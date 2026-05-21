@@ -1,0 +1,23 @@
+import { expect, test } from "bun:test"
+import { Circuit } from "tscircuit"
+import "./fixtures/svg-snapshot-matcher"
+import ChargePumpReproBoard from "./fixtures/microscope-stage-controller/charge-pump-repro.circuit"
+
+test("same-net routed traces obstacle repro", async () => {
+  const circuit = new Circuit()
+
+  circuit.add(ChargePumpReproBoard())
+  await circuit.renderUntilSettled()
+
+  const circuitJson = circuit.getCircuitJson()
+  const autoroutingErrors = circuitJson.filter(
+    (element: any) => element.type === "pcb_autorouting_error",
+  )
+  expect(autoroutingErrors).toHaveLength(1)
+  expect((autoroutingErrors[0] as any).message).toContain(
+    "KRT GridRouter found no route",
+  )
+  await expect(circuit.getSvg({ view: "pcb" })).toMatchSvgSnapshot(
+    import.meta.path,
+  )
+})
