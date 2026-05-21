@@ -13,10 +13,7 @@ test("same-net routed traces obstacle repro", async () => {
   const autoroutingErrors = circuitJson.filter(
     (element: any) => element.type === "pcb_autorouting_error",
   )
-  expect(autoroutingErrors).toHaveLength(1)
-  expect((autoroutingErrors[0] as any).message).toContain(
-    "KRT GridRouter found no route",
-  )
+  expect(autoroutingErrors).toHaveLength(0)
   await expect(circuit.getSvg({ view: "pcb" })).toMatchSvgSnapshot(
     import.meta.path,
   )

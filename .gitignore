@@ -38,6 +38,9 @@ Thumbs.db
 rust_router/target/
 *.pyd
 
+# Visual snapshot diffs
+*.diff.png
+
 # KiCad outputs (routed files, backups, project files)
 /kicad_files/test_diffpair*kicad_pcb
 /kicad_files/fanout_output*.kicad_pcb
