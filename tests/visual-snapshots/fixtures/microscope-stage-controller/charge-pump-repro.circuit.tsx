@@ -419,20 +419,20 @@ export default () => (
     <trace
       from="J_PWR.VBAT"
       to="U_REG.VIN"
-      thickness="0.6mm"
+      thickness="0.2mm"
       routingPhaseIndex={0}
     />
     <trace
       from="J_PWR.GND"
       to="net.GND"
-      thickness="0.6mm"
+      thickness="0.2mm"
       routingPhaseIndex={0}
     />
 
     <trace
       from="U_DRV.VM"
       to="U_REG.VIN"
-      thickness="0.45mm"
+      thickness="0.2mm"
       routingPhaseIndex={0}
     />
     <trace
@@ -444,32 +444,32 @@ export default () => (
     <trace
       from="U_DRV.GND2"
       to="net.GND"
-      thickness="0.25mm"
+      thickness="0.2mm"
       routingPhaseIndex={0}
     />
 
     <trace
       from="C_VM_BULK.pin1"
       to="U_DRV.VM"
-      thickness="0.6mm"
+      thickness="0.2mm"
       routingPhaseIndex={0}
     />
     <trace
       from="C_VM_BULK.pin2"
       to="U_DRV.GND2"
-      thickness="0.6mm"
+      thickness="0.2mm"
       routingPhaseIndex={0}
     />
     <trace
       from="C_VM_DEC.pin1"
       to="U_DRV.VM"
-      thickness="0.4mm"
+      thickness="0.2mm"
       routingPhaseIndex={0}
     />
     <trace
       from="C_VM_DEC.pin2"
       to="U_DRV.GND2"
-      thickness="0.4mm"
+      thickness="0.2mm"
       routingPhaseIndex={0}
     />
 
