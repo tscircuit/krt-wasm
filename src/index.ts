@@ -101,7 +101,7 @@ export class KiCadRoutingToolsAutorouter implements GenericLocalAutorouter {
 
   solveSync(): SimplifiedPcbTrace[] {
     this.cachedTraces ??= gridRouter.routeSimpleRouteJson(
-      normalizeSameNetObstacleConnectedTo(this.input),
+      expandObstacleConnectedToSameNetIds(this.input),
       normalizeOptions(this.options),
     ) as SimplifiedPcbTrace[]
     if (this.options.collapseShortSameLayerTunnels ?? true) {
@@ -161,7 +161,9 @@ function normalizeOptions(options: KiCadRoutingToolsAutorouterOptions) {
   }
 }
 
-function normalizeSameNetObstacleConnectedTo(input: SimpleRouteJson): SimpleRouteJson {
+function expandObstacleConnectedToSameNetIds(
+  input: SimpleRouteJson,
+): SimpleRouteJson {
   const obstacles = input.obstacles
   if (!Array.isArray(obstacles) || obstacles.length === 0) {
     return input
