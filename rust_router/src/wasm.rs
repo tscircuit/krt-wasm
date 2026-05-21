@@ -113,14 +113,6 @@ enum RouteSegment {
     },
 }
 
-#[derive(Clone, Debug)]
-struct RoutedCell {
-    gx: i32,
-    gy: i32,
-    layer: u8,
-    same_net_ids: Vec<String>,
-}
-
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct WasmRouterOptions {
@@ -217,7 +209,7 @@ fn route_simple_route_json_inner(
     }
 
     let layer_names = get_layer_names(layer_count);
-    let mut routed_cells: Vec<RoutedCell> = Vec::new();
+    let mut routed_cells: Vec<(i32, i32, u8)> = Vec::new();
     let mut traces = Vec::new();
 
     for (connection_index, connection) in input.connections.iter().enumerate() {
@@ -231,7 +223,7 @@ fn route_simple_route_json_inner(
             options.clearance,
             options.grid_step,
         ));
-        let same_net_ids = collect_same_net_ids(input, connection);
+        let connection_ids = get_connection_ids(connection);
         let mut full_path: Vec<(i32, i32, u8)> = Vec::new();
 
         for segment_index in 0..(connection.points_to_connect.len() - 1) {
@@ -241,7 +233,7 @@ fn route_simple_route_json_inner(
                 input,
                 options,
                 layer_count,
-                &same_net_ids,
+                &connection_ids,
                 &routed_cells,
                 route_margin,
             );
@@ -302,12 +294,7 @@ fn route_simple_route_json_inner(
             }
         }
 
-        routed_cells.extend(full_path.iter().map(|&(gx, gy, layer)| RoutedCell {
-            gx,
-            gy,
-            layer,
-            same_net_ids: same_net_ids.clone(),
-        }));
+        routed_cells.extend(full_path.iter().copied());
 
         traces.push(SimplifiedPcbTrace {
             trace_type: "pcb_trace",
@@ -327,8 +314,8 @@ fn build_obstacle_map(
     input: &SimpleRouteJson,
     options: &WasmRouterOptions,
     layer_count: usize,
-    same_net_ids: &[String],
-    routed_cells: &[RoutedCell],
+    connection_ids: &[String],
+    routed_cells: &[(i32, i32, u8)],
     route_margin: i32,
 ) -> GridObstacleMap {
     let mut obstacles = GridObstacleMap::new(layer_count);
@@ -338,7 +325,13 @@ fn build_obstacle_map(
     let max_gy = to_grid(input.bounds.max_y, options.grid_step);
 
     for obstacle in &input.obstacles {
-        if shares_any_id(&obstacle.connected_to, same_net_ids) {
+        let connected_to_current_net = obstacle.connected_to.iter().any(|id| {
+            connection_ids
+                .iter()
+                .any(|connection_id| connection_id == id)
+        });
+
+        if connected_to_current_net {
             continue;
         }
 
@@ -370,17 +363,8 @@ fn build_obstacle_map(
         }
     }
 
-    for routed_cell in routed_cells {
-        if shares_any_id(&routed_cell.same_net_ids, same_net_ids) {
-            continue;
-        }
-        reserve_cell_halo(
-            &mut obstacles,
-            routed_cell.gx,
-            routed_cell.gy,
-            routed_cell.layer as usize,
-            route_margin,
-        );
+    for &(gx, gy, layer) in routed_cells {
+        reserve_cell_halo(&mut obstacles, gx, gy, layer as usize, route_margin);
     }
 
     add_board_bounds(&mut obstacles, min_gx, max_gx, min_gy, max_gy);
@@ -864,10 +848,7 @@ fn get_trace_width(input: &SimpleRouteJson, connection: &SimpleRouteConnection) 
         .unwrap_or(0.2)
 }
 
-fn collect_same_net_ids(
-    input: &SimpleRouteJson,
-    connection: &SimpleRouteConnection,
-) -> Vec<String> {
+fn get_connection_ids(connection: &SimpleRouteConnection) -> Vec<String> {
     let mut ids = vec![connection.name.clone()];
     if let Some(id) = &connection.source_trace_id {
         ids.push(id.clone());
@@ -880,45 +861,7 @@ fn collect_same_net_ids(
             ids.push(id.clone());
         }
     }
-    expand_ids_through_same_net_obstacles(input, ids)
-}
-
-fn expand_ids_through_same_net_obstacles(
-    input: &SimpleRouteJson,
-    seed_ids: Vec<String>,
-) -> Vec<String> {
-    let mut ids = Vec::new();
-    for id in seed_ids {
-        push_unique_string(&mut ids, id);
-    }
-
-    let mut changed = true;
-    while changed {
-        changed = false;
-        for obstacle in &input.obstacles {
-            if !shares_any_id(&obstacle.connected_to, &ids) {
-                continue;
-            }
-            for id in &obstacle.connected_to {
-                if !ids.contains(id) {
-                    ids.push(id.clone());
-                    changed = true;
-                }
-            }
-        }
-    }
-
     ids
-}
-
-fn push_unique_string(values: &mut Vec<String>, value: String) {
-    if !values.contains(&value) {
-        values.push(value);
-    }
-}
-
-fn shares_any_id(left: &[String], right: &[String]) -> bool {
-    left.iter().any(|left_id| right.contains(left_id))
 }
 
 fn get_layer_names(layer_count: usize) -> Vec<String> {

@@ -101,7 +101,7 @@ export class KiCadRoutingToolsAutorouter implements GenericLocalAutorouter {
 
   solveSync(): SimplifiedPcbTrace[] {
     this.cachedTraces ??= gridRouter.routeSimpleRouteJson(
-      this.input,
+      normalizeSameNetObstacleConnectedTo(this.input),
       normalizeOptions(this.options),
     ) as SimplifiedPcbTrace[]
     if (this.options.collapseShortSameLayerTunnels ?? true) {
@@ -159,6 +159,103 @@ function normalizeOptions(options: KiCadRoutingToolsAutorouterOptions) {
     layerDirectionPreferences: options.layerDirectionPreferences,
     directionPreferenceCost: options.directionPreferenceCost ?? 0,
   }
+}
+
+function normalizeSameNetObstacleConnectedTo(input: SimpleRouteJson): SimpleRouteJson {
+  const obstacles = input.obstacles
+  if (!Array.isArray(obstacles) || obstacles.length === 0) {
+    return input
+  }
+
+  const parent = new Map<string, string>()
+
+  for (const obstacle of obstacles) {
+    const connectedTo = getConnectedToIds(obstacle)
+    if (connectedTo.length === 0) continue
+
+    getSameNetRoot(parent, connectedTo[0])
+    for (let i = 1; i < connectedTo.length; i++) {
+      unionSameNetIds(parent, connectedTo[0], connectedTo[i])
+    }
+  }
+
+  const idsByRoot = new Map<string, string[]>()
+  for (const id of parent.keys()) {
+    const root = getSameNetRoot(parent, id)
+    const ids = idsByRoot.get(root)
+    if (ids) {
+      ids.push(id)
+    } else {
+      idsByRoot.set(root, [id])
+    }
+  }
+
+  let changed = false
+  const normalizedObstacles = obstacles.map((obstacle) => {
+    const connectedTo = getConnectedToIds(obstacle)
+    if (connectedTo.length === 0) return obstacle
+
+    const sameNetIds =
+      idsByRoot.get(getSameNetRoot(parent, connectedTo[0])) ?? connectedTo
+    if (sameNetIds.length === connectedTo.length) return obstacle
+
+    changed = true
+    return {
+      ...obstacle,
+      connectedTo: sameNetIds,
+    }
+  })
+
+  if (!changed) return input
+
+  return {
+    ...input,
+    obstacles: normalizedObstacles,
+  }
+}
+
+function getSameNetRoot(parent: Map<string, string>, id: string): string {
+  const currentParent = parent.get(id)
+  if (!currentParent) {
+    parent.set(id, id)
+    return id
+  }
+
+  let root = currentParent
+  while (parent.get(root) && parent.get(root) !== root) {
+    root = parent.get(root)!
+  }
+
+  let current = id
+  while (parent.get(current) && parent.get(current) !== root) {
+    const next = parent.get(current)!
+    parent.set(current, root)
+    current = next
+  }
+
+  return root
+}
+
+function unionSameNetIds(parent: Map<string, string>, a: string, b: string) {
+  const rootA = getSameNetRoot(parent, a)
+  const rootB = getSameNetRoot(parent, b)
+  if (rootA !== rootB) {
+    parent.set(rootB, rootA)
+  }
+}
+
+function getConnectedToIds(
+  obstacle: SimpleRouteJson["obstacles"][number],
+): string[] {
+  if (!Array.isArray(obstacle?.connectedTo)) return []
+
+  const ids: string[] = []
+  for (const id of obstacle.connectedTo) {
+    if (typeof id === "string" && !ids.includes(id)) {
+      ids.push(id)
+    }
+  }
+  return ids
 }
 
 function collapseShortSameLayerTunnels(
