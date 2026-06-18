@@ -21,7 +21,7 @@
     "test:update": "BUN_UPDATE_SNAPSHOTS=1 bun test tests/visual-snapshots"
   },
   "peerDependencies": {
-    "tscircuit": ">=0.0.1686"
+    "tscircuit": "*"
   },
   "devDependencies": {
     "@resvg/resvg-js": "^2.6.2",
