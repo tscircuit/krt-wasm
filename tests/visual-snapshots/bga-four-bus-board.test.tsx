@@ -17,8 +17,15 @@ test("KRT routes four buses out of a dense BGA", async () => {
   const autoroutingErrors = circuitJson.filter(
     (element: any) => element.type === "pcb_autorouting_error",
   )
+  const pcbDrcErrors = circuitJson.filter(
+    (element: any) =>
+      typeof element.type === "string" &&
+      element.type.startsWith("pcb_") &&
+      element.type.endsWith("_error"),
+  )
 
   expect(autoroutingErrors).toHaveLength(0)
+  expect(pcbDrcErrors).toHaveLength(0)
   expect(traces).toHaveLength(24)
   await expect(circuit.getSvg({ view: "pcb" })).toMatchSvgSnapshot(
     import.meta.path,

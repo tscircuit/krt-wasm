@@ -15,6 +15,10 @@ struct SimpleRouteJson {
     bounds: Bounds,
     min_trace_width: Option<NumberOrString>,
     nominal_trace_width: Option<NumberOrString>,
+    #[serde(default)]
+    min_via_pad_diameter: Option<NumberOrString>,
+    #[serde(default, rename = "min_via_pad_diameter")]
+    legacy_min_via_pad_diameter: Option<NumberOrString>,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -37,8 +41,6 @@ struct Bounds {
 #[derive(Clone, Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct Obstacle {
-    #[serde(rename = "type", default)]
-    obstacle_type: Option<String>,
     center: Point2,
     width: f64,
     height: f64,
@@ -211,6 +213,37 @@ struct RoutePlanItem {
     attraction_connection_name: Option<String>,
 }
 
+#[derive(Clone, Copy, Debug)]
+enum BusRouteOrder {
+    CenterOut,
+    AdjacentFirst,
+    Physical,
+    ReversePhysical,
+}
+
+#[derive(Clone, Copy, Debug)]
+enum UngroupedRouteOrder {
+    Original,
+    ShortestFirst,
+    Reverse,
+    LongestFirst,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct RoutePlanStrategy {
+    bus_order: BusRouteOrder,
+    ungrouped_order: UngroupedRouteOrder,
+}
+
+#[derive(Debug)]
+struct RoutedTraceGeometry {
+    cells: Vec<(i32, i32, u8)>,
+    via_positions: Vec<(i32, i32)>,
+    trace_width: f64,
+    via_pad_diameter: f64,
+    connection_ids: Vec<String>,
+}
+
 #[wasm_bindgen(js_name = routeSimpleRouteJson)]
 pub fn route_simple_route_json(input: JsValue, options: JsValue) -> Result<JsValue, JsValue> {
     let input: SimpleRouteJson = serde_wasm_bindgen::from_value(input)
@@ -235,16 +268,58 @@ fn route_simple_route_json_inner(
     input: &SimpleRouteJson,
     options: &WasmRouterOptions,
 ) -> Result<Vec<SimplifiedPcbTrace>, JsValue> {
+    let mut attempt_errors = Vec::new();
+    for strategy in [
+        RoutePlanStrategy {
+            bus_order: BusRouteOrder::CenterOut,
+            ungrouped_order: UngroupedRouteOrder::Original,
+        },
+        RoutePlanStrategy {
+            bus_order: BusRouteOrder::AdjacentFirst,
+            ungrouped_order: UngroupedRouteOrder::ShortestFirst,
+        },
+        RoutePlanStrategy {
+            bus_order: BusRouteOrder::Physical,
+            ungrouped_order: UngroupedRouteOrder::Reverse,
+        },
+        RoutePlanStrategy {
+            bus_order: BusRouteOrder::ReversePhysical,
+            ungrouped_order: UngroupedRouteOrder::LongestFirst,
+        },
+    ] {
+        match route_connections_with_order(input, options, strategy) {
+            Ok(traces) => return Ok(traces),
+            Err(error) => attempt_errors.push(format!(
+                "{strategy:?}: {}",
+                error
+                    .as_string()
+                    .unwrap_or_else(|| "unknown routing error".to_string())
+            )),
+        }
+    }
+
+    Err(JsValue::from_str(&format!(
+        "KRT GridRouter exhausted route-plan retries: {}",
+        attempt_errors.join("; ")
+    )))
+}
+
+fn route_connections_with_order(
+    input: &SimpleRouteJson,
+    options: &WasmRouterOptions,
+    strategy: RoutePlanStrategy,
+) -> Result<Vec<SimplifiedPcbTrace>, JsValue> {
     let layer_count = input.layer_count.unwrap_or(2).max(1);
     if layer_count > u8::MAX as usize {
         return Err(JsValue::from_str("layerCount must fit in u8"));
     }
 
     let layer_names = get_layer_names(layer_count);
-    let mut routed_cells: Vec<(i32, i32, u8)> = Vec::new();
+    let mut routed_trace_geometry: Vec<RoutedTraceGeometry> = Vec::new();
     let mut routed_paths: HashMap<String, Vec<(i32, i32, u8)>> = HashMap::new();
     let mut traces = Vec::new();
-    let route_plan = build_route_plan(input)?;
+    let route_plan = build_route_plan(input, strategy)?;
+    let via_pad_diameter = get_via_pad_diameter(input);
 
     for route_plan_item in route_plan {
         let connection_index = route_plan_item.connection_index;
@@ -254,11 +329,6 @@ fn route_simple_route_json_inner(
         }
 
         let width = get_trace_width(input, connection);
-        let route_margin = options.track_margin.max(clearance_radius(
-            width,
-            options.clearance,
-            options.grid_step,
-        ));
         let connection_ids = get_connection_ids(connection);
         let mut full_path: Vec<(i32, i32, u8)> = Vec::new();
         let route_points: Vec<&RoutePoint> = if route_plan_item.reverse_direction {
@@ -275,8 +345,9 @@ fn route_simple_route_json_inner(
                 options,
                 layer_count,
                 &connection_ids,
-                &routed_cells,
-                route_margin,
+                &routed_trace_geometry,
+                width,
+                via_pad_diameter,
             );
 
             let sources = point_states(input, start, layer_count, &layer_names, options.grid_step);
@@ -285,7 +356,7 @@ fn route_simple_route_json_inner(
 
             obstacles.clear_source_target_cells();
             obstacles.clear_allowed_cells();
-            obstacles.set_endpoint_exempt(endpoint_positions, route_margin.max(1));
+            obstacles.set_endpoint_exempt(endpoint_positions, 1);
 
             for &(gx, gy, layer) in sources.iter().chain(targets.iter()) {
                 obstacles.add_source_target_cell(gx, gy, layer as usize);
@@ -327,7 +398,7 @@ fn route_simple_route_json_inner(
                 None,
                 None,
                 2,
-                route_margin,
+                0,
             );
 
             let path = path.ok_or_else(|| {
@@ -345,7 +416,13 @@ fn route_simple_route_json_inner(
             }
         }
 
-        routed_cells.extend(full_path.iter().copied());
+        routed_trace_geometry.push(RoutedTraceGeometry {
+            via_positions: get_path_via_positions(&full_path),
+            cells: full_path.clone(),
+            trace_width: width,
+            via_pad_diameter,
+            connection_ids,
+        });
         routed_paths.insert(connection.name.clone(), full_path.clone());
         if route_plan_item.reverse_direction {
             full_path.reverse();
@@ -365,7 +442,10 @@ fn route_simple_route_json_inner(
     Ok(traces)
 }
 
-fn build_route_plan(input: &SimpleRouteJson) -> Result<Vec<RoutePlanItem>, JsValue> {
+fn build_route_plan(
+    input: &SimpleRouteJson,
+    strategy: RoutePlanStrategy,
+) -> Result<Vec<RoutePlanItem>, JsValue> {
     let mut connection_index_by_name = HashMap::new();
     for (connection_index, connection) in input.connections.iter().enumerate() {
         if connection_index_by_name
@@ -379,7 +459,7 @@ fn build_route_plan(input: &SimpleRouteJson) -> Result<Vec<RoutePlanItem>, JsVal
         }
     }
 
-    let mut route_plan = Vec::new();
+    let mut bus_route_plan = Vec::new();
     let mut scheduled_connection_indices = HashSet::new();
     for bus in &input.buses {
         let bus_label = bus.name.as_deref().unwrap_or("<unnamed>");
@@ -418,11 +498,11 @@ fn build_route_plan(input: &SimpleRouteJson) -> Result<Vec<RoutePlanItem>, JsVal
             bus_should_route_from_last_endpoints(input, &bus_connection_indices);
         let physically_ordered_connection_indices =
             physically_order_bus_connections(input, &bus_connection_indices, reverse_direction);
-        let center_out_connection_indices =
-            center_out_order(&physically_ordered_connection_indices);
+        let ordered_connection_indices =
+            order_bus_connections(&physically_ordered_connection_indices, strategy.bus_order);
         let mut routed_bus_connection_indices = HashSet::new();
 
-        for connection_index in center_out_connection_indices {
+        for connection_index in ordered_connection_indices {
             let physical_position = physically_ordered_connection_indices
                 .iter()
                 .position(|candidate| *candidate == connection_index)
@@ -437,7 +517,7 @@ fn build_route_plan(input: &SimpleRouteJson) -> Result<Vec<RoutePlanItem>, JsVal
                         .filter(|candidate| routed_bus_connection_indices.contains(*candidate))
                 });
 
-            route_plan.push(RoutePlanItem {
+            bus_route_plan.push(RoutePlanItem {
                 connection_index,
                 reverse_direction,
                 attraction_connection_name: attraction_connection_index
@@ -448,15 +528,27 @@ fn build_route_plan(input: &SimpleRouteJson) -> Result<Vec<RoutePlanItem>, JsVal
         }
     }
 
+    let mut ungrouped_connection_indices = Vec::new();
     for connection_index in 0..input.connections.len() {
         if !scheduled_connection_indices.contains(&connection_index) {
-            route_plan.push(RoutePlanItem {
-                connection_index,
-                reverse_direction: false,
-                attraction_connection_name: None,
-            });
+            ungrouped_connection_indices.push(connection_index);
         }
     }
+    order_ungrouped_connections(
+        input,
+        &mut ungrouped_connection_indices,
+        strategy.ungrouped_order,
+    );
+
+    let mut route_plan = ungrouped_connection_indices
+        .into_iter()
+        .map(|connection_index| RoutePlanItem {
+            connection_index,
+            reverse_direction: false,
+            attraction_connection_name: None,
+        })
+        .collect::<Vec<_>>();
+    route_plan.extend(bus_route_plan);
 
     Ok(route_plan)
 }
@@ -544,6 +636,55 @@ fn physically_order_bus_connections(
     ordered
 }
 
+fn order_bus_connections(
+    physically_ordered_connection_indices: &[usize],
+    bus_route_order: BusRouteOrder,
+) -> Vec<usize> {
+    match bus_route_order {
+        BusRouteOrder::CenterOut => center_out_order(physically_ordered_connection_indices),
+        BusRouteOrder::AdjacentFirst => {
+            let mut ordered = physically_ordered_connection_indices.to_vec();
+            if ordered.len() > 1 {
+                ordered.swap(0, 1);
+            }
+            ordered
+        }
+        BusRouteOrder::Physical => physically_ordered_connection_indices.to_vec(),
+        BusRouteOrder::ReversePhysical => physically_ordered_connection_indices
+            .iter()
+            .rev()
+            .copied()
+            .collect(),
+    }
+}
+
+fn order_ungrouped_connections(
+    input: &SimpleRouteJson,
+    connection_indices: &mut [usize],
+    ungrouped_route_order: UngroupedRouteOrder,
+) {
+    match ungrouped_route_order {
+        UngroupedRouteOrder::Original => {}
+        UngroupedRouteOrder::ShortestFirst => connection_indices.sort_by(|left, right| {
+            connection_airwire_length(&input.connections[*left])
+                .total_cmp(&connection_airwire_length(&input.connections[*right]))
+        }),
+        UngroupedRouteOrder::Reverse => connection_indices.reverse(),
+        UngroupedRouteOrder::LongestFirst => connection_indices.sort_by(|left, right| {
+            connection_airwire_length(&input.connections[*right])
+                .total_cmp(&connection_airwire_length(&input.connections[*left]))
+        }),
+    }
+}
+
+fn connection_airwire_length(connection: &SimpleRouteConnection) -> f64 {
+    connection
+        .points_to_connect
+        .windows(2)
+        .map(|pair| (pair[1].x - pair[0].x).hypot(pair[1].y - pair[0].y))
+        .sum()
+}
+
 fn center_out_order(physically_ordered_connection_indices: &[usize]) -> Vec<usize> {
     let mut ordered = Vec::with_capacity(physically_ordered_connection_indices.len());
     let middle = physically_ordered_connection_indices.len() / 2;
@@ -566,14 +707,18 @@ fn build_obstacle_map(
     options: &WasmRouterOptions,
     layer_count: usize,
     connection_ids: &[String],
-    routed_cells: &[(i32, i32, u8)],
-    route_margin: i32,
+    routed_trace_geometry: &[RoutedTraceGeometry],
+    current_trace_width: f64,
+    current_via_pad_diameter: f64,
 ) -> GridObstacleMap {
     let mut obstacles = GridObstacleMap::new(layer_count);
     let min_gx = to_grid(input.bounds.min_x, options.grid_step);
     let max_gx = to_grid(input.bounds.max_x, options.grid_step);
     let min_gy = to_grid(input.bounds.min_y, options.grid_step);
     let max_gy = to_grid(input.bounds.max_y, options.grid_step);
+    let extra_margin = options.track_margin.max(0) as f64 * options.grid_step;
+    let obstacle_to_wire_margin = current_trace_width / 2.0 + options.clearance + extra_margin;
+    let obstacle_to_via_margin = current_via_pad_diameter / 2.0 + options.clearance + extra_margin;
 
     for obstacle in &input.obstacles {
         let connected_to_current_net = obstacle.connected_to.iter().any(|id| {
@@ -586,18 +731,9 @@ fn build_obstacle_map(
             continue;
         }
 
-        if !obstacle
-            .obstacle_type
-            .as_deref()
-            .map(|value| value == "rect")
-            .unwrap_or(true)
-        {
-            continue;
-        }
-
         let (obs_min_gx, obs_max_gx, obs_min_gy, obs_max_gy) = obstacle_grid_bounds(
             obstacle,
-            options.clearance,
+            obstacle_to_wire_margin,
             options.grid_step,
             min_gx,
             max_gx,
@@ -612,10 +748,86 @@ fn build_obstacle_map(
                 }
             }
         }
+
+        let (via_min_gx, via_max_gx, via_min_gy, via_max_gy) = obstacle_grid_bounds(
+            obstacle,
+            obstacle_to_via_margin,
+            options.grid_step,
+            min_gx,
+            max_gx,
+            min_gy,
+            max_gy,
+        );
+        for gx in via_min_gx..=via_max_gx {
+            for gy in via_min_gy..=via_max_gy {
+                obstacles.add_blocked_via(gx, gy);
+            }
+        }
     }
 
-    for &(gx, gy, layer) in routed_cells {
-        reserve_cell_halo(&mut obstacles, gx, gy, layer as usize, route_margin);
+    for routed_trace in routed_trace_geometry {
+        if routed_trace
+            .connection_ids
+            .iter()
+            .any(|id| connection_ids.contains(id))
+        {
+            continue;
+        }
+
+        let wire_to_wire_clearance = routed_trace.trace_width / 2.0
+            + current_trace_width / 2.0
+            + options.clearance
+            + extra_margin;
+        let previous_wire_to_via_clearance = routed_trace.trace_width / 2.0
+            + current_via_pad_diameter / 2.0
+            + options.clearance
+            + extra_margin;
+        let previous_via_to_wire_clearance = routed_trace.via_pad_diameter / 2.0
+            + current_trace_width / 2.0
+            + options.clearance
+            + extra_margin;
+        let via_to_via_clearance = routed_trace.via_pad_diameter / 2.0
+            + current_via_pad_diameter / 2.0
+            + options.clearance
+            + extra_margin;
+
+        for &(gx, gy, layer) in &routed_trace.cells {
+            reserve_cell_halo(
+                &mut obstacles,
+                gx,
+                gy,
+                layer as usize,
+                wire_to_wire_clearance,
+                options.grid_step,
+            );
+            reserve_via_halo(
+                &mut obstacles,
+                gx,
+                gy,
+                previous_wire_to_via_clearance,
+                options.grid_step,
+            );
+        }
+
+        for &(gx, gy) in &routed_trace.via_positions {
+            for layer in 0..layer_count {
+                reserve_cell_halo(
+                    &mut obstacles,
+                    gx,
+                    gy,
+                    layer,
+                    previous_via_to_wire_clearance,
+                    options.grid_step,
+                );
+            }
+            reserve_via_halo(
+                &mut obstacles,
+                gx,
+                gy,
+                via_to_via_clearance,
+                options.grid_step,
+            );
+        }
     }
 
     add_board_bounds(&mut obstacles, min_gx, max_gx, min_gy, max_gy);
@@ -638,10 +850,43 @@ fn add_board_bounds(
     obstacles.set_bga_zone(min_gx, max_gy + 1, max_gx, far_max);
 }
 
-fn reserve_cell_halo(obstacles: &mut GridObstacleMap, gx: i32, gy: i32, layer: usize, radius: i32) {
+fn reserve_cell_halo(
+    obstacles: &mut GridObstacleMap,
+    gx: i32,
+    gy: i32,
+    layer: usize,
+    clearance: f64,
+    grid_step: f64,
+) {
+    let radius = (clearance / grid_step).ceil().max(0.0) as i32;
+    let clearance_squared = clearance * clearance;
     for dx in -radius..=radius {
         for dy in -radius..=radius {
-            obstacles.add_blocked_cell(gx + dx, gy + dy, layer);
+            let x_distance = dx as f64 * grid_step;
+            let y_distance = dy as f64 * grid_step;
+            if x_distance * x_distance + y_distance * y_distance + 1e-12 < clearance_squared {
+                obstacles.add_blocked_cell(gx + dx, gy + dy, layer);
+            }
+        }
+    }
+}
+
+fn reserve_via_halo(
+    obstacles: &mut GridObstacleMap,
+    gx: i32,
+    gy: i32,
+    clearance: f64,
+    grid_step: f64,
+) {
+    let radius = (clearance / grid_step).ceil().max(0.0) as i32;
+    let clearance_squared = clearance * clearance;
+    for dx in -radius..=radius {
+        for dy in -radius..=radius {
+            let x_distance = dx as f64 * grid_step;
+            let y_distance = dy as f64 * grid_step;
+            if x_distance * x_distance + y_distance * y_distance + 1e-12 < clearance_squared {
+                obstacles.add_blocked_via(gx + dx, gy + dy);
+            }
         }
     }
 }
@@ -657,10 +902,10 @@ fn obstacle_grid_bounds(
 ) -> (i32, i32, i32, i32) {
     let half_width = obstacle.width / 2.0 + margin;
     let half_height = obstacle.height / 2.0 + margin;
-    let obs_min_gx = to_grid(obstacle.center.x - half_width, grid_step).max(min_gx);
-    let obs_max_gx = to_grid(obstacle.center.x + half_width, grid_step).min(max_gx);
-    let obs_min_gy = to_grid(obstacle.center.y - half_height, grid_step).max(min_gy);
-    let obs_max_gy = to_grid(obstacle.center.y + half_height, grid_step).min(max_gy);
+    let obs_min_gx = to_grid_floor(obstacle.center.x - half_width, grid_step).max(min_gx);
+    let obs_max_gx = to_grid_ceil(obstacle.center.x + half_width, grid_step).min(max_gx);
+    let obs_min_gy = to_grid_floor(obstacle.center.y - half_height, grid_step).max(min_gy);
+    let obs_max_gy = to_grid_ceil(obstacle.center.y + half_height, grid_step).min(max_gy);
 
     (obs_min_gx, obs_max_gx, obs_min_gy, obs_max_gy)
 }
@@ -923,7 +1168,7 @@ fn grid_path_to_route(
         });
     }
 
-    compact_route(collapse_short_same_layer_tunnels(route, 1.0))
+    compact_route(route)
 }
 
 fn compact_route(route: Vec<RouteSegment>) -> Vec<RouteSegment> {
@@ -937,100 +1182,6 @@ fn compact_route(route: Vec<RouteSegment>) -> Vec<RouteSegment> {
     }
 
     compacted
-}
-
-fn collapse_short_same_layer_tunnels(
-    route: Vec<RouteSegment>,
-    max_tunnel_length: f64,
-) -> Vec<RouteSegment> {
-    let mut collapsed = Vec::new();
-    let mut index = 0;
-
-    while index < route.len() {
-        if let Some(replacement) =
-            short_same_layer_tunnel_replacement(&route[index..], max_tunnel_length)
-        {
-            collapsed.push(replacement);
-            index += 6;
-            continue;
-        }
-
-        collapsed.push(route[index].clone());
-        index += 1;
-    }
-
-    collapsed
-}
-
-fn short_same_layer_tunnel_replacement(
-    route: &[RouteSegment],
-    max_tunnel_length: f64,
-) -> Option<RouteSegment> {
-    let [RouteSegment::Wire {
-        x: start_x,
-        y: start_y,
-        layer: start_layer,
-        width,
-    }, RouteSegment::Via {
-        x: first_via_x,
-        y: first_via_y,
-        from_layer,
-        to_layer,
-    }, RouteSegment::Wire {
-        x: first_inner_x,
-        y: first_inner_y,
-        layer: inner_layer,
-        ..
-    }, RouteSegment::Wire {
-        x: second_inner_x,
-        y: second_inner_y,
-        layer: second_inner_layer,
-        ..
-    }, RouteSegment::Via {
-        x: second_via_x,
-        y: second_via_y,
-        from_layer: second_from_layer,
-        to_layer: second_to_layer,
-    }, RouteSegment::Wire {
-        x: end_x,
-        y: end_y,
-        layer: end_layer,
-        ..
-    }, ..] = route
-    else {
-        return None;
-    };
-
-    if start_layer != from_layer
-        || to_layer != inner_layer
-        || inner_layer != second_inner_layer
-        || second_from_layer != inner_layer
-        || second_to_layer != start_layer
-        || end_layer != start_layer
-        || !same_point(*start_x, *start_y, *first_via_x, *first_via_y)
-        || !same_point(*start_x, *start_y, *first_inner_x, *first_inner_y)
-        || !same_point(
-            *second_inner_x,
-            *second_inner_y,
-            *second_via_x,
-            *second_via_y,
-        )
-        || !same_point(*second_inner_x, *second_inner_y, *end_x, *end_y)
-    {
-        return None;
-    }
-
-    let tunnel_length = ((*end_x - *start_x).powi(2) + (*end_y - *start_y).powi(2)).sqrt();
-    if tunnel_length > max_tunnel_length {
-        return None;
-    }
-
-    Some(RouteSegment::Wire {
-        x: *end_x,
-        y: *end_y,
-        layer: start_layer.clone(),
-        width: *width,
-    })
 }
 
 fn should_replace_last_wire(route: &[RouteSegment], next: &RouteSegment) -> bool {
@@ -1099,6 +1250,33 @@ fn get_trace_width(input: &SimpleRouteJson, connection: &SimpleRouteConnection) 
         .unwrap_or(0.2)
 }
 
+fn get_via_pad_diameter(input: &SimpleRouteJson) -> f64 {
+    input
+        .min_via_pad_diameter
+        .as_ref()
+        .and_then(NumberOrString::as_f64)
+        .or_else(|| {
+            input
+                .legacy_min_via_pad_diameter
+                .as_ref()
+                .and_then(NumberOrString::as_f64)
+        })
+        .unwrap_or(0.3)
+}
+
+fn get_path_via_positions(path: &[(i32, i32, u8)]) -> Vec<(i32, i32)> {
+    let mut via_positions = Vec::new();
+    for pair in path.windows(2) {
+        if pair[0].2 != pair[1].2 {
+            let position = (pair[0].0, pair[0].1);
+            if !via_positions.contains(&position) {
+                via_positions.push(position);
+            }
+        }
+    }
+    via_positions
+}
+
 fn get_connection_ids(connection: &SimpleRouteConnection) -> Vec<String> {
     let mut ids = vec![connection.name.clone()];
     if let Some(id) = &connection.source_trace_id {
@@ -1148,12 +1326,16 @@ fn layer_to_index(layer: &str, layer_count: usize) -> Option<usize> {
     .filter(|index| *index < layer_count)
 }
 
-fn clearance_radius(width: f64, clearance: f64, grid_step: f64) -> i32 {
-    ((width / 2.0 + clearance) / grid_step).ceil().max(0.0) as i32
-}
-
 fn to_grid(value: f64, grid_step: f64) -> i32 {
     (value / grid_step).round() as i32
+}
+
+fn to_grid_floor(value: f64, grid_step: f64) -> i32 {
+    (value / grid_step).floor() as i32
+}
+
+fn to_grid_ceil(value: f64, grid_step: f64) -> i32 {
+    (value / grid_step).ceil() as i32
 }
 
 fn from_grid(value: i32, grid_step: f64) -> f64 {
@@ -1169,8 +1351,4 @@ fn sign(value: f64) -> i32 {
     } else {
         0
     }
-}
-
-fn same_point(a_x: f64, a_y: f64, b_x: f64, b_y: f64) -> bool {
-    (a_x - b_x).abs() < 0.000_001 && (a_y - b_y).abs() < 0.000_001
 }

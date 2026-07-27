@@ -19,6 +19,12 @@ test(
     const autoroutingErrors = circuitJson.filter(
       (element: any) => element.type === "pcb_autorouting_error",
     )
+    const pcbDrcErrors = circuitJson.filter(
+      (element: any) =>
+        typeof element.type === "string" &&
+        element.type.startsWith("pcb_") &&
+        element.type.endsWith("_error"),
+    )
     const capacitors = circuitJson.filter(
       (element: any) =>
         element.type === "source_component" &&
@@ -41,6 +47,7 @@ test(
     )
 
     expect(autoroutingErrors).toHaveLength(0)
+    expect(pcbDrcErrors).toHaveLength(0)
     expect(traces).toHaveLength(40)
     expect(traces.every((trace: any) => trace.route.length >= 2)).toBe(true)
     expect(capacitors).toHaveLength(8)
