@@ -25,6 +25,8 @@ export default () => (
         gridStep: 0.1,
         clearance: 0.2,
         maxIterations: 300_000,
+        busAttractionRadius: 1,
+        busAttractionBonus: 5_000,
       }),
     }}
   >
@@ -56,6 +58,7 @@ bun run build
 - Routing bounds enforcement from `SimpleRouteJson.bounds`.
 - Trace width selection from connection width, nominal width, or input defaults.
 - Configurable grid step, clearance, max iterations, via cost, heuristic weight, turn cost, layer costs, layer direction preferences, and track margin.
+- Explicit `SimpleRouteJson.buses` routing, with physical lane ordering, center-out routing, and neighbor-path attraction.
 - Basic post-processing to compact collinear route points and collapse very short same-layer tunnels.
 
 ## What Is Not Implemented
