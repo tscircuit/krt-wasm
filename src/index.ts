@@ -24,6 +24,8 @@ export interface KiCadRoutingToolsAutorouterOptions {
   layerCosts?: number[]
   layerDirectionPreferences?: number[]
   directionPreferenceCost?: number
+  busAttractionRadius?: number
+  busAttractionBonus?: number
   collapseShortSameLayerTunnels?: boolean
 }
 
@@ -158,6 +160,8 @@ function normalizeOptions(options: KiCadRoutingToolsAutorouterOptions) {
     layerCosts: options.layerCosts,
     layerDirectionPreferences: options.layerDirectionPreferences,
     directionPreferenceCost: options.directionPreferenceCost ?? 0,
+    busAttractionRadius: options.busAttractionRadius ?? 1,
+    busAttractionBonus: options.busAttractionBonus ?? 5_000,
   }
 }
 

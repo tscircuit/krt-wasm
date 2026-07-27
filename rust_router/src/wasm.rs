@@ -1,6 +1,7 @@
 use crate::obstacle_map::GridObstacleMap;
 use crate::router::GridRouter;
 use serde::{Deserialize, Serialize};
+use std::collections::{HashMap, HashSet};
 use wasm_bindgen::prelude::*;
 
 #[derive(Clone, Debug, Deserialize)]
@@ -9,9 +10,19 @@ struct SimpleRouteJson {
     layer_count: Option<usize>,
     obstacles: Vec<Obstacle>,
     connections: Vec<SimpleRouteConnection>,
+    #[serde(default)]
+    buses: Vec<SimpleRouteBus>,
     bounds: Bounds,
     min_trace_width: Option<NumberOrString>,
     nominal_trace_width: Option<NumberOrString>,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct SimpleRouteBus {
+    #[serde(default)]
+    name: Option<String>,
+    connection_names: Vec<String>,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -136,6 +147,10 @@ struct WasmRouterOptions {
     layer_direction_preferences: Option<Vec<u8>>,
     #[serde(default)]
     direction_preference_cost: i32,
+    #[serde(default = "default_bus_attraction_radius")]
+    bus_attraction_radius: f64,
+    #[serde(default = "default_bus_attraction_bonus")]
+    bus_attraction_bonus: i32,
 }
 
 impl Default for WasmRouterOptions {
@@ -151,6 +166,8 @@ impl Default for WasmRouterOptions {
             layer_costs: None,
             layer_direction_preferences: None,
             direction_preference_cost: 0,
+            bus_attraction_radius: default_bus_attraction_radius(),
+            bus_attraction_bonus: default_bus_attraction_bonus(),
         }
     }
 }
@@ -177,6 +194,21 @@ fn default_h_weight() -> f32 {
 
 fn default_turn_cost() -> i32 {
     1_000
+}
+
+fn default_bus_attraction_radius() -> f64 {
+    1.0
+}
+
+fn default_bus_attraction_bonus() -> i32 {
+    5_000
+}
+
+#[derive(Debug)]
+struct RoutePlanItem {
+    connection_index: usize,
+    reverse_direction: bool,
+    attraction_connection_name: Option<String>,
 }
 
 #[wasm_bindgen(js_name = routeSimpleRouteJson)]
@@ -210,9 +242,13 @@ fn route_simple_route_json_inner(
 
     let layer_names = get_layer_names(layer_count);
     let mut routed_cells: Vec<(i32, i32, u8)> = Vec::new();
+    let mut routed_paths: HashMap<String, Vec<(i32, i32, u8)>> = HashMap::new();
     let mut traces = Vec::new();
+    let route_plan = build_route_plan(input)?;
 
-    for (connection_index, connection) in input.connections.iter().enumerate() {
+    for route_plan_item in route_plan {
+        let connection_index = route_plan_item.connection_index;
+        let connection = &input.connections[connection_index];
         if connection.points_to_connect.len() < 2 {
             continue;
         }
@@ -225,10 +261,15 @@ fn route_simple_route_json_inner(
         ));
         let connection_ids = get_connection_ids(connection);
         let mut full_path: Vec<(i32, i32, u8)> = Vec::new();
+        let route_points: Vec<&RoutePoint> = if route_plan_item.reverse_direction {
+            connection.points_to_connect.iter().rev().collect()
+        } else {
+            connection.points_to_connect.iter().collect()
+        };
 
-        for segment_index in 0..(connection.points_to_connect.len() - 1) {
-            let start = &connection.points_to_connect[segment_index];
-            let end = &connection.points_to_connect[segment_index + 1];
+        for segment_index in 0..(route_points.len() - 1) {
+            let start = route_points[segment_index];
+            let end = route_points[segment_index + 1];
             let mut obstacles = build_obstacle_map(
                 input,
                 options,
@@ -251,7 +292,12 @@ fn route_simple_route_json_inner(
                 obstacles.add_allowed_cell(gx, gy);
             }
 
-            let router = GridRouter::new_core(
+            let bus_attraction_radius = if options.bus_attraction_radius > 0.0 {
+                (options.bus_attraction_radius / options.grid_step).round() as i32
+            } else {
+                0
+            };
+            let mut router = GridRouter::new_core(
                 options.via_cost,
                 options.h_weight,
                 Some(options.turn_cost),
@@ -262,9 +308,14 @@ fn route_simple_route_json_inner(
                 None,
                 options.layer_direction_preferences.clone(),
                 options.direction_preference_cost,
-                0,
-                0,
+                bus_attraction_radius,
+                options.bus_attraction_bonus.max(0),
             );
+            if let Some(attraction_connection_name) = &route_plan_item.attraction_connection_name {
+                if let Some(attraction_path) = routed_paths.get(attraction_connection_name) {
+                    router.set_attraction_path_core(attraction_path.clone());
+                }
+            }
 
             let (path, _iterations, _stats) = router.route_multi_core(
                 &obstacles,
@@ -295,6 +346,10 @@ fn route_simple_route_json_inner(
         }
 
         routed_cells.extend(full_path.iter().copied());
+        routed_paths.insert(connection.name.clone(), full_path.clone());
+        if route_plan_item.reverse_direction {
+            full_path.reverse();
+        }
 
         traces.push(SimplifiedPcbTrace {
             trace_type: "pcb_trace",
@@ -308,6 +363,202 @@ fn route_simple_route_json_inner(
     }
 
     Ok(traces)
+}
+
+fn build_route_plan(input: &SimpleRouteJson) -> Result<Vec<RoutePlanItem>, JsValue> {
+    let mut connection_index_by_name = HashMap::new();
+    for (connection_index, connection) in input.connections.iter().enumerate() {
+        if connection_index_by_name
+            .insert(connection.name.clone(), connection_index)
+            .is_some()
+        {
+            return Err(JsValue::from_str(&format!(
+                "SimpleRouteJson contains duplicate connection name {}",
+                connection.name
+            )));
+        }
+    }
+
+    let mut route_plan = Vec::new();
+    let mut scheduled_connection_indices = HashSet::new();
+    for bus in &input.buses {
+        let bus_label = bus.name.as_deref().unwrap_or("<unnamed>");
+        if bus.connection_names.len() < 2 {
+            return Err(JsValue::from_str(&format!(
+                "Bus {bus_label} must contain at least two connections"
+            )));
+        }
+
+        let mut bus_connection_indices = Vec::new();
+        for connection_name in &bus.connection_names {
+            let Some(&connection_index) = connection_index_by_name.get(connection_name) else {
+                return Err(JsValue::from_str(&format!(
+                    "Bus {bus_label} references unknown connection {connection_name}"
+                )));
+            };
+            if bus_connection_indices.contains(&connection_index) {
+                return Err(JsValue::from_str(&format!(
+                    "Bus {bus_label} contains connection {connection_name} more than once"
+                )));
+            }
+            if scheduled_connection_indices.contains(&connection_index) {
+                return Err(JsValue::from_str(&format!(
+                    "Connection {connection_name} belongs to more than one bus"
+                )));
+            }
+            if input.connections[connection_index].points_to_connect.len() < 2 {
+                return Err(JsValue::from_str(&format!(
+                    "Bus {bus_label} connection {connection_name} has fewer than two endpoints"
+                )));
+            }
+            bus_connection_indices.push(connection_index);
+        }
+
+        let reverse_direction =
+            bus_should_route_from_last_endpoints(input, &bus_connection_indices);
+        let physically_ordered_connection_indices =
+            physically_order_bus_connections(input, &bus_connection_indices, reverse_direction);
+        let center_out_connection_indices =
+            center_out_order(&physically_ordered_connection_indices);
+        let mut routed_bus_connection_indices = HashSet::new();
+
+        for connection_index in center_out_connection_indices {
+            let physical_position = physically_ordered_connection_indices
+                .iter()
+                .position(|candidate| *candidate == connection_index)
+                .expect("bus connection must have a physical position");
+            let attraction_connection_index = physical_position
+                .checked_sub(1)
+                .and_then(|position| physically_ordered_connection_indices.get(position))
+                .filter(|candidate| routed_bus_connection_indices.contains(*candidate))
+                .or_else(|| {
+                    physically_ordered_connection_indices
+                        .get(physical_position + 1)
+                        .filter(|candidate| routed_bus_connection_indices.contains(*candidate))
+                });
+
+            route_plan.push(RoutePlanItem {
+                connection_index,
+                reverse_direction,
+                attraction_connection_name: attraction_connection_index
+                    .map(|index| input.connections[*index].name.clone()),
+            });
+            routed_bus_connection_indices.insert(connection_index);
+            scheduled_connection_indices.insert(connection_index);
+        }
+    }
+
+    for connection_index in 0..input.connections.len() {
+        if !scheduled_connection_indices.contains(&connection_index) {
+            route_plan.push(RoutePlanItem {
+                connection_index,
+                reverse_direction: false,
+                attraction_connection_name: None,
+            });
+        }
+    }
+
+    Ok(route_plan)
+}
+
+fn bus_should_route_from_last_endpoints(
+    input: &SimpleRouteJson,
+    connection_indices: &[usize],
+) -> bool {
+    let first_endpoints: Vec<_> = connection_indices
+        .iter()
+        .filter_map(|index| input.connections[*index].points_to_connect.first())
+        .collect();
+    let last_endpoints: Vec<_> = connection_indices
+        .iter()
+        .filter_map(|index| input.connections[*index].points_to_connect.last())
+        .collect();
+    endpoint_span(&last_endpoints) < endpoint_span(&first_endpoints)
+}
+
+fn endpoint_span(points: &[&RoutePoint]) -> f64 {
+    let min_x = points
+        .iter()
+        .map(|point| point.x)
+        .fold(f64::INFINITY, f64::min);
+    let max_x = points
+        .iter()
+        .map(|point| point.x)
+        .fold(f64::NEG_INFINITY, f64::max);
+    let min_y = points
+        .iter()
+        .map(|point| point.y)
+        .fold(f64::INFINITY, f64::min);
+    let max_y = points
+        .iter()
+        .map(|point| point.y)
+        .fold(f64::NEG_INFINITY, f64::max);
+    (max_x - min_x).hypot(max_y - min_y)
+}
+
+fn physically_order_bus_connections(
+    input: &SimpleRouteJson,
+    connection_indices: &[usize],
+    use_last_endpoints: bool,
+) -> Vec<usize> {
+    let endpoint = |connection_index: usize| {
+        if use_last_endpoints {
+            input.connections[connection_index]
+                .points_to_connect
+                .last()
+                .expect("bus connection must have endpoints")
+        } else {
+            input.connections[connection_index]
+                .points_to_connect
+                .first()
+                .expect("bus connection must have endpoints")
+        }
+    };
+    let min_x = connection_indices
+        .iter()
+        .map(|index| endpoint(*index).x)
+        .fold(f64::INFINITY, f64::min);
+    let max_x = connection_indices
+        .iter()
+        .map(|index| endpoint(*index).x)
+        .fold(f64::NEG_INFINITY, f64::max);
+    let min_y = connection_indices
+        .iter()
+        .map(|index| endpoint(*index).y)
+        .fold(f64::INFINITY, f64::min);
+    let max_y = connection_indices
+        .iter()
+        .map(|index| endpoint(*index).y)
+        .fold(f64::NEG_INFINITY, f64::max);
+    let sort_by_x = max_x - min_x >= max_y - min_y;
+    let mut ordered = connection_indices.to_vec();
+    ordered.sort_by(|left, right| {
+        let left_endpoint = endpoint(*left);
+        let right_endpoint = endpoint(*right);
+        if sort_by_x {
+            left_endpoint.x.total_cmp(&right_endpoint.x)
+        } else {
+            left_endpoint.y.total_cmp(&right_endpoint.y)
+        }
+    });
+    ordered
+}
+
+fn center_out_order(physically_ordered_connection_indices: &[usize]) -> Vec<usize> {
+    let mut ordered = Vec::with_capacity(physically_ordered_connection_indices.len());
+    let middle = physically_ordered_connection_indices.len() / 2;
+    ordered.push(physically_ordered_connection_indices[middle]);
+    for offset in 1..physically_ordered_connection_indices.len() {
+        if let Some(left_index) = middle.checked_sub(offset) {
+            ordered.push(physically_ordered_connection_indices[left_index]);
+        }
+        if let Some(right_connection_index) =
+            physically_ordered_connection_indices.get(middle + offset)
+        {
+            ordered.push(*right_connection_index);
+        }
+    }
+    ordered
 }
 
 fn build_obstacle_map(
