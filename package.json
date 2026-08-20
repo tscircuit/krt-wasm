@@ -1,6 +1,10 @@
 {
   "name": "@tscircuit/krt-wasm",
   "version": "0.1.5",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/tscircuit/krt-wasm"
+  },
   "description": "Fork of KiCad Routing Tools packaged as a WASM autorouter for tscircuit.",
   "type": "module",
   "main": "./dist/index.js",
