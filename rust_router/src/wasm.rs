@@ -19,6 +19,14 @@ struct SimpleRouteJson {
     min_via_pad_diameter: Option<NumberOrString>,
     #[serde(default, rename = "min_via_pad_diameter")]
     legacy_min_via_pad_diameter: Option<NumberOrString>,
+    #[serde(default)]
+    min_via_hole_diameter: Option<NumberOrString>,
+    #[serde(default, rename = "min_via_hole_diameter")]
+    legacy_min_via_hole_diameter: Option<NumberOrString>,
+    #[serde(default)]
+    min_via_hole_edge_to_via_hole_edge_clearance: Option<NumberOrString>,
+    #[serde(default)]
+    allow_via_in_pad: bool,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -350,6 +358,19 @@ fn route_connections_with_order(
                 via_pad_diameter,
             );
 
+            // Current-net segments have not been committed to routed geometry yet.
+            // Copper may be shared, but a new distinct drill must clear every
+            // earlier drill, including those in this same connection chain.
+            for (gx, gy) in get_path_via_positions(&full_path) {
+                reserve_via_halo(
+                    &mut obstacles,
+                    gx,
+                    gy,
+                    get_via_hole_spacing(input),
+                    options.grid_step,
+                );
+            }
+
             let sources = point_states(input, start, layer_count, &layer_names, options.grid_step);
             let targets = point_states(input, end, layer_count, &layer_names, options.grid_step);
             let endpoint_positions = endpoint_positions(&sources, &targets);
@@ -394,7 +415,7 @@ fn route_connections_with_order(
                 targets,
                 options.max_iterations,
                 false,
-                0,
+                get_own_path_via_exclusion_radius(input, options.grid_step),
                 None,
                 None,
                 2,
@@ -728,6 +749,24 @@ fn build_obstacle_map(
         });
 
         if connected_to_current_net {
+            // Same-net copper can touch its pad. Via-in-pad is a different
+            // physical rule and must retain the pad's via exclusion volume.
+            if !input.allow_via_in_pad {
+                let (min_x, max_x, min_y, max_y) = obstacle_grid_bounds(
+                    obstacle,
+                    get_via_hole_diameter(input) / 2.0 + extra_margin,
+                    options.grid_step,
+                    min_gx,
+                    max_gx,
+                    min_gy,
+                    max_gy,
+                );
+                for gx in min_x..=max_x {
+                    for gy in min_y..=max_y {
+                        obstacles.add_blocked_via(gx, gy);
+                    }
+                }
+            }
             continue;
         }
 
@@ -771,6 +810,16 @@ fn build_obstacle_map(
             .iter()
             .any(|id| connection_ids.contains(id))
         {
+            // Electrical ownership does not waive spacing between drilled holes.
+            for &(gx, gy) in &routed_trace.via_positions {
+                reserve_via_halo(
+                    &mut obstacles,
+                    gx,
+                    gy,
+                    get_via_hole_spacing(input),
+                    options.grid_step,
+                );
+            }
             continue;
         }
 
@@ -790,6 +839,7 @@ fn build_obstacle_map(
             + current_via_pad_diameter / 2.0
             + options.clearance
             + extra_margin;
+        let via_to_via_clearance = via_to_via_clearance.max(get_via_hole_spacing(input));
 
         for &(gx, gy, layer) in &routed_trace.cells {
             reserve_cell_halo(
@@ -1250,6 +1300,33 @@ fn get_trace_width(input: &SimpleRouteJson, connection: &SimpleRouteConnection) 
         .unwrap_or(0.2)
 }
 
+fn get_via_hole_diameter(input: &SimpleRouteJson) -> f64 {
+    input
+        .min_via_hole_diameter
+        .as_ref()
+        .or(input.legacy_min_via_hole_diameter.as_ref())
+        .and_then(NumberOrString::as_f64)
+        .unwrap_or_else(|| get_via_pad_diameter(input) * 0.5)
+}
+
+fn get_via_hole_spacing(input: &SimpleRouteJson) -> f64 {
+    let clearance = input
+        .min_via_hole_edge_to_via_hole_edge_clearance
+        .as_ref()
+        .and_then(NumberOrString::as_f64)
+        .unwrap_or(0.1)
+        .max(0.1);
+    get_via_hole_diameter(input) + clearance
+}
+
+fn get_own_path_via_exclusion_radius(input: &SimpleRouteJson, grid_step: f64) -> i32 {
+    // The core rejects Chebyshev distances <= 2 * radius. The next lattice
+    // site therefore has at least (2 * radius + 1) * grid_step separation.
+    ((get_via_hole_spacing(input) / grid_step - 1.0) / 2.0)
+        .ceil()
+        .max(1.0) as i32
+}
+
 fn get_via_pad_diameter(input: &SimpleRouteJson) -> f64 {
     input
         .min_via_pad_diameter
@@ -1352,3 +1429,20 @@ fn sign(value: f64) -> i32 {
         0
     }
 }
+
+#[cfg(test)]
+#[path = "wasm_tests/fixtures.rs"]
+mod test_fixtures;
+#[cfg(test)]
+#[path = "wasm_tests/same_net_drills.rs"]
+mod same_net_drill_tests;
+#[cfg(test)]
+#[path = "wasm_tests/same_net_pad.rs"]
+mod same_net_pad_tests;
+#[cfg(test)]
+#[path = "wasm_tests/own_path_radius.rs"]
+mod own_path_radius_tests;
+
+#[cfg(test)]
+#[path = "wasm_tests/routed_chain.rs"]
+mod routed_chain_tests;
