@@ -34,7 +34,6 @@
     "looks-same": "^9.0.1",
     "react": "^19.1.0",
     "tscircuit": "^0.0.1757",
-    "typescript": "^5.8.3",
-    "@tscircuit/core": "^0.0.2268"
+    "typescript": "^5.8.3"
   }
 }
