@@ -1,0 +1,1542 @@
+#!/usr/bin/env python3
+"""Cross-check check_drc.py against KiCad's own DRC engine (issue #316).
+
+check_drc.py is the grading authority for the whole stress methodology, so its
+accuracy is load-bearing. Per board this runs `kicad-cli pcb drc --format json
+--severity-error --refill-zones` (KiCad grades at the board's OWN .kicad_pro
+rules -- the clearance ledger writes the routed floors there, so the two
+engines see the same constraints), filters both sides to the COPPER-CLEARANCE
+classes they both check, then matches items by net pair + location and
+classifies every discrepancy:
+
+  * MATCHED        -- same net pair within 0.5 mm: agreement.
+  * KICAD-ONLY     -- check_drc false negative (the dangerous direction;
+                      e.g. the butterstick shorting_items under-classification).
+                      Graded at the SAME classes on both sides (#1594). A
+                      KiCad item short by less than check_drc's 5% margin
+                      also lands here (KiCad's tolerance is an absolute
+                      500 nm): a real KiCad error, which
+                      `check_drc --clearance-margin-mm 0.0005` reports too.
+  * CHECKDRC-ONLY  -- check_drc phantom (over-report) OR a class KiCad cannot
+                      see (KiCad 10 net-unifies touching copper, so it is
+                      structurally blind to overlaps it merged into one net).
+
+Known-benign asymmetries filtered out:
+  * KiCad classes we deliberately do not grade (annular width,
+    silkscreen, text/edge, footprint checks, ...).
+  * KiCad "unconnected_items" (that is check_connected's job, not check_drc's).
+  * check_drc warnings (same-net copper classes + sub-coincidence gaps) --
+    KiCad permits same-net overlap outright.
+
+Graded SEPARATELY (#406, never matched against check_drc): KiCad's
+`connection_width` min-copper-web class. The checker is OFF by default
+(min_connection 0, warning severity), so _staged_copy stages the constraint
+(author-set min_connection kept, else the project's min_track_width) and
+lifts the severity; the count is reported as kicad_connection_width (None =
+not graded -- no recorded floor). check_drc has no counterpart by design:
+the flagged artifact lives in KiCad's own float-borderline web measurement.
+
+Graded SEPARATELY too (#1334): KiCad's `starved_thermal` -- a pad whose
+thermal relief resolves fewer spokes than `min_resolved_spokes` -- at the
+PROJECT's severity (staging leaves it as the author set it; KiCad's default
+is error). Reported as kicad_starved_thermal with the pads it names, never
+matched against check_drc (which has no thermal model) and never part of the
+CONSISTENT verdict or the exit code.
+
+Graded SEPARATELY too (#1376): KiCad's `track_dangling` -- a track end that
+nothing counts for -- at the project's severity (a warning unless the author
+set it). check_weird and check_orphan_stubs hold a looser model of the same
+defect (a tail past an anchor under 3 x the width is allowed, a track touching
+only one end is credited), so a delivered board they call clean can still
+carry them. Reported as kicad_track_dangling with the net and position, never
+matched against check_drc and never part of the CONSISTENT verdict or the exit
+code.
+
+Its own channel too (#1628): KiCad `clearance` items on two pads of ONE
+footprint closer than their clearance without touching. check_drc measures
+them and does not grade them (library geometry, #1306), and publishes each
+PAIR as an accepted `own-footprint-gap` row. KiCad lists the pair once per
+copper layer the two pads share (#1675), so one row answers for one item on an
+SMD pair and for two identical items on a through-hole pair of a 2-layer board.
+Every such item is dropped and counted as kicad_library_pad_gaps (KiCad items;
+checkdrc_library_pad_gaps counts pairs), not listed as a check_drc false
+negative. A row KiCad lists no item for is the channel disagreeing (#1706):
+counted as checkdrc_library_pad_gaps_unreported and named, apart from the
+rows check_drc tagged `unverified_rule` (a rule it cannot fully read may
+clear them). Neither enters the verdict, which grades the copper match.
+
+Usage:
+  python3 tests/stress/kicad_drc_compare.py <board.kicad_pcb> [...]
+  python3 tests/stress/kicad_drc_compare.py --wave <wave_dir>   # summary.json
+  python3 tests/stress/kicad_drc_compare.py <final> --baseline <input>
+
+--baseline subtracts the input board's items from BOTH engines, one for one,
+by position and then by (type, net pair). It cancels only what is reported
+identically on both boards, so a pile baseline cancels little (#1333).
+
+Exit: 0 every board compared and consistent; 1 a board diverged; 2 a board
+was NOT compared (kicad-cli missing or failed on it), or none was given (#995).
+Exit 2 outranks 1, and is never agreement.
+"""
+import argparse
+import json
+import math
+import os
+import re
+import shutil
+import subprocess
+import sys
+import tempfile
+
+REPO = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+sys.path.insert(0, REPO)
+sys.path.insert(0, os.path.join(REPO, 'py_router'))  # #522
+sys.path.insert(0, os.path.join(REPO, 'py_placer'))  # placement split
+sys.path.insert(0, os.path.join(REPO, 'py_tools'))  # #522
+
+# kicad_oracle's finder: $KICAD_CLI, then PATH and the packaged locations,
+# then every versioned Windows install, newest by numeric version. Windows
+# installs do NOT put kicad-cli on PATH, so the PATH-then-macOS lookup this
+# replaced found nothing there. The macOS path stays as the last resort so
+# the "not found" message below names a concrete location.
+from kicad_oracle import find_kicad_cli as _find_kicad_cli  # noqa: E402
+# Resolved SILENTLY here: at import the not-found warning came out BEFORE the
+# CMD banner __main__ installs, so on a machine without KiCad this tool's
+# output no longer started with `CMD:` (test_run4_instruments, red on the
+# Modal suite image). __main__ says the warning after the banner instead.
+KICAD_CLI = (_find_kicad_cli(warn=False)
+             or "/Applications/KiCad/KiCad.app/Contents/MacOS/kicad-cli")
+
+# kicad violation types that correspond to copper-clearance/short classes
+# check_drc grades. Everything else (annular_width, courtyard, silk, thermal,
+# malformed, zone fill, footprint/lib checks, text...) is out of scope.
+#
+# The drill-pair class -- check_drc's `via-drill-hole` and
+# `pad-drill-via-drill[-same-net]` -- is `hole_to_hole` in KiCad 10, and
+# `holes_co_located` when the two centres coincide (read from KiCad 10.0.0's
+# own DRC item table, in _pcbnew.kiface). The list named only `hole_near_hole`,
+# the older spelling, so every drill pair check_drc reported read
+# checkdrc_only and was never matched: two Net-(C1-Pad1) vias 0.18 mm
+# apart, which kicad-cli reports as hole_to_hole. `hole_near_hole`
+# stays for reports from older KiCad. Being listed here also stages both new
+# types at error in _staged_copy, as every copper class is (#526).
+KICAD_COPPER_TYPES = {
+    "clearance", "shorting_items", "tracks_crossing",
+    "hole_clearance", "hole_to_hole", "holes_co_located",
+    "hole_near_hole", "drilled_holes_too_close",
+    "drilled_holes_colliding", "via_hole_larger_than_pad",
+    "copper_edge_clearance",
+}
+
+# check_drc's SIZE classes, the mirror of the kicad-side scope above: KiCad's
+# track_width / via_diameter / hole_size items are out of scope, so
+# check_drc's must be too or every one of them lands in checkdrc_only. Until
+# #530 this never bit -- check_drc graded sizes against the fab floor only,
+# which routed copper never crosses -- but it now grades each item against
+# the board's OWN declared minimum through the shared resolver (the same
+# value KiCad's track_width check enforces), so a board carrying copper
+# below its min_track_width is a check_drc size item AND a KiCad size item,
+# both outside this comparator's copper-clearance match.
+CD_SIZE_TYPES = {"track-width", "via-size", "via-drill-size"}
+# #962 D6: a via in a solder-paste opening. KiCad has NO such check (probed on
+# 10.0.0: no finding at any severity), so these never enter the copper match,
+# where every one would read checkdrc_only. They get a labelled channel of
+# their own, `via_in_paste`, and never count as edge accepts.
+CD_VIA_PASTE_TYPES = {"via-in-paste"}
+# Copper in a keep-out rule area (check_drc `keepout`): check_drc-only by
+# construction -- kicad-cli 10.0.0 reported no `items_not_allowed` for a track
+# through a tracks-not-allowed rule area in our measurement, even on a board
+# pcbnew built itself; 10.0.3 and 10.0.7 report one row per track inside
+# (#1591). Its own labelled channel, `keepout`, off the copper match, on every
+# release; the `items_not_allowed` KiCad does report is counted beside it.
+CD_KEEPOUT_TYPES = {"keepout"}
+KICAD_KEEPOUT_TYPE = "items_not_allowed"
+# #1313: a .kicad_dru length window. KiCad's twin (`length_out_of_range`) is
+# not a copper type above, so check_drc's is out of the copper match too --
+# in it, every one would read checkdrc_only. #1303's diff-pair rules
+# (`skew_out_of_range`, `diff_pair_uncoupled_length_too_long`) likewise.
+CD_LENGTH_TYPES = {"length-out-of-range", "skew-out-of-range", "diff-pair-uncoupled"}
+
+# Min-copper-web class (#406): graded SEPARATELY from the copper-clearance
+# classes -- check_drc has no counterpart (the artifact lives in KiCad's own
+# float-borderline web measurement, which a from-scratch geometric check
+# cannot reproduce), so these items never enter the match and can never
+# pollute kicad_only (the check_drc-false-negative alarm channel).
+KICAD_WEB_TYPES = {"connection_width"}
+
+# Courtyard-overlap class (run-6): a third LABELED channel, never silently
+# filtered (run 5 shipped a stacked part while this comparator dropped
+# KiCad's courtyards_overlap on the floor and reported CONSISTENT). Items
+# are reconciled against check_assembly's class-waiver verdicts: each pair
+# is labeled blocking / advisory / waived / unmatched -- `unmatched` (KiCad
+# sees a pair our grader does not, or vice versa) is the alarm channel.
+# Never enters the copper match.
+KICAD_COURTYARD_TYPES = {"courtyards_overlap"}
+
+# Thermal-relief spokes (#1334): a fourth LABELED channel. It was filtered as
+# "known-benign", so a DONE board shipped two starved_thermal ERRORS (gp14
+# 04_multichannel_mixer: IC1.4 and IC2.4 GND, 1 spoke of 2) that no grader in
+# the repo named. Graded at the project's severity, like the copper classes
+# before #526 lifted them, and never in the copper match.
+KICAD_THERMAL_TYPES = {"starved_thermal"}
+
+# Dangling track ends (#1376): a fifth LABELED channel. KiCad reports
+# `track_dangling` where check_weird / check_orphan_stubs, which allow a short
+# tail past an anchor and credit a track touching one end, call the copper
+# clean. Like the thermal class it is graded at the project's severity and
+# never in the copper match.
+KICAD_DANGLING_TYPES = {"track_dangling"}
+# KiCad 10 spells a through-hole pad "PTH pad 7 [GND] of JP1" (lower-case
+# `pad`, #1406) and an SMD one "Pad 1 [GND] of BUS1 on bottom_copper".
+_PAD_ITEM_RE = re.compile(
+    r"(?:\b(?:N?PTH|SMD)\s+)?\b[Pp]ad\s+(\S*)\s*\[[^\]]*\]\s+of\s+(\S+)")
+
+#: #1390: the error types of KiCad's LAST report that no channel of this
+#: comparator classifies ({type: count}). A type outside the copper, web,
+#: thermal and courtyard classes used to be dropped without a word, so a
+#: `track_width` error read `kicad=0 ... CONSISTENT`. Set by `run_kicad_drc`,
+#: read by `compare_board_data` right after `kicad_items_for` returns.
+LAST_UNCLASSIFIED = {}
+
+
+def unclassified_error_types(data):
+    """{type: count} of the error-severity violations in a kicad-cli report
+    that no class here grades."""
+    known = (KICAD_COPPER_TYPES | KICAD_WEB_TYPES | KICAD_THERMAL_TYPES
+             | KICAD_COURTYARD_TYPES | KICAD_DANGLING_TYPES)
+    out = {}
+    for v in data.get("violations", []):
+        t = v.get("type", "")
+        if t and t not in known and v.get("severity", "error") == "error":
+            out[t] = out.get(t, 0) + 1
+    return out
+
+MATCH_RADIUS_MM = 0.5
+
+
+def run_kicad_drc(board: str):
+    """Run kicad-cli DRC, return (violations, error) with items filtered to
+    copper + web classes. Each -> {type, nets:frozenset, pos:(x,y), desc,
+    kinds} (kinds = the offending item kinds, e.g. ('track', 'zone'))."""
+    with tempfile.NamedTemporaryFile(suffix=".json", delete=False) as f:
+        out_json = f.name
+    try:
+        # --severity-all, not --severity-error: courtyards_overlap is
+        # demoted to WARNING by the run-6 project writeback and must still
+        # reach this comparator. Non-error items of every OTHER class are
+        # dropped below, so the copper channels keep error-only semantics.
+        if not (os.path.isfile(KICAD_CLI) or shutil.which(KICAD_CLI)):
+            # Run-7 A19: on a machine where kicad-cli is not on PATH this fell
+            # through to the macOS bundle default and died with a bare
+            # FileNotFoundError naming a path the user has never heard of. The
+            # oracle is the instrument that catches check_drc's own false
+            # negatives, so a run that cannot start it must say what to set.
+            return None, (
+                f"kicad-cli not found at '{KICAD_CLI}'. Set KICAD_CLI to the "
+                f"binary, e.g. KICAD_CLI='C:/Program Files/KiCad/<ver>/bin/"
+                f"kicad-cli.exe' (Windows), /usr/bin/kicad-cli (Linux), or "
+                f"/Applications/KiCad/KiCad.app/Contents/MacOS/kicad-cli "
+                f"(macOS) -- or put it on PATH. The KiCad oracle is skipped "
+                f"without it, so check_drc's result is UNCORROBORATED.")
+        r = subprocess.run(
+            [KICAD_CLI, "pcb", "drc", "--format", "json", "--severity-all",
+             "--refill-zones", "--output", out_json, board],
+            capture_output=True, text=True, timeout=1800)
+        if not os.path.exists(out_json) or os.path.getsize(out_json) == 0:
+            return None, f"kicad-cli produced no report (rc={r.returncode}: {r.stderr.strip()[:200]})"
+        data = json.load(open(out_json))
+    except Exception as e:  # noqa: BLE001 -- per-board tool robustness
+        return None, f"kicad-cli failed: {e}"
+    finally:
+        try:
+            os.unlink(out_json)
+        except OSError:
+            pass
+    LAST_UNCLASSIFIED.clear()
+    LAST_UNCLASSIFIED.update(unclassified_error_types(data))
+    return parse_kicad_report(data), None
+
+
+def parse_kicad_report(data):
+    """The graded items of one kicad-cli DRC JSON report: the courtyard
+    class at any severity, the copper, web and thermal classes at error."""
+    out = []
+    for v in data.get("violations", []):
+        vtype = v.get("type", "")
+        if vtype in KICAD_COURTYARD_TYPES:
+            # any severity (the writeback demotes to warning); ref pair
+            # from the item descriptions ("Footprint H4 of ...")
+            refs = []
+            for item in v.get("items", []):
+                m = re.search(r"Footprint\s+(\S+)", item.get("description",
+                                                             "") or "")
+                if m:
+                    refs.append(m.group(1))
+            out.append({"type": vtype, "nets": frozenset(),
+                        "pos": (0.0, 0.0), "desc": v.get("description", ""),
+                        "kinds": tuple(sorted(refs)[:2]),
+                        "severity": v.get("severity", "")})
+            continue
+        if vtype in KICAD_DANGLING_TYPES:
+            # at the project's severity: a warning by default, so the
+            # error-only filter below must not drop it
+            item = (v.get("items") or [{}])[0]
+            d = item.get("description", "") or ""
+            p = item.get("pos") or {}
+            out.append({"type": vtype,
+                        "nets": frozenset([d[d.index("[") + 1:d.index("]")]]
+                                          if "[" in d and "]" in d else []),
+                        "pos": (float(p.get("x", 0.0)), float(p.get("y", 0.0))),
+                        "desc": d, "kinds": ("track",),
+                        "severity": v.get("severity", "")})
+            continue
+        if (vtype not in KICAD_COPPER_TYPES and vtype not in KICAD_WEB_TYPES
+                and vtype not in KICAD_THERMAL_TYPES):
+            continue
+        if v.get("severity") == "warning":
+            # copper/web channels keep their historical error-only
+            # semantics under the new --severity-all run
+            continue
+        nets = set()
+        pos = None
+        copper_pos = None
+        kinds = set()
+        owners = _graphic_owners(i.get("description", "")
+                                 for i in v.get("items", []))
+        for item in v.get("items", []):
+            d = item.get("description", "")
+            # descriptions look like: "Track [/NET] on F.Cu, length ..." or
+            # "Via [/NET] on F.Cu - B.Cu" or "Pad 3 [/NET] of U1 on F.Cu"
+            if "[" in d and "]" in d:
+                nets.add(d[d.index("[") + 1:d.index("]")])
+            if d:
+                kinds.add(d.split()[0].lower())
+            p = item.get("pos")
+            if pos is None and p:
+                pos = (float(p.get("x", 0.0)), float(p.get("y", 0.0)))
+            # For edge violations the FIRST item is often the Edge.Cuts /
+            # NPTH-pad object, whose anchor can sit a far corner away from
+            # the offending copper (quickfeather: a 58mm gr_line anchored
+            # 24mm from the flagged track) -- proximity pairing against
+            # check_drc's copper-anchored items then never matches. Prefer
+            # the position of the COPPER item (the one carrying a [net]).
+            if copper_pos is None and p and "[" in d and "]" in d:
+                copper_pos = (float(p.get("x", 0.0)), float(p.get("y", 0.0)))
+        if vtype in EDGE_KICAD_TYPES and copper_pos is not None:
+            pos = copper_pos
+        row = {"type": vtype, "nets": frozenset(nets),
+               "pos": pos or (0.0, 0.0),
+               "desc": v.get("description", ""),
+               "kinds": tuple(sorted(kinds)),
+               "graphic_owners": owners}
+        pad_items = [(m, i) for i in v.get("items", [])
+                     for m in [_PAD_ITEM_RE.search(
+                         i.get("description", "") or "")] if m]
+        # The pads the item names, as REF.PAD: for a thermal item the starved
+        # pad a reader goes to fix, for a clearance item its two participants.
+        row["pads"] = tuple(f"{m.group(2)}.{m.group(1)}" for m, _i in pad_items)
+        if vtype in KICAD_THERMAL_TYPES:
+            # At the PAD, not the zone's anchor (one point for every pad
+            # the pour starves).
+            _pp = pad_items[0][1].get("pos") if pad_items else None
+            if _pp:
+                row["pos"] = (float(_pp.get("x", 0.0)), float(_pp.get("y", 0.0)))
+            row["severity"] = v.get("severity", "")
+        out.append(row)
+    return out
+
+
+# "Polygon [<no net>] of U2 on F.Cu" -- a footprint's own graphic copper. A
+# net-less PAD ("Pad 3 [<no net>] of U2") is not graphic copper and never
+# matches.
+_GRAPHIC_OWNER_RE = re.compile(r"^(?!Pad\b)\S+ \[<no net>\] of (\S+) on ")
+
+
+def _graphic_owners(descriptions):
+    """The footprints whose net-less GRAPHIC copper a KiCad item names (#995)."""
+    return tuple(sorted({m.group(1) for d in descriptions
+                         if (m := _GRAPHIC_OWNER_RE.match(d or ""))}))
+
+
+def run_check_drc(board: str, clearance: float = None, netclasses: bool = True,
+                  baseline: str = None):
+    """Run check_drc.run_drc, return counted violations (post warning-split)
+    as {type, nets:frozenset, pos:(x,y)}.
+
+    Parity with the kicad-cli side (#326/#338): pad/footprint local-clearance
+    overrides are graded unconditionally (they live in the .kicad_pcb, which
+    staging never touches); the board's min_copper_edge_clearance is always
+    honored (staging leaves it alone); and the NET CLASSES are graded as the
+    staged copy has KiCad grade them (#1594): `clearance` for the Default
+    class (which _staged_copy equalizes to it) and every non-Default class at
+    its own value, a pair at max(A, B) -- the check_drc CLI's own reading.
+    The staged copy does not clamp a non-Default class (only
+    `--clearance-ceiling` does, in the project itself, since #530), so
+    grading the board at one clearance listed every pair a stricter class
+    breaks as KICAD-ONLY. `netclasses=False` keeps the single-clearance
+    grade for a caller that asks for it."""
+    from check_drc import run_drc
+    kw = {"clearance": clearance} if clearance else {}
+    # _staged_copy forces copper_edge_clearance severity to "error" on the
+    # kicad-cli side (#441: authored-"ignore" boards must not hide router copper
+    # run to the milled edge). Mirror that here or every edge item on an
+    # ignore-authored board (sofle_pico) grades one-sided as kicad_only -- and
+    # check_drc's accepted-edge publications (pad-covered, quantization-margin,
+    # #448 npth-slot) never happen, so the reconciler can't subtract them.
+    kw["respect_edge_severity"] = False
+    # #1626: check_drc grades at the board's own severities, and _staged_copy
+    # stages every copper class at "error" on the kicad-cli side (#526). Grade
+    # this side at the same staged severities; a .kicad_dru rule's own
+    # (severity ...) is left as authored on both sides.
+    kw["severity_overrides"] = {k: "error" for k in KICAD_COPPER_TYPES}
+    try:
+        from fix_kicad_drc_settings import read_project_edge_clearance
+        edge = read_project_edge_clearance(board)
+        if edge:
+            kw["board_edge_clearance"] = edge
+    except Exception:
+        pass
+    # Staging leaves the board's min_hole_to_hole alone, so kicad-cli grades
+    # drill pairs at it, and the check_drc CLI pins its floor up to it (#439).
+    # Graded here at the 0.20 default, a pair between the two read kicad_only
+    # (a GND/RAM_D3 pair 0.2308 mm apart under a board's 0.25).
+    try:
+        from list_nets import read_design_rules
+        import routing_defaults
+        h2h = float(read_design_rules(board).get("constraints", {})
+                    .get("min_hole_to_hole") or 0.0)
+        if h2h > routing_defaults.HOLE_TO_HOLE_CLEARANCE:
+            kw["hole_to_hole_clearance"] = h2h
+    except Exception:
+        pass
+    if netclasses:
+        try:
+            from list_nets import read_design_rules, net_clearance_map
+            from kicad_parser import extract_nets
+            rules = read_design_rules(board)
+            if rules.get("classes"):
+                with open(board, encoding="utf-8", errors="replace") as f:
+                    net_objs, _ = extract_nets(f.read())
+                ncl = net_clearance_map(board, [n.name for n in net_objs.values()],
+                                        rules=rules)
+                if ncl:
+                    kw["net_clearances"] = ncl
+        except Exception:
+            pass
+    # #383: NO redirect_stdout -- swapping the process-global sys.stdout inside
+    # a worker thread stole other concurrent boards' prints (result lines) into
+    # this buffer. print_summary=False makes run_drc emit nothing in the success
+    # path, so no capture is needed.
+    if baseline:
+        kw["baseline"] = baseline    # #962: placement-created graphic grazes
+    violations = run_drc(board, quiet=True, print_summary=False, **kw)
+    out = []
+    for v in violations or []:
+        if v.get("type") in CD_SIZE_TYPES or v.get("type") in CD_LENGTH_TYPES:
+            continue        # out of the copper-clearance scope on BOTH sides
+        # Net 0 in KiCad's spelling: check_drc names it `net_0` (a KiCad 10
+        # board has no nets[0]), KiCad says `<no net>`. Without this a short
+        # against a part's own copper -- which check_drc counts since #1181 --
+        # shared only one net with KiCad's item and fell to the tight radius.
+        nets = frozenset("<no net>" if str(v.get(k)) == "net_0" else str(v.get(k))
+                         for k in ("net1", "net2") if v.get(k))
+        pos = None
+        for k in ("loc1", "via_loc", "pad_loc", "seg_loc", "cross_point", "loc2"):
+            p = v.get(k)
+            if p:
+                pos = (float(p[0]), float(p[1]))
+                break
+        item = {"type": v["type"], "nets": nets, "pos": pos or (0.0, 0.0)}
+        # check_drc publishes 'accepted' edge items (a track covered by an
+        # edge-exempt pad -- no new edge copper): not a check_drc failure, but the
+        # matching kicad copper_edge_clearance finding must be dropped, not alarmed
+        # on as a false negative. Carry the flag through for the reconciler.
+        if v.get("accepted"):
+            item["accepted"] = v["accepted"]
+        if v.get("pad_loc2"):
+            # #1628: a pad pair is anchored by KiCad on either pad
+            item["pos2"] = (float(v["pad_loc2"][0]), float(v["pad_loc2"][1]))
+        if v.get("accepted") == "own-footprint-gap":
+            # #1675: which two pads, as KiCad spells them: it has no `~2` for
+            # the second block of a reference one file uses twice (#726)
+            item["pad_pair"] = frozenset(re.sub(r"~\d+(?=\.)", "", v[k], count=1)
+                                         for k in ("pad_ref", "pad_ref2"))
+            if v.get("unverified_rule"):
+                item["unverified_rule"] = v["unverified_rule"]     # #1706
+        if v.get("owner"):
+            item["owner"] = v["owner"]     # #995 footprint-own-copper
+        # The part whose graphic copper the row names ("Polygon(U2)"), so
+        # match() can pair it with KiCad's "Polygon [<no net>] of U2" item,
+        # which KiCad anchors at the SHAPE, not at the contact (#1181).
+        for _k in ("item1", "item2"):
+            _lbl = v.get(_k) or ""
+            if _lbl.startswith("Polygon(") and _lbl.endswith(")"):
+                item["graphic_owner"] = _lbl[len("Polygon("):-1].split("~")[0]
+        # Board-edge reconciliation (edge family) needs the WHOLE segment, not
+        # just its start: check_drc anchors segment-board-edge at the segment
+        # start while kicad anchors copper_edge_clearance at the edge-closest
+        # point ON the segment, so point-to-segment distance collapses the
+        # anchor mismatch. seg_loc is a 4-tuple (sx, sy, ex, ey).
+        seg = v.get("seg_loc")
+        if seg and len(seg) >= 4:
+            item["seg"] = (float(seg[0]), float(seg[1]), float(seg[2]), float(seg[3]))
+        out.append(item)
+    return out
+
+
+#: A graphic item both engines attribute to the SAME part with the SAME nets
+#: is paired within this radius (#1181) -- the part bounds how far apart the
+#: two anchors can be.
+GRAPHIC_OWNER_MATCH_RADIUS_MM = 15.0
+
+
+def match(kicad_items, cd_items):
+    """Greedy match by shared net + proximity; returns (matched, kicad_only, cd_only)."""
+    used = set()
+    matched = []
+    kicad_only = []
+    for kv in kicad_items:
+        best = None
+        for i, cv in enumerate(cd_items):
+            if i in used:
+                continue
+            if kv["nets"] and cv["nets"] and not (kv["nets"] & cv["nets"]):
+                continue
+            d = math.hypot(kv["pos"][0] - cv["pos"][0], kv["pos"][1] - cv["pos"][1])
+            # The two engines anchor a violation at different reference points
+            # (check_drc: pad copper centre; kicad: item anchor / track vertex),
+            # which for big module pads differ by mm. When BOTH nets agree the
+            # identity is unambiguous -- allow a generous radius; the tight
+            # radius only arbitrates single-net/partial matches.
+            radius = 3.0 if (kv["nets"] and kv["nets"] == cv["nets"]) else MATCH_RADIUS_MM
+            # Same nets AND the same part's graphic copper named on both
+            # sides: one object, whatever the anchors. KiCad anchors a
+            # polygon item at the polygon, which on a big tab or shield is
+            # several mm from the contact check_drc reports (#1181).
+            if (radius == 3.0 and cv.get("graphic_owner")
+                    and cv["graphic_owner"] in (kv.get("graphic_owners") or ())):
+                radius = GRAPHIC_OWNER_MATCH_RADIUS_MM
+            if d <= radius and (best is None or d < best[0]):
+                best = (d, i)
+        if best is not None:
+            used.add(best[1])
+            matched.append((kv, cd_items[best[1]]))
+        else:
+            kicad_only.append(kv)
+    cd_only = [cv for i, cv in enumerate(cd_items) if i not in used]
+    return matched, kicad_only, cd_only
+
+
+# --- Board-edge anchor reconciliation (edge family only) ---------------------
+# The two engines report the SAME copper-to-edge violation at DIFFERENT anchors:
+# kicad's `copper_edge_clearance` anchors at the edge-closest point (which lies
+# ON the offending copper), while check_drc's `segment-board-edge` anchors at the
+# segment START (mm away on a long track). The generic point-to-point matcher
+# fails, so a shared edge violation double-counts as kicad_only AND checkdrc_only
+# (core1106_cam: 51 shared -> 51 + 51). This narrow reconciliation matches the
+# edge family by (a) shared net + proximity to the WHOLE segment, then (b)
+# net-set agreement within the family (mirroring the net-PAIR agreement metric
+# already used below). Genuine one-sided divergence -- a net only ONE engine
+# flags for edge -- has no counterpart on the other side under either pass, so it
+# is left in the remaining kicad_only / checkdrc_only and stays reported.
+EDGE_KICAD_TYPES = {"copper_edge_clearance"}
+# #962: footprint graphic copper past the outline / a placement-created graze
+# is KiCad's copper_edge_clearance too (one KiCad item per shape).
+EDGE_CD_TYPES = {"segment-board-edge", "via-board-edge", "pad-board-edge",
+                 "graphic-off-board", "graphic-board-edge"}
+EDGE_MATCH_RADIUS_MM = 2.0   # generous: kicad's edge point sits on the segment,
+
+
+def _point_to_segment(pt, seg):
+    """Distance from point pt=(x,y) to segment seg=(sx,sy,ex,ey)."""
+    px, py = pt
+    sx, sy, ex, ey = seg
+    dx, dy = ex - sx, ey - sy
+    if dx == 0.0 and dy == 0.0:
+        return math.hypot(px - sx, py - sy)
+    t = ((px - sx) * dx + (py - sy) * dy) / (dx * dx + dy * dy)
+    t = max(0.0, min(1.0, t))
+    return math.hypot(px - (sx + t * dx), py - (sy + t * dy))
+
+
+def _edge_net_ok(kv, cv):
+    """Same-net gate for the edge family: a copper-to-edge item carries one net
+    (the copper's); a blank/no-net edge item may pair with anything."""
+    if kv["nets"] and cv["nets"]:
+        return bool(kv["nets"] & cv["nets"])
+    return True
+
+
+def _edge_dist(kv, cv):
+    """kicad edge point vs check_drc edge item -- point-to-segment when the cd
+    item is a track (its whole segment is known), else point-to-point."""
+    if cv.get("seg"):
+        return _point_to_segment(kv["pos"], cv["seg"])
+    return math.hypot(kv["pos"][0] - cv["pos"][0], kv["pos"][1] - cv["pos"][1])
+
+
+def reconcile_edge_family(kicad_only, cd_only):
+    """Collapse the edge-anchor double-count. Returns
+    (n_reconciled, remaining_kicad_only, remaining_cd_only)."""
+    k_idx = [i for i, v in enumerate(kicad_only) if v["type"] in EDGE_KICAD_TYPES]
+    c_idx = [i for i, v in enumerate(cd_only) if v["type"] in EDGE_CD_TYPES]
+    if not k_idx or not c_idx:
+        return 0, kicad_only, cd_only
+    k_matched, c_matched = set(), set()
+    # Pass 1: shared-net proximity to the whole segment (anchor-collapsing).
+    for ki in k_idx:
+        kv = kicad_only[ki]
+        best = None
+        for ci in c_idx:
+            if ci in c_matched:
+                continue
+            cv = cd_only[ci]
+            if not _edge_net_ok(kv, cv):
+                continue
+            d = _edge_dist(kv, cv)
+            if d <= EDGE_MATCH_RADIUS_MM and (best is None or d < best[0]):
+                best = (d, ci)
+        if best is not None:
+            c_matched.add(best[1])
+            k_matched.add(ki)
+    # Pass 2: net-set agreement (position-independent) for the residue -- a net
+    # BOTH engines flag for edge is the same condition however each anchored it.
+    # Min-count pairing (one cd item consumes one kicad item of the same net set)
+    # preserves genuine per-net over-flagging as one-sided.
+    from collections import defaultdict
+    k_by_net = defaultdict(list)
+    for ki in k_idx:
+        if ki not in k_matched:
+            k_by_net[frozenset(kicad_only[ki]["nets"])].append(ki)
+    for ci in c_idx:
+        if ci in c_matched:
+            continue
+        pool = k_by_net.get(frozenset(cd_only[ci]["nets"]))
+        if pool:
+            k_matched.add(pool.pop())
+            c_matched.add(ci)
+    rem_k = [v for i, v in enumerate(kicad_only) if i not in k_matched]
+    rem_c = [v for i, v in enumerate(cd_only) if i not in c_matched]
+    return len(k_matched), rem_k, rem_c
+
+
+def _drop_kicad_covered_by_accepted(kicad, cd_accepted):
+    """Drop kicad copper_edge_clearance items that match an ACCEPTED check_drc edge
+    item -- a track whose edge copper is covered by an edge-exempt pad (check_drc's
+    authority; ottercast R7.2). Respecting check_drc's accept here keeps the item out
+    of kicad_only (the false-negative alarm) instead of double-reporting a
+    pad-placement condition no routing can fix. Returns (remaining_kicad, n_dropped)."""
+    acc = [c for c in cd_accepted if c.get("type") in EDGE_CD_TYPES]
+    if not acc:
+        return kicad, 0
+    c_used, keep, dropped = set(), [], 0
+    for kv in kicad:
+        if kv.get("type") not in EDGE_KICAD_TYPES:
+            keep.append(kv)
+            continue
+        best = None
+        for i, cv in enumerate(acc):
+            if i in c_used or not _edge_net_ok(kv, cv):
+                continue
+            d = _edge_dist(kv, cv)
+            if d <= EDGE_MATCH_RADIUS_MM and (best is None or d < best[0]):
+                best = (d, i)
+        if best is not None:
+            c_used.add(best[1])
+            dropped += 1  # covered by an edge-exempt pad -> accepted-by-design
+        else:
+            keep.append(kv)
+    return keep, dropped
+
+
+# --- #408: accept-by-design edge-clearance subtraction -----------------------
+def _net_tie_accepted_pairs(board: str):
+    """[(frozenset({netA, netB}), (x, y))] -- net pairs a footprint's
+    net_tie_pad_groups deliberately shorts, with the footprint position.
+
+    KiCad reports the Kelvin-shunt escape contact as shorting_items/clearance
+    even on the HUMAN-routed originals (cynthion ships 4 such items, one per
+    shunt) -- an enclosed sense tab cannot be exited without touching its
+    partner pad, and the designer accepts it. Grading treats tie-pair items AT
+    the tie footprint as accepted-by-design (the #408 pattern); the positional
+    gate keeps genuine track-track shorts between the same nets elsewhere on
+    the board flagged."""
+    try:
+        from kicad_parser import parse_kicad_pcb
+        pcb = parse_kicad_pcb(board)
+    except Exception:
+        return []
+    pairs = []
+    for fp in pcb.footprints.values():
+        if not getattr(fp, 'net_tie_groups', None):
+            continue
+        by_num = {}
+        for p in fp.pads:
+            by_num.setdefault(p.pad_number, []).append(p)
+        for group in fp.net_tie_groups:
+            members = [p for num in group for p in by_num.get(num, [])]
+            names = {p.net_name for p in members if p.net_id != 0 and p.net_name}
+            if len(names) >= 2:
+                for a in names:
+                    for b in names:
+                        if a < b:
+                            pairs.append((frozenset((a, b)), (fp.x, fp.y)))
+    return pairs
+
+
+_NET_TIE_ACCEPT_RADIUS_MM = 3.0
+
+
+def _drop_net_tie_accepted(items, tie_pairs):
+    """Drop accepted net-tie contact items: type shorting_items / clearance /
+    pad-segment whose net pair is a tie pair and whose anchor lies within
+    _NET_TIE_ACCEPT_RADIUS_MM of the tie footprint. Returns (kept, dropped)."""
+    if not tie_pairs:
+        return items, 0
+    kept, dropped = [], 0
+    for v in items:
+        hit = False
+        if len(v.get("nets") or ()) == 2:
+            for pair, (fx, fy) in tie_pairs:
+                if v["nets"] == pair and \
+                        math.hypot(v["pos"][0] - fx, v["pos"][1] - fy) <= _NET_TIE_ACCEPT_RADIUS_MM:
+                    hit = True
+                    break
+        if hit:
+            dropped += 1
+        else:
+            kept.append(v)
+    return kept, dropped
+
+
+def _drop_kicad_own_copper(kicad, cd_own):
+    """Drop the KiCad items check_drc published as `footprint-own-copper` (#995).
+
+    KiCad gives a footprint's graphic copper no net, so a track, via or pad of
+    the one net that part's own pads give its copper is reported against
+    `<no net>`: esp_prog's SOT-89 tab and pad 2's `Net-(C1-Pad1)`. Matched by
+    the part KiCad names and that net, not by position -- KiCad anchors an
+    item at the item, not at the contact. A different net on the same part's
+    copper (a real short, which KiCad reports in the same form) matches no
+    accepted pair and stays kicad_only. Returns (remaining_kicad, n_dropped).
+    """
+    accepted = {(c["owner"], n) for c in cd_own if c.get("owner")
+                for n in c["nets"] if n != "<no net>"}
+    if not accepted:
+        return kicad, 0
+    keep, dropped = [], 0
+    for kv in kicad:
+        nets = kv.get("nets") or frozenset()
+        if (kv.get("type") in ("shorting_items", "clearance")
+                and len(nets) == 2 and "<no net>" in nets):
+            (other,) = nets - {"<no net>"}
+            if any((o, other) in accepted for o in kv.get("graphic_owners", ())):
+                dropped += 1
+                continue
+        keep.append(kv)
+    return keep, dropped
+
+
+#: how far KiCad's anchor for a pad pair may sit from either pad (#1628): it
+#: anchors the item on one of the two pads, and both belong to one part
+LIBRARY_GAP_MATCH_RADIUS_MM = 2.0
+
+
+def _drop_kicad_library_gaps(kicad, cd_gaps):
+    """Drop the KiCad `clearance` items check_drc published as
+    `own-footprint-gap` (#1628): two pads of ONE footprint on different nets,
+    closer than their clearance without touching. Library geometry no step
+    changes, so check_drc does not grade them (#1306) -- but it measured them,
+    so they are not its false negatives: they get their own channel.
+
+    A row publishes a PAIR, and KiCad lists a pair once per copper layer the
+    two pads share (#1675): one item for an SMD pair, two identical ones for a
+    through-hole pair on 2 layers, four on 4. So a row keeps matching, however
+    many KiCad lists, and n_dropped counts KiCad items, not rows. Which is why
+    an item must NAME the row's two pads: a track's clearance to one of those
+    pads, or another part's pad, on the same net pair beside them is a finding
+    of its own and stays. The anchor test separates the two blocks of a
+    reference one file uses twice. Returns (remaining_kicad, n_dropped)."""
+    if not cd_gaps:
+        return kicad, 0
+    keep, dropped = [], 0
+    for kv in kicad:
+        if any(_library_gap_match(kv, c) for c in cd_gaps):
+            dropped += 1
+        else:
+            keep.append(kv)
+    return keep, dropped
+
+
+def _library_gap_match(kv, c):
+    """Does KiCad item `kv` report check_drc's library-gap row `c`?"""
+    return (kv.get("type") == "clearance" and c["nets"] == kv.get("nets")
+            and c.get("pad_pair") == frozenset(kv.get("pads") or ())
+            and any(p and math.hypot(kv["pos"][0] - p[0], kv["pos"][1] - p[1])
+                    <= LIBRARY_GAP_MATCH_RADIUS_MM
+                    for p in (c.get("pos"), c.get("pos2"))))
+
+
+def _library_gaps_unreported(kicad, cd_gaps):
+    """#1706: check_drc's library-gap rows KiCad lists no item for, split as
+    (certain, may_be_cleared): a row tagged `unverified_rule` is one a rule
+    check_drc cannot fully read may clear, so KiCad's silence on it is
+    expected; an untagged one is the channel disagreeing."""
+    certain, maybe = [], []
+    for c in cd_gaps:
+        if not any(_library_gap_match(kv, c) for kv in kicad):
+            (maybe if c.get("unverified_rule") else certain).append(c)
+    return certain, maybe
+
+
+# The floor itself lives in py_router so check_weird and the repair passes call
+# the SAME function (#1187) rather than a mirror of it.
+from fix_kicad_drc_settings import web_min_connection as _web_min_connection  # noqa: E402
+
+
+_PAD_OVERRIDE_CACHE = {}
+
+
+def _smallest_pad_override(board: str):
+    """The smallest per-pad `local_clearance` this board DECLARES, or None.
+
+    #326 resolves the pad's own `(clearance ...)` else the footprint-level one,
+    so this is the tightest clearance the board says some pair may legally have.
+    A staged BOARD MINIMUM above it grades that declaration away (see the call
+    site). Cached per path: `compare_board_data` stages the final and the
+    baseline, and a big board is not worth parsing twice.
+    """
+    if board in _PAD_OVERRIDE_CACHE:
+        return _PAD_OVERRIDE_CACHE[board]
+    val = None
+    try:
+        import io
+        import contextlib
+        sys.path.insert(0, os.path.join(
+            os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))), 'py_router'))
+        from kicad_parser import parse_kicad_pcb
+        with contextlib.redirect_stderr(io.StringIO()):
+            pcb = parse_kicad_pcb(board)
+        for fp in (getattr(pcb, 'footprints', None) or {}).values():
+            for pd in fp.pads:
+                lc = getattr(pd, 'local_clearance', 0) or 0
+                if lc > 0 and (val is None or lc < val):
+                    val = lc
+    except Exception:
+        val = None          # never let this turn a gradeable board into a skip
+    _PAD_OVERRIDE_CACHE[board] = val
+    return val
+
+
+def _staged_copy(board: str, clearance: float):
+    """Copy board + sibling .kicad_pro into a temp dir, staged so KiCad grades at
+    the routed floor. `clearance` here is the caller's RESOLVED grading clearance,
+    which compare_board_data now sets to the board's OWN recorded floor (#439), so
+    the Default-class equalization below is a no-op on routed output (the recorded
+    Default class already IS the floor) -- it only bites a stock/project-less board.
+
+    NON-Default classes are left untouched: KiCad grades each at its own value
+    and a cross-class pair at max(A, B). Since #530 the writeback clamps them
+    only under --clearance-ceiling, so a board routed without one ships its
+    classes as authored -- which is why run_check_drc grades the check_drc side
+    at the same classes (#1594) rather than at one clearance.
+
+    This function still does the useful, board-derived work: skip the slow silk DRC
+    provider, stage the #406 min-connection web check, and pin an ABSENT edge rule to
+    the fab floor. The clearance forcings are legacy and mostly inert now that the
+    caller passes the recorded floor."""
+    import shutil
+    clearance = float(clearance)
+    d = tempfile.mkdtemp(prefix="kdrc_")
+    b2 = os.path.join(d, os.path.basename(board))
+    shutil.copy(board, b2)
+    # #498: stage the custom-rules file too -- kicad-cli only honors rules
+    # sitting next to the staged project, and the router routes to the board's
+    # per-layer clearance rules, so grading without them manufactures phantom
+    # violations on ruled layers (or misses real ones).
+    dru = os.path.splitext(board)[0] + ".kicad_dru"
+    if os.path.exists(dru):
+        shutil.copy(dru, os.path.splitext(b2)[0] + ".kicad_dru")
+    pro = os.path.splitext(board)[0] + ".kicad_pro"
+    pro2 = os.path.splitext(b2)[0] + ".kicad_pro"
+    try:
+        cfg = json.load(open(pro)) if os.path.exists(pro) else {}
+    except Exception:
+        cfg = {}
+    def _f(x, dflt):
+        try:
+            return float(x)
+        except (TypeError, ValueError):
+            return dflt
+    for c in cfg.setdefault("net_settings", {}).setdefault("classes", []) or []:
+        # Only the Default class is equalized to the routed clearance; non-Default
+        # classes keep their original clearance (routing respects them -- PR392).
+        if c.get("name", "Default") == "Default" and "clearance" in c:
+            c["clearance"] = min(_f(c.get("clearance"), clearance), clearance)
+    rules = cfg.setdefault("board", {}).setdefault("design_settings", {}).setdefault("rules", {})
+    # The BOARD MINIMUM outranks a per-pad `local_clearance` override in KiCad,
+    # where the netclass does not (#326: a pad override REPLACES the class for
+    # that pad). So forcing this key up to the routed floor grades the board's
+    # OWN declared pad overrides away and manufactures items on copper the
+    # router legitimately laid at them -- the writeback caps this key DOWN to a
+    # pad override for exactly that reason (#900/#530), and staging it back up
+    # undoes that.
+    #
+    # MEASURED on a20_can. U1's 8 pads, plus C1/C2/CAN_T1 and the 3.3V/5.0V1
+    # jumper, declare local_clearance 0.0508 (2 mil). With the board's own
+    # project (min_clearance 0.0, Default class 0.254) kicad-cli reports ZERO
+    # clearance items; staging min_clearance to 0.254 reports 48, every one a
+    # pad-to-track pair at 0.070..0.234mm -- all legal at the pad's own 0.0508,
+    # none of them >= 0.254. That was the whole of this board's kicad_only=49,
+    # and a large share of the corpus kicad_drc totals it drove.
+    #
+    # The netclass arm above is untouched: raising the Default class DOES grade
+    # (probed: 0.254 -> 0.60 turns 0 items into 255), so the routed floor is
+    # still enforced everywhere a pad has not declared otherwise.
+    pad_floor = _smallest_pad_override(board)
+    mc_target = clearance if pad_floor is None else min(clearance, pad_floor)
+    # #1542: the board minimum also FLOORS KiCad's implicit per-class
+    # "netclass '<class>' (diff pair)" rule, which grades a pair's P against
+    # its N at the class diff_pair_gap where that is below the class
+    # clearance. Staging the minimum above that gap grades every coupled run
+    # laid at it as a clearance item (measured: 109 P/N items at a 0.1 class
+    # gap on a board whose own project, min_clearance 0.0, reports none).
+    for c in cfg.get("net_settings", {}).get("classes", []) or []:
+        gap = _f(c.get("diff_pair_gap"), None)
+        if gap and 0 < gap < _f(c.get("clearance"), 0.0) and gap < mc_target:
+            mc_target = gap
+    rules["min_clearance"] = min(
+        _f(rules.get("min_clearance"), mc_target) or mc_target, mc_target)
+    # Hole floor (#327): equalize min_hole_clearance to the routed copper
+    # clearance too -- our stack guarantees the NPTH fab floor (0.2, #308) and
+    # copper clearance, not a board's stricter DESIGN hole rule; grading holes
+    # stricter than the routing was told manufactures config-mismatch items.
+    # (Footprint-LEVEL clearance overrides remain and are a real gap: #326.)
+    mhc = _f(rules.get("min_hole_clearance"), None)
+    if mhc and mhc > clearance:
+        rules["min_hole_clearance"] = clearance
+    # Edge (#338/#295/#441 class): copper-to-edge is graded at max(recorded rule,
+    # clearance, 0.20 fab copper-to-edge floor). Two config artifacts this fixes:
+    #  * ABSENT key -- kicad-cli falls back to its built-in 0.5mm default while
+    #    check_drc falls back to the routed clearance (openstint: a lost project
+    #    manufactured 11 phantom items). Pin it so both engines grade alike.
+    #  * RECORDED sub-fab key -- 80/184 corpus boards declare < 0.20 (32 at 0.0);
+    #    grading at that tiny value masks copper run to the milled edge (#441). It
+    #    is NOT a legitimate design constraint below what the fab can make, so it is
+    #    pinned UP to the fab floor -- matching the routers, which now enforce
+    #    max(cli, board rule, 0.20) to the edge (effective_board_edge_clearance).
+    # A recorded rule ABOVE the fab floor (e.g. 0.5) is preserved as a real design
+    # constraint via the max().
+    from fix_kicad_drc_settings import fab_edge_floor
+    _fab_edge = fab_edge_floor(board)
+    _rec_edge = _f(rules.get("min_copper_edge_clearance"), None)
+    rules["min_copper_edge_clearance"] = max(
+        _rec_edge if _rec_edge is not None else clearance, _fab_edge)
+    # Silk checks are OUT OF SCOPE (results are filtered to copper classes)
+    # but DRC_TEST_PROVIDER_SILK_CLEARANCE dominates wall time on art-heavy
+    # boards -- lily58's keyboard legends made kicad-cli spin >10 MINUTES at
+    # 100% CPU in that one provider (#333, confirmed by sampling). Severity
+    # "ignore" makes the DRC engine skip the provider entirely.
+    sev = cfg["board"]["design_settings"].setdefault("rule_severities", {})
+    for k in ("silk_over_copper", "silk_overlap", "silk_edge_clearance"):
+        sev[k] = "ignore"
+    # #441: force copper_edge_clearance ON. A board may author it "ignore" (many
+    # corpus boards do -- lpddr4_testbed's unrouted input ignores it), which makes
+    # kicad-cli skip the edge provider entirely -> the wave undercounts edge defects
+    # AND, worse, grades the UNROUTED baseline (ignore) differently from the routed
+    # final (error), so baseline subtraction spuriously attributes the whole delta
+    # to the router. Staging both sides at "error" restores symmetry and surfaces
+    # real router copper run to the milled edge (graded at the pinned floor above).
+    sev["copper_edge_clearance"] = "error"
+    # #526: generalize #441 to EVERY copper class this pipeline grades. The
+    # a13 corpus board's AUTHOR ships `clearance: warning` in the project, the
+    # chain preserves author settings (correctly), kicad-cli honors project
+    # severities, and the --severity-error run therefore never listed a REAL
+    # 31um track-to-pad graze -- kicad graded 0 while check_drc flagged it,
+    # which read as a check_drc-only artifact until dug into. Same
+    # baseline-symmetry argument as the edge rule: both sides staged at error.
+    for _k in sorted(KICAD_COPPER_TYPES):
+        sev[_k] = "error"
+    # Min copper web (#406): KiCad's connection_width checker is OFF by default
+    # (min_connection 0) and warning-severity, so routed-copper micro-webs were
+    # invisible to every automated consumer in the repo -- the corpus gave NO
+    # signal on the class. Same config-artifact family as the #338 edge rule:
+    # stage the constraint (author-set min_connection kept, else the project's
+    # min_track_width; see _web_min_connection) and lift the severity to error
+    # so the --severity-error run reports it. Items are graded SEPARATELY from
+    # the copper-clearance classes (KICAD_WEB_TYPES) -- check_drc has no
+    # counterpart to match against.
+    web_min = _web_min_connection(cfg)
+    if web_min is not None:
+        rules["min_connection"] = web_min
+        sev["connection_width"] = "error"
+    json.dump(cfg, open(pro2, "w"))
+    return d, b2
+
+
+def _pro_clearance(board: str):
+    """Read the board's routed copper clearance from its sibling .kicad_pro
+    Default net class, floored at Board Setup min_clearance as KiCad grades it
+    (#1210) -- the same Stage-C auto-grade check_drc.py's CLI does
+    (#226/#227). Grading at a default (0.1) instead of the board's own floor
+    manufactures phantom sub-clearance grazes on legitimately tight copper
+    (#359). Returns None if no project / no clearance is recorded."""
+    try:
+        from fix_kicad_drc_settings import find_project, project_grading_clearance
+        pro = find_project(board)
+        if os.path.isfile(pro):
+            with open(pro) as f:
+                return project_grading_clearance(json.load(f))[0]
+    except Exception:  # noqa: BLE001 -- best-effort, fall back to check_drc default
+        pass
+    return None
+
+
+def kicad_items_for(board: str, clearance: float = None):
+    """kicad-cli copper items for a board, staged the same way compare_board
+    stages (netclasses clamped to the routed clearance when known). Returns
+    (items, err)."""
+    if clearance:
+        _tmpd, board_k = _staged_copy(board, clearance)
+    else:
+        _tmpd, board_k = None, board
+    try:
+        return run_kicad_drc(board_k)
+    finally:
+        if _tmpd:
+            import shutil
+            shutil.rmtree(_tmpd, ignore_errors=True)
+
+
+def _subtract_baseline(items, base_items):
+    """Two-pass symmetric baseline subtraction shared by both engines' sides
+    (#326/#338/#405): drop from `items` every pre-existing (unrouted-input)
+    condition present in `base_items`, so what remains is ROUTER-attributable.
+    Pass 1 = positional match (identical template copper => distance 0); pass 2
+    = positional-drift-tolerant (type, nets) twin (kicad re-anchors the same
+    design condition at a different instance position run-to-run; openstint's
+    pre-routed /A- input copper matched 6 of 8 positionally). Returns
+    (remaining_items, n_preexisting_subtracted)."""
+    if not base_items:
+        return items, 0
+    matched_pre, base_rest, rest = match(base_items, items)
+    pre = len(matched_pre)
+    pool = {}
+    for bv in base_rest:
+        pool[(bv["type"], bv["nets"])] = pool.get((bv["type"], bv["nets"]), 0) + 1
+    keep = []
+    for v in rest:
+        key = (v["type"], v["nets"])
+        if pool.get(key):
+            pool[key] -= 1
+            pre += 1
+        else:
+            keep.append(v)
+    return keep, pre
+
+
+def compare_board_data(board: str, label: str = None, clearance: float = None,
+                       baseline: str = None):
+    """SHARED per-board grading core used by BOTH the CLI (`compare_board`) and
+    ab_replay_grade's `_kicad_grade` -- neither reimplements subtraction or
+    matching, so the two tools produce identical numbers for the same board by
+    construction.
+
+    Runs kicad-cli + check_drc, symmetrically baseline-subtracts both sides
+    (#405), matches the two, then reconciles the board-edge anchor mismatch
+    (Part B). `baseline` = the UNROUTED input board: its items are pre-existing
+    design conditions (e.g. edge-connector pads inside the board's own
+    copper_edge rule) that no routing can fix -- subtracted from BOTH engines so
+    the counts reflect router-introduced copper.
+
+    Returns a dict (numeric grade + item lists + verdict for the printer), or
+    None if kicad-cli could not grade the board (caller degrades to Nones)."""
+    label = label or os.path.basename(board)
+    # #439: grade at the board's OWN recorded routed floor (the Default net-class
+    # clearance the clearance ledger + writeback record in the sibling .kicad_pro --
+    # always <= the manifest --clearance because the writeback only-lowers), NOT the
+    # passed manifest clearance. A board may legitimately fine-tap SOME connections
+    # below the nominal --clearance; grading at the manifest ceiling manufactures
+    # phantom sub-clearance items on that copper (neo6502: 499 phantom at 0.127 vs 0
+    # at the recorded 0.1; olimex_lora: 125 vs 36). The passed value is only a
+    # FALLBACK for a final shipped without a recorded floor (project-less board,
+    # #217; stock/minimal project, the tigard class). Reassigning it here threads the
+    # recorded floor to EVERY kicad_items_for / run_check_drc / web_min call below --
+    # finals AND baseline -- so the two engines agree and baseline subtraction (#405)
+    # lines up at the same floor.
+    recorded = _pro_clearance(board)
+    requested = clearance
+    if recorded is not None:
+        clearance = recorded
+    LAST_UNCLASSIFIED.clear()
+    kicad, err = kicad_items_for(board, clearance)
+    if err:
+        return {"board": label, "skip": err}
+    unclassified = dict(LAST_UNCLASSIFIED)
+    # Min copper web (#406): split the web class out BEFORE baseline
+    # subtraction and matching -- the positional subtraction pass is
+    # type-blind, so pooling would let a baseline clearance item consume a
+    # final web item (and vice versa); and check_drc has no web counterpart,
+    # so matching would orphan every item into kicad_only (the false-negative
+    # alarm channel). web_min mirrors the _staged_copy condition: None =
+    # connection_width was NOT graded (no staged run / no recorded floor),
+    # reported as None rather than a fake clean 0.
+    web_min = None
+    if clearance:
+        pro = os.path.splitext(board)[0] + ".kicad_pro"
+        try:
+            web_min = _web_min_connection(
+                json.load(open(pro)) if os.path.exists(pro) else {})
+        except Exception:  # noqa: BLE001 -- unreadable project = not graded
+            web_min = None
+    web_items = [v for v in kicad if v["type"] in KICAD_WEB_TYPES]
+    kicad = [v for v in kicad if v["type"] not in KICAD_WEB_TYPES]
+    # #1334: thermal spokes split out the same way, for the same reason.
+    thermal_items = [v for v in kicad if v["type"] in KICAD_THERMAL_TYPES]
+    kicad = [v for v in kicad if v["type"] not in KICAD_THERMAL_TYPES]
+    # #1376: dangling track ends split out the same way.
+    dangling_items = [v for v in kicad if v["type"] in KICAD_DANGLING_TYPES]
+    kicad = [v for v in kicad if v["type"] not in KICAD_DANGLING_TYPES]
+    # Run-6: the courtyard channel splits out the same way (never enters the
+    # copper match), then reconciles against check_assembly's class-waiver
+    # verdicts by ref pair. `unmatched` on either side is the alarm.
+    court_items = [v for v in kicad if v["type"] in KICAD_COURTYARD_TYPES]
+    kicad = [v for v in kicad if v["type"] not in KICAD_COURTYARD_TYPES]
+    courtyard = None
+    try:
+        from kicad_parser import parse_kicad_pcb as _pk
+        from placement.legality import grade_body_overlap as _gbo
+        import routing_defaults as _defaults
+        _g = _gbo(_pk(board), clearance or _defaults.CLEARANCE,
+                  pcb_file=board)
+        _ours = {}
+        for q in _g["pairs"]:
+            key = tuple(sorted((q.a, q.b)))
+            lab = ("blocking" if q.kind == "pad_intersection"
+                   else (f"waived:{q.waiver}" if q.waived else "advisory"))
+            # blocking outranks advisory outranks waived for a shared pair
+            rank = {"blocking": 2}.get(lab.split(":")[0],
+                                       1 if lab == "advisory" else 0)
+            if key not in _ours or rank > _ours[key][1]:
+                _ours[key] = (lab, rank)
+        rows = []
+        seen_pairs = set()
+        for v in court_items:
+            key = tuple(v.get("kinds") or ())
+            seen_pairs.add(key)
+            lab = _ours.get(key, ("unmatched-by-krt", -1))[0]
+            rows.append({"pair": list(key), "krt": lab,
+                         "severity": v.get("severity", "")})
+        for key, (lab, rank) in sorted(_ours.items()):
+            # krt-only rows are BLOCKING only: advisory pairs are routine
+            # on dense healthy boards (corpus: glasgow ships 55) and have
+            # their reporting home in check_assembly; this channel exists
+            # to reconcile the two BLOCKING-grade instruments.
+            if key not in seen_pairs and rank >= 2:
+                rows.append({"pair": list(key), "krt": lab,
+                             "severity": "krt-only"})
+        courtyard = {"kicad": len(court_items),
+                     "krt_blocking": _g["blocking"],
+                     "krt_advisory": _g["advisory"],
+                     "krt_waived": _g["waived"],
+                     "unmatched": sum(1 for r in rows
+                                      if r["krt"].startswith("unmatched")
+                                      or r["severity"] == "krt-only"),
+                     "pairs": rows}
+    except Exception as e:  # noqa: BLE001 -- reporting channel, not a gate
+        courtyard = {"error": str(e)[:150], "kicad": len(court_items)}
+    pre = web_pre = thermal_pre = dangling_pre = 0
+    if baseline and os.path.exists(baseline):
+        base_items, berr = kicad_items_for(baseline, clearance)
+        if not berr and base_items:
+            base_web = [v for v in base_items if v["type"] in KICAD_WEB_TYPES]
+            base_thermal = [v for v in base_items
+                            if v["type"] in KICAD_THERMAL_TYPES]
+            base_dangling = [v for v in base_items
+                             if v["type"] in KICAD_DANGLING_TYPES]
+            base_items = [v for v in base_items
+                          if v["type"] not in KICAD_WEB_TYPES
+                          and v["type"] not in KICAD_THERMAL_TYPES
+                          and v["type"] not in KICAD_DANGLING_TYPES]
+            kicad, pre = _subtract_baseline(kicad, base_items)
+            web_items, web_pre = _subtract_baseline(web_items, base_web)
+            thermal_items, thermal_pre = _subtract_baseline(thermal_items,
+                                                            base_thermal)
+            dangling_items, dangling_pre = _subtract_baseline(dangling_items,
+                                                              base_dangling)
+    # #962: the unrouted input doubles as check_drc's --baseline, so a
+    # footprint-graphic graze a PART MOVE created is graded (not accepted) and
+    # cannot consume KiCad's matching finding below.
+    cd = run_check_drc(board, clearance, netclasses=True,
+                       baseline=baseline if baseline and os.path.exists(baseline) else None)
+    # check_drc 'accepted' edge items (track covered by an edge-exempt pad): not
+    # check_drc failures -- split them out of the counted list, and use them to drop
+    # the matching kicad copper_edge_clearance finding below (respect check_drc's
+    # authority instead of alarming it as a false negative).
+    via_in_paste = {
+        "check_drc": sum(1 for c in cd if c["type"] in CD_VIA_PASTE_TYPES
+                         and not c.get("accepted")),
+        "protected": sum(1 for c in cd if c.get("accepted") == "protected-via-in-paste"),
+        "inherited": sum(1 for c in cd if c.get("accepted") == "inherited-via-in-paste"),
+        # a pre-KiCad-10 file cannot declare Type VII at all (fab drawing)
+        "undeclarable": sum(1 for c in cd
+                            if c.get("accepted") == "undeclarable-via-in-paste"),
+        "kicad": None,      # KiCad has no via-in-paste check
+    }
+    cd = [c for c in cd if c["type"] not in CD_VIA_PASTE_TYPES]
+    keepout = {
+        "check_drc": sum(1 for c in cd if c["type"] in CD_KEEPOUT_TYPES
+                         and not c.get("accepted")),
+        "inherited": sum(1 for c in cd if c.get("accepted") == "inherited-keepout"),
+        # what kicad-cli itself reported (also in kicad_unclassified)
+        "kicad": unclassified.get(KICAD_KEEPOUT_TYPE, 0),
+    }
+    cd = [c for c in cd if c["type"] not in CD_KEEPOUT_TYPES]
+    # #995: a part's own copper against its own pad's net -- its own channel,
+    # never the edge family's `intentional` count.
+    cd_own = [c for c in cd if c.get("accepted") == "footprint-own-copper"]
+    cd = [c for c in cd if c.get("accepted") != "footprint-own-copper"]
+    # #1737: a contact at a net-tie pad nested in its partner, which KiCad
+    # reports by item order; KiCad's side drops tie-pair items at the tie
+    # footprint below (_drop_net_tie_accepted), so this is its own count.
+    cd_tie_order = sum(1 for c in cd if c.get("accepted") == "net-tie-order")
+    cd = [c for c in cd if c.get("accepted") != "net-tie-order"]
+    # #1306: two of one footprint's pads touching that the --baseline board's
+    # footprint already had -- pre-existing, as KiCad's side subtracts it.
+    cd_own_pads_pre = sum(1 for c in cd
+                          if c.get("accepted") == "inherited-own-pad-contact")
+    cd = [c for c in cd if c.get("accepted") != "inherited-own-pad-contact"]
+    # #1628: one footprint's pads closer than their clearance -- measured by
+    # check_drc and not graded, its own channel (never a false negative)
+    cd_gaps = [c for c in cd if c.get("accepted") == "own-footprint-gap"]
+    cd = [c for c in cd if c.get("accepted") != "own-footprint-gap"]
+    cd_accepted = [c for c in cd if c.get("accepted")]
+    cd = [c for c in cd if not c.get("accepted")]
+    # Symmetric baseline subtraction (#405): drop the input's own check_drc
+    # items too (e.g. vfo_ctrl's 23 FG chassis-ground segments already <edge on
+    # the bare board), mirroring the kicad side, so both are graded on
+    # router-attributable copper.
+    cd_pre = cd_own_pads_pre
+    if baseline and os.path.exists(baseline):
+        try:
+            cd_base = run_check_drc(baseline, clearance, netclasses=True)
+        except Exception:  # noqa: BLE001 -- best-effort, tolerate a bad input
+            cd_base = None
+        cd_base = [c for c in (cd_base or []) if c["type"] not in CD_VIA_PASTE_TYPES
+                   and c["type"] not in CD_KEEPOUT_TYPES
+                   and c.get("accepted") != "footprint-own-copper"]
+        cd, _cd_sub = _subtract_baseline(cd, cd_base or [])
+        cd_pre += _cd_sub
+    kicad_intentional = checkdrc_intentional = 0
+    # Static footprint-geometry conditions (#450 kbic65): a hole_clearance
+    # item whose participants are ALL pads is placement/footprint design
+    # (overlapping alternative-layout switch footprints: a PTH pad's copper
+    # over the neighbor variant's NPTH mounting hole) -- pad copper and pad
+    # holes are footprint geometry. Baseline subtraction normally removes
+    # them, EXCEPT when (remove_unused_layers) hid the pad's inner-layer
+    # copper on the UNROUTED input: connecting the pad materializes the
+    # copper, so the item exists only on the routed board while remaining
+    # 100% footprint geometry. Drop them as pre-existing design conditions.
+    # Scoped to hole_clearance: all-pad clearance/shorting items stay visible
+    # (the cap optimizer MOVES passives, so those can be chain-attributable).
+    _pad_kinds = {"pth", "npth", "pad"}
+    _static_pad = [v for v in kicad
+                   if v["type"] == "hole_clearance"
+                   and v.get("kinds") and set(v["kinds"]) <= _pad_kinds]
+    if _static_pad:
+        kicad = [v for v in kicad if v not in _static_pad]
+        pre += len(_static_pad)
+        print(f"    ({len(_static_pad)} all-pad footprint-geometry item(s) "
+              f"dropped as pre-existing design conditions)")
+    # Accept-by-design: drop kicad edge findings covered by an edge-exempt pad
+    # (check_drc published them as 'accepted'), symmetric with check_drc having
+    # already excluded them from its count.
+    if cd_accepted:
+        kicad, _k_acc = _drop_kicad_covered_by_accepted(kicad, cd_accepted)
+        kicad_intentional += _k_acc
+        checkdrc_intentional += len(cd_accepted)
+    # Net-tie accepted contact (Kelvin shunts): tie-pair shorting/clearance
+    # items AT the tie footprint are accepted-by-design on human-routed
+    # originals too -- drop from BOTH engines before matching (board-derived,
+    # no router emission needed).
+    tie_pairs = _net_tie_accepted_pairs(board)
+    if tie_pairs:
+        kicad, k_tie = _drop_net_tie_accepted(kicad, tie_pairs)
+        cd, c_tie = _drop_net_tie_accepted(cd, tie_pairs)
+        kicad_intentional += k_tie
+        checkdrc_intentional += c_tie
+    kicad, kicad_own = _drop_kicad_own_copper(kicad, cd_own)
+    gaps_unreported, gaps_maybe = _library_gaps_unreported(kicad, cd_gaps)
+    kicad, kicad_gaps = _drop_kicad_library_gaps(kicad, cd_gaps)
+    matched, kicad_only, cd_only = match(kicad, cd)
+    # Part B: collapse the board-edge anchor double-count (same edge violation
+    # anchored differently by each engine). One-sided edge divergence survives.
+    edge_reconciled, kicad_only, cd_only = reconcile_edge_family(kicad_only, cd_only)
+    n_matched = len(matched) + edge_reconciled
+    # NET-PAIR agreement: the engines report at different granularities
+    # (check_drc: one violation per offending segment; kicad: grouped item
+    # pairs), so the honest consistency metric is the SET of net pairs each
+    # engine implicates. Instance-level diffs then refine within agreed pairs.
+    kpairs = {v["nets"] for v in kicad if len(v["nets"]) == 2}
+    cpairs = {v["nets"] for v in cd if len(v["nets"]) == 2}
+    pk_only, pc_only = kpairs - cpairs, cpairs - kpairs
+    verdict = ("CONSISTENT" if not kicad_only and not cd_only else
+               "PAIR-CONSISTENT" if not pk_only and not pc_only else "DIVERGED")
+    # kicad / check_drc are the REAL router-attributable counts: pre-existing
+    # (baseline) AND accepted-by-design edge items (#408) already removed. The
+    # subtracted edge counts are reported separately for transparency.
+    return {"board": label, "kicad": len(kicad), "kicad_preexisting": pre,
+            # The floor this grade ACTUALLY used, and the one the caller asked
+            # for. They differ whenever the board ships its own recorded floor
+            # (the #439 rule above), and the grade is then only comparable to
+            # another board graded at the SAME value -- so an A/B that pairs two
+            # arms has to be able to SEE it. a20_can: the v0.22.0 arm shipped a
+            # 0.0508 Default class (the #900 pad-override-clobbers-Default bug)
+            # and was graded at 0.0508, reporting ZERO kicad items on copper
+            # that has 54 at the 0.254 its own route step asked for; the fixed
+            # arm ships 0.254 and reports 49. Read as a pair that is a 0 -> 49
+            # "regression" and is really two different rulers. Disclosed rather
+            # than forced to `requested`, because grading at the manifest
+            # ceiling is what #439 measured as 499 phantom items on neo6502.
+            "graded_clearance": clearance,
+            "requested_clearance": requested,
+            "check_drc": len(cd), "checkdrc_preexisting": cd_pre,
+            "kicad_intentional_edge": kicad_intentional,
+            "checkdrc_intentional_edge": checkdrc_intentional,
+            # #995: KiCad items on a part's own copper and its own pad's net,
+            # and the check_drc contacts that accepted them
+            "kicad_own_copper": kicad_own,
+            "checkdrc_own_copper": len(cd_own),
+            "checkdrc_net_tie_order": cd_tie_order,
+            # #1628: KiCad clearance items on one footprint's own pad pairs,
+            # and the gaps check_drc measured and published (not graded)
+            "kicad_library_pad_gaps": kicad_gaps,
+            "checkdrc_library_pad_gaps": len(cd_gaps),
+            # #1706: of those, the pairs KiCad lists no item for -- untagged
+            # (the channel disagrees) and tagged `unverified_rule` (a rule
+            # check_drc cannot fully read may clear them, as it did)
+            "checkdrc_library_pad_gaps_unreported": len(gaps_unreported),
+            "checkdrc_library_pad_gaps_unreported_maybe": len(gaps_maybe),
+            "library_pad_gaps_unreported_items": gaps_unreported,
+            "matched": n_matched, "kicad_only": len(kicad_only),
+            "checkdrc_only": len(cd_only),
+            "pairs_both": len(kpairs & cpairs),
+            "pairs_kicad_only": len(pk_only), "pairs_checkdrc_only": len(pc_only),
+            "verdict": verdict,
+            # #406 min copper web: None = not graded (no recorded floor).
+            "kicad_connection_width": (len(web_items) if web_min is not None
+                                       else None),
+            "connection_width_min": web_min,
+            "connection_width_preexisting": web_pre,
+            "connection_width_items": web_items,
+            # #1334: thermal spokes, at the project's severity (report only)
+            "kicad_starved_thermal": len(thermal_items),
+            "starved_thermal_preexisting": thermal_pre,
+            "starved_thermal_items": thermal_items,
+            # #1376: dangling track ends, at the project's severity (report only)
+            "kicad_track_dangling": len(dangling_items),
+            "track_dangling_preexisting": dangling_pre,
+            "track_dangling_items": dangling_items,
+            # run-6: the labeled courtyard channel (never silently filtered)
+            "courtyard": courtyard,
+            # #962 D6: check_drc-only by construction (KiCad has no check)
+            "via_in_paste": via_in_paste,
+            # check_drc-only by construction (kicad-cli 10.0.0 reported
+            # none; 10.0.3+ one row per track, counted beside it -- #1591)
+            "keepout": keepout,
+            # #1390: KiCad error types no channel grades, never dropped
+            "kicad_unclassified": unclassified,
+            "kicad_only_items": kicad_only, "checkdrc_only_items": cd_only}
+
+
+# Summary keys the CLI callers persist (item lists + verdict are print-only).
+_SUMMARY_KEYS = ("board", "kicad", "kicad_preexisting", "check_drc",
+                 "kicad_intentional_edge", "checkdrc_intentional_edge",
+                 "kicad_own_copper", "checkdrc_own_copper", "checkdrc_net_tie_order",
+                 "kicad_library_pad_gaps", "checkdrc_library_pad_gaps",
+                 "checkdrc_library_pad_gaps_unreported",
+                 "matched", "kicad_only", "checkdrc_only",
+                 "pairs_kicad_only", "pairs_checkdrc_only",
+                 "kicad_connection_width", "connection_width_min",
+                 "kicad_starved_thermal", "kicad_track_dangling",
+                 "courtyard", "via_in_paste", "keepout")
+
+
+def compare_board(board: str, label: str = None, clearance: float = None,
+                  baseline: str = None):
+    """Thin CLI wrapper over compare_board_data: print the per-board line +
+    divergence detail, return the summary-key subset (schema unchanged)."""
+    label = label or os.path.basename(board)
+    data = compare_board_data(board, label=label, clearance=clearance,
+                              baseline=baseline)
+    if data is None or "skip" in (data or {}):
+        print(f"{label}: SKIP ({data.get('skip') if data else 'no result'})")
+        return None
+    pre_note = f" (+{data['kicad_preexisting']} pre-existing on input, subtracted)" if data["kicad_preexisting"] else ""
+    cd_pre_note = f" (+{data['checkdrc_preexisting']} pre-existing, subtracted)" if data["checkdrc_preexisting"] else ""
+    # #408: accepted-by-design edge items removed from both engines.
+    ie = data.get("kicad_intentional_edge", 0) or data.get("checkdrc_intentional_edge", 0)
+    ie_note = (f" [#408: -{data.get('kicad_intentional_edge', 0)} kicad / "
+               f"-{data.get('checkdrc_intentional_edge', 0)} check_drc intentional edge]") if ie else ""
+    if data.get("kicad_own_copper") or data.get("checkdrc_own_copper"):
+        ie_note += (f" [#995: -{data.get('kicad_own_copper', 0)} kicad / "
+                    f"-{data.get('checkdrc_own_copper', 0)} check_drc footprint own copper]")
+    if data.get("kicad_library_pad_gaps") or data.get("checkdrc_library_pad_gaps"):
+        ie_note += (f" [#1628: -{data.get('kicad_library_pad_gaps', 0)} kicad "
+                    f"item(s) / -{data.get('checkdrc_library_pad_gaps', 0)} "
+                    f"check_drc pair(s) library pad gaps (one footprint's "
+                    f"pads, not graded; KiCad lists a pair per copper layer "
+                    f"they share)"
+                    # #1706: the two counts of the channel disagree
+                    + (f"; {data['checkdrc_library_pad_gaps_unreported']} check_drc "
+                       f"pair(s) KiCad does NOT report"
+                       if data.get("checkdrc_library_pad_gaps_unreported") else "")
+                    + (f"; {data['checkdrc_library_pad_gaps_unreported_maybe']} more "
+                       f"KiCad does not report that check_drc said a rule may clear"
+                       if data.get("checkdrc_library_pad_gaps_unreported_maybe") else "")
+                    + "]")
+    # #406 min copper web: separate class, not matched against check_drc.
+    cw = data.get("kicad_connection_width")
+    cw_min = data.get("connection_width_min")
+    cw_pre = data.get("connection_width_preexisting", 0)
+    cw_pre_note = f" (+{cw_pre} pre-existing, subtracted)" if cw_pre else ""
+    cw_note = (f" connwidth={cw}@<{cw_min}mm{cw_pre_note}" if cw is not None
+               else " connwidth=not-graded")
+    _st = data.get("kicad_starved_thermal", 0)
+    _st_pre = data.get("starved_thermal_preexisting", 0)
+    cw_note += (f" thermal={_st}"
+                + (f" (+{_st_pre} pre-existing, subtracted)" if _st_pre
+                   else ""))
+    _td = data.get("kicad_track_dangling", 0)
+    _td_pre = data.get("track_dangling_preexisting", 0)
+    cw_note += (f" dangling={_td}"
+                + (f" (+{_td_pre} pre-existing, subtracted)" if _td_pre
+                   else ""))
+    print(f"{label}: kicad={data['kicad']}{pre_note} check_drc={data['check_drc']}{cd_pre_note} "
+          f"matched={data['matched']} kicad_only={data['kicad_only']} checkdrc_only={data['checkdrc_only']}{ie_note} | "
+          f"net-pairs: both={data['pairs_both']} kicad_only={data['pairs_kicad_only']} "
+          f"checkdrc_only={data['pairs_checkdrc_only']} |{cw_note}  {data['verdict']}")
+    if data.get("kicad_unclassified"):
+        print("    NOT CLASSIFIED (KiCad errors this comparator does not "
+              "grade, so 'CONSISTENT' says nothing about them): "
+              + ", ".join(f"{t}={n}" for t, n in
+                          sorted(data["kicad_unclassified"].items())))
+    for kv in data["kicad_only_items"]:
+        print(f"    KICAD-ONLY  {kv['type']:16s} {sorted(kv['nets'])} @ {kv['pos']}  {kv.get('desc','')[:60]}")
+    for cv in data["checkdrc_only_items"]:
+        print(f"    CHECKDRC-ONLY {cv['type']:16s} {sorted(cv['nets'])} @ {cv['pos']}")
+    for gv in data.get("library_pad_gaps_unreported_items", []):
+        # #1706: a library-gap pair check_drc publishes as a KiCad error
+        print(f"    LIBRARY-GAP NOT IN KICAD {'|'.join(sorted(gv.get('pad_pair') or ()))} "
+              f"{sorted(gv['nets'])} @ {gv['pos']}")
+    for wv in data.get("connection_width_items", []):
+        print(f"    CONNWIDTH   {'/'.join(wv.get('kinds', ())) or '?':16s} "
+              f"{sorted(wv['nets'])} @ {wv['pos']}  {wv.get('desc', '')[:60]}")
+    for tv in data.get("starved_thermal_items", []):
+        print(f"    STARVED-THERMAL {','.join(tv.get('pads', ())) or '?':12s} "
+              f"{sorted(tv['nets'])} @ {tv['pos']}  {tv.get('desc', '')[:60]}")
+    for dv in data.get("track_dangling_items", []):
+        print(f"    TRACK-DANGLING {sorted(dv['nets'])} @ {dv['pos']}  "
+              f"{dv.get('desc', '')[:60]}")
+    vip = data.get("via_in_paste")
+    if vip and any(vip.get(k) for k in ("check_drc", "protected", "inherited",
+                                        "undeclarable")):
+        print(f"    VIA-IN-PASTE check_drc={vip['check_drc']} "
+              f"protected={vip['protected']} inherited={vip['inherited']} "
+              f"undeclarable={vip.get('undeclarable', 0)} "
+              f"(KiCad has no such check)")
+    ko = data.get("keepout")
+    if ko and any(ko.get(k) for k in ("check_drc", "inherited", "kicad")):
+        print(f"    KEEPOUT     check_drc={ko['check_drc']} "
+              f"inherited={ko['inherited']} kicad_items_not_allowed={ko['kicad']} "
+              f"(check_drc's own class: kicad-cli 10.0.0 reported none, "
+              f"10.0.3+ one row per track)")
+    court = data.get("courtyard")
+    if court is not None:
+        if "error" in court:
+            print(f"    COURTYARD   kicad={court.get('kicad')} "
+                  f"(krt grader error: {court['error']})")
+        else:
+            print(f"    COURTYARD   kicad={court['kicad']} "
+                  f"krt_blocking={court['krt_blocking']} "
+                  f"advisory={court['krt_advisory']} "
+                  f"waived={court['krt_waived']} "
+                  f"unmatched={court['unmatched']}")
+            for row in court["pairs"]:
+                print(f"      {'<->'.join(row['pair']) or '?':20s} "
+                      f"krt={row['krt']} sev={row['severity']}")
+    return {k: data[k] for k in _SUMMARY_KEYS}
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("boards", nargs="*")
+    ap.add_argument("--wave", action="append", default=[],
+                    help="wave dir with summary.json; compares every final board")
+    ap.add_argument("--baseline", default=None,
+                    help="UNROUTED input board: its kicad items (pre-existing "
+                         "design conditions, e.g. edge-connector pads inside "
+                         "the board's own edge rule) are subtracted so "
+                         "kicad_only reflects router-introduced items "
+                         "(single-board mode only). It cancels only an item "
+                         "the engine reports on BOTH boards, at the same "
+                         "position or as a (type, net pair) twin, one for "
+                         "one. A PILE (parts staged off the outline) is a "
+                         "poor baseline: its pad-on-pad items are not the "
+                         "placed board's, and KiCad reports a part's "
+                         "footprint-inherent items in different numbers "
+                         "there (#1333). The baseline's own check_drc "
+                         "listing is never printed")
+    args = ap.parse_args()
+    boards = list(args.boards)
+    jobs = [(b, None) for b in boards]
+    for wave in args.wave:
+        for e in json.load(open(os.path.join(wave, "summary.json"))):
+            if e.get("final"):
+                p = os.path.join(wave, e["board"], os.path.basename(e["final"]))
+                if os.path.exists(p):
+                    clr = e.get("clearance")
+                    jobs.append((p, float(clr) if clr else None))
+    rows = []
+    not_compared = []
+    for b, clr in jobs:
+        r = compare_board(b, label=None, clearance=clr, baseline=args.baseline)
+        if r:
+            rows.append(r)
+        else:
+            not_compared.append(os.path.basename(b))
+    div = [r for r in rows if r["kicad_only"] or r["checkdrc_only"]]
+    print(f"\n{len(rows)} boards compared: {len(rows) - len(div)} consistent, "
+          f"{len(div)} diverged "
+          f"(kicad_only total {sum(r['kicad_only'] for r in rows)}, "
+          f"checkdrc_only total {sum(r['checkdrc_only'] for r in rows)})")
+    # #406 min copper web -- graded on boards with a recorded floor only.
+    cw_rows = [r for r in rows if r.get("kicad_connection_width") is not None]
+    print(f"connection_width: {sum(r['kicad_connection_width'] for r in cw_rows)} "
+          f"item(s) on {len(cw_rows)} graded board(s) "
+          f"({len(rows) - len(cw_rows)} not graded: no recorded min floor)")
+    # #1334: report only -- never part of the verdict or the exit code.
+    print(f"starved_thermal: "
+          f"{sum(r.get('kicad_starved_thermal') or 0 for r in rows)} item(s) "
+          f"at the project's severity on {len(rows)} board(s)")
+    print(f"track_dangling: "
+          f"{sum(r.get('kicad_track_dangling') or 0 for r in rows)} item(s) "
+          f"at the project's severity on {len(rows)} board(s)")
+    # #995: a board that was never compared is not a board that agreed. With
+    # no kicad-cli every board SKIPs, and this used to print "0 boards
+    # compared" and exit 0, which a caller reading the exit code took as
+    # agreement. It outranks a divergence: the verdict no longer covers the
+    # boards that were asked for.
+    if not jobs or not_compared:
+        print(f"NOT RUN: {len(not_compared)} of {len(jobs)} board(s) not "
+              f"compared{': ' + ', '.join(not_compared) if not_compared else ''}"
+              f"{' (no board given)' if not jobs else ''} -- exit 2, never "
+              f"read this as agreement")
+        return 2
+    return 1 if div else 0
+
+
+if __name__ == "__main__":
+    import cli_banner; cli_banner.install()  # CMD/EXIT self-echo (run-5 c1)
+    _find_kicad_cli()  # the loud not-found warning, now AFTER the banner
+    sys.exit(main())

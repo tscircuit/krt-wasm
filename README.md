@@ -2,6 +2,8 @@
 
 This package is a fork of [KiCad Routing Tools](https://github.com/drandyhaas/KiCadRoutingTools) adapted to run inside tscircuit as a custom autorouter.
 
+The current routing core comes from [KiCad Routing Tools v0.24.1](https://github.com/drandyhaas/KiCadRoutingTools/releases/tag/v0.24.1). Call `getKiCadRoutingToolsVersion()` to read the upstream version from the loaded WASM binary.
+
 The fork keeps the upstream Rust `GridRouter` core and exposes it through WASM for tscircuit's `autorouter={{ algorithmFn }}` API. It is not a full port of the KiCad plugin or the Python command-line tools.
 
 ## Install

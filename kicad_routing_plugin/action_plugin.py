@@ -15,6 +15,87 @@ PLUGIN_DIR = os.path.dirname(os.path.abspath(__file__))
 ROOT_DIR = os.path.dirname(PLUGIN_DIR)
 if ROOT_DIR not in sys.path:
     sys.path.insert(0, ROOT_DIR)
+# #522 layout: the engine modules live in py_router/ under the repo root.
+# The exists() guard keeps a FLAT installed layout (PCM zip) working too.
+_ENGINE_DIR = os.path.join(ROOT_DIR, 'py_router')
+if os.path.isdir(_ENGINE_DIR) and _ENGINE_DIR not in sys.path:
+    sys.path.insert(0, _ENGINE_DIR)
+# py_placer/ holds the placement package (placement.groups / .fanout_clearance
+# are imported from here) and py_tools/ the instruments. Same exists() guard so
+# a FLAT installed layout (PCM zip) keeps working.
+for _sib in ('py_placer', 'py_tools'):
+    _d = os.path.join(ROOT_DIR, _sib)
+    if os.path.isdir(_d) and _d not in sys.path:
+        sys.path.append(_d)
+
+# #795: KiCad's hand-written __iter__ for GetTracks()/GetDrawings() calls the
+# py2 `SwigPyIterator.next()`, dropped by current SWIG -- restore the alias at
+# the GUI entry, before _get_selected_net_names() or the dialog walk a board.
+try:
+    from swig_compat import patch_swig_iterators as _patch_swig_iterators
+    _patch_swig_iterators()
+except ImportError:
+    pass         # kicad_parser makes the same call, and it is what parses here
+
+
+def _get_selected_net_names(board):
+    """Return the set of net names that the user has selected in the PCB editor.
+
+    Looks at the current selection (tracks, vias, pads, and zones) and collects
+    the net of each selected item. Selecting any item that belongs to a net is
+    treated as selecting that net for routing. Returns an empty set if nothing
+    relevant is selected, so the dialog falls back to its normal behaviour.
+    """
+    net_names = set()
+    try:
+        selected_items = []
+
+        # Tracks and vias
+        for track in board.GetTracks():
+            if track.IsSelected():
+                selected_items.append(track)
+
+        # Pads (including those on whole-footprint selections)
+        for footprint in board.GetFootprints():
+            fp_selected = footprint.IsSelected()
+            for pad in footprint.Pads():
+                if fp_selected or pad.IsSelected():
+                    selected_items.append(pad)
+
+        # Copper zones / planes
+        for i in range(board.GetAreaCount()):
+            zone = board.GetArea(i)
+            if zone.IsSelected():
+                selected_items.append(zone)
+
+        for item in selected_items:
+            try:
+                name = item.GetNetname()
+            except Exception:
+                name = None
+            # Ignore the unconnected/no-net pseudo-net (net code 0)
+            if name and item.GetNetCode() > 0:
+                net_names.add(name)
+    except Exception:
+        # Selection introspection is best-effort; never block the dialog.
+        pass
+
+    return net_names
+
+
+def _pcb_editor_frame():
+    """The PCB Editor's frame, to own the plugin's dialogs (#1654).
+
+    The first top-level window is the Project Manager when KiCad was opened
+    on a project, and the dialogs used to open under it. KiCad names the
+    editor's frame "PcbFrame" (PCB_EDIT_FRAME_NAME), in a project and in a
+    standalone editor alike; the first top-level window stays the fallback.
+    """
+    frame = wx.FindWindowByName("PcbFrame")
+    if frame is not None:
+        return frame
+    windows = wx.GetTopLevelWindows()
+    return windows[0] if windows else None
 
 
 class KiCadRoutingToolsPlugin(pcbnew.ActionPlugin):
@@ -53,6 +134,12 @@ class KiCadRoutingToolsPlugin(pcbnew.ActionPlugin):
 
     def _run_plugin(self):
         """Main plugin logic."""
+        # Ensure scipy/shapely are available (KiCad doesn't bundle them, and
+        # PCM-installed plugins can't pip-install during install).
+        from .deps_check import ensure_dependencies
+        if not ensure_dependencies(_pcb_editor_frame()):
+            return
+
         board = pcbnew.GetBoard()
         if board is None:
             wx.MessageBox(
@@ -80,8 +167,12 @@ class KiCadRoutingToolsPlugin(pcbnew.ActionPlugin):
             )
             return
 
+        # Collect the nets the user has selected in the PCB editor so the
+        # dialog can pre-check them for routing (GitHub issue #6).
+        preselected_nets = _get_selected_net_names(board)
+
         # Show the configuration dialog (modal)
-        parent = wx.GetTopLevelWindows()[0] if wx.GetTopLevelWindows() else None
+        parent = _pcb_editor_frame()
 
         # Check if we have saved settings for this board
         saved_settings = None
@@ -89,7 +180,9 @@ class KiCadRoutingToolsPlugin(pcbnew.ActionPlugin):
                 and KiCadRoutingToolsPlugin._saved_settings is not None):
             saved_settings = KiCadRoutingToolsPlugin._saved_settings
 
-        dlg = RoutingDialog(parent, pcb_data, board_filename, saved_settings=saved_settings)
+        dlg = RoutingDialog(parent, pcb_data, board_filename,
+                            saved_settings=saved_settings,
+                            preselected_nets=preselected_nets)
 
         dlg.ShowModal()
 

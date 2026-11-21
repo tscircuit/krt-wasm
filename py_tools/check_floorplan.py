@@ -1,0 +1,1288 @@
+#!/usr/bin/env python3
+"""Grade a board against a declared floorplan intent (#549).
+
+Placement is judged here by `crossings` and `hpwl`, and those are indifferent
+between a sensible layout and a scattered one with the same wirelength. Nothing
+declares where parts BELONG, so nothing can check whether they went there, and a
+render only moves the judgement from a number to a vibe.
+
+This makes the intent falsifiable. Write what the floorplan is meant to be, and
+this measures the board against it and exits non-zero with the number that broke.
+
+    # start from what the board already is, then edit it
+    python3 check_floorplan.py board.kicad_pcb --emit-intent floorplan.json
+
+    # grade
+    python3 check_floorplan.py board.kicad_pcb --intent floorplan.json
+    python3 check_floorplan.py board.kicad_pcb --intent floorplan.json --json out.json
+
+THE BOARD OUTLINE IS NOT EDITABLE BY THIS TOOLCHAIN. `envelope` is READ from the
+board; a part outside it is a finding about the PART. Board size, cutouts and
+slots are mechanical decisions -- enclosure fit, panel rails, connector
+apertures -- that belong to the user. The honest response to a board that is
+genuinely too small is to say so with the measured number and stop, never to
+resize it. Nothing here writes Edge.Cuts.
+
+Exit codes:
+
+    0   graded, no error-severity violations (or --exit-zero)
+    1   crash
+    2   argparse, including an unreadable or malformed intent file
+    3   the board is not in a state this tool can work on (unplaced / no
+        trustworthy outline) -- the placement-family convention
+    4   graded successfully, error-severity violations found; ALSO a grade
+        that is clean but INCOMPLETE ("NOT FULLY GRADED": a channel the
+        intent asked for was never measured -- a budget key the emitter
+        withheld, an armed rule the board cannot answer). Clear it by
+        declaring the value, or by writing why it stays ungraded:
+        `dispositions.withheld.<key>` / `dispositions.rules.<rule>`
+        (#1420). `--exit-zero` suppresses it as it does the violations.
+
+4 rather than 1 because 3 is already taken and 1 is ambiguous with a crash: a
+caller has to be able to tell "the floorplan is wrong" from "the grader is
+broken", and that distinction is the entire product. (`check_drc.py` uses 1 for
+its violations; this diverges knowingly.)
+"""
+from __future__ import annotations
+
+#: #937 registry: which door(s) show this tool, and whether it changes
+#: the board. Read by krt_registry.py -- by AST, never imported.
+KRT_TOOL = {'scope': ['placement', 'combined'], 'kind': 'instrument'}
+
+import _path  # noqa: F401  (py_tools -> py_router/py_placer on sys.path)
+
+import argparse
+import fnmatch
+import json
+import os
+import sys
+
+from kicad_parser import parse_kicad_pcb
+from placement.cli_gates import (add_board_state_args, add_brief_arg,
+                                 add_mechanical_arg, load_brief_or_exit,
+                                 load_mechanical_or_exit)
+from placement.floorplan import (UntrustworthyOutline, emit_intent, format_text,
+                                 grade, load_intent, summary, to_json)
+from placement.floorplan import (declaration_ledger, format_roster,
+                                 intent_from_dict, ledger_summary,
+                                 rule_roster, stale_dispositions)
+from placement.placement_state import UNPLACED_EXIT, gate_or_exit
+from placement.groups import GroupError, parse_sources
+
+#: What `--emit-intent` does about a decap limit when no flag says (#959,
+#: #1002): 'off' | 'strict' | 'auto'. Flip it only on a routed A/B.
+#: Set through `set_defaults` in `build_parser` -- a `default=` on one of
+#: the three shared-dest flags would be dead.
+DECLARE_DECAPS_DEFAULT = 'off'
+from placement.floorplan import IntentError
+
+VIOLATIONS_EXIT = 4
+
+
+def build_parser():
+    p = argparse.ArgumentParser(
+        description="Grade a board against a declared floorplan intent",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=__doc__.split('Exit codes:')[0].strip())
+    p.add_argument('board', help='the .kicad_pcb to grade')
+    p.add_argument('--intent', metavar='PATH',
+                   help='the floorplan intent JSON to grade against')
+    p.add_argument('--emit-intent', metavar='PATH',
+                   help='write a starter intent READ OFF this board and exit. '
+                        'It grades clean by construction -- a baseline to '
+                        'tighten, with the real block names filled in')
+    p.add_argument('--declare-classes', action='store_true',
+                   help='with --emit-intent: ALSO declare edge-class parts '
+                        '(part_class KB, run-4 A) that are not currently '
+                        'overhanging -- a USB receptacle parked interior gets '
+                        'an edge_connectors entry with a class-default band '
+                        'and NO edge (reconstruct derives it). DELIBERATELY '
+                        'breaks grades-clean-by-construction on a damaged '
+                        'board: an implausibly-posed receptacle then FAILS '
+                        'the proximity rule, which is the detection working. '
+                        'Default off to preserve the observation-only round '
+                        'trip')
+    p.add_argument('--no-declare-decaps', dest='declare_decaps',
+                   action='store_const', const='off',
+                   help='with --emit-intent: derive NO decaps limit, on any '
+                        'board (#959: the explicit OFF arm of the tri-state)')
+    p.add_argument('--auto-declare-decaps', dest='declare_decaps',
+                   action='store_const', const='auto',
+                   help='with --emit-intent: derive decaps.max_distance_mm '
+                        'only off a PLACED board with a sufficient census, '
+                        'labelled an observed regression baseline; a pile '
+                        'records why in context.decap_census.auto_withheld '
+                        'rather than a limit of 0.0 (#959)')
+    p.add_argument('--decaps-from', default=None, metavar='BOARD',
+                   help='with --emit-intent: derive decaps.max_distance_mm '
+                        'from this PLACED reference board of the same design '
+                        '(a human layout, an earlier placement) instead of '
+                        'the board being emitted -- the way to arm the decap '
+                        'rule on a pile, where nothing can be read (#1099). '
+                        'Same derivation and withholding as --declare-decaps; '
+                        'the census records decaps_basis reference:<file>. '
+                        'Also derives decaps.max_pin_distance_mm (supply pin '
+                        'to nearest cap, #1102) and lists the caps the '
+                        'reference keeps inside the search radius '
+                        '(decaps.within_radius_refs, #1142): such a cap left '
+                        'beyond the radius is a decap_ungraded ERROR, per '
+                        'cap, while a cap the reference itself keeps beyond '
+                        'stays a warn. Overrides the '
+                        '--*declare-decaps arms')
+    p.add_argument('--declare-decaps', dest='declare_decaps',
+                   action='store_const', const='strict',
+                   help='with --emit-intent: ALSO derive decaps.'
+                        'max_distance_mm from the board\'s own measured '
+                        'tethers (#704), so rule_decap_distance can fire on '
+                        'an auto intent at all. The limit is ceil(max) over '
+                        'placement.groups.decap_tethers, so it grades CLEAN '
+                        'by construction, and it is WITHHELD into '
+                        'context.budget_withheld when the number would be '
+                        'dishonest: no tethers, fewer than 3, or more than '
+                        'a quarter of the rail-sharing caps already beyond '
+                        'the search radius. SEPARATE from --declare-classes '
+                        'on purpose -- this key is not a part CLASS. It also '
+                        'arms decap_ungraded, which reports at WARN '
+                        'the caps beyond the search radius that the limit '
+                        'was never derived from. The tether census is '
+                        'written to context.decap_census either way')
+    add_brief_arg(p)
+    add_mechanical_arg(p)
+    p.add_argument('--require-brief', action='store_true',
+                   help='exit 4 when no design brief was found, or when the '
+                        'one found declares nothing gradable. The parallel of '
+                        '--require-rules one level up: a grade with no '
+                        'declared intent behind it is graded against '
+                        'INFERENCE, and a caller that means "check this '
+                        'against what was declared" needs to be able to say '
+                        'so (#711)')
+    p.add_argument('--require-brief-coverage', action='store_true',
+                   help='exit 4 unless every clause the design brief DECLARED '
+                        'reached a verdict. --require-rules counts RULES, and '
+                        'that is exactly the gap: one run graded six rules, '
+                        'passed, and measured not one clause its brief '
+                        'declared, because the count was satisfied by rules '
+                        'nobody had declared anything for. This counts '
+                        'CLAUSES. A clause the author wrote "unknown", and one '
+                        'this toolchain carries by design, never block (#902)')
+    p.add_argument('--plan-only', action='store_true',
+                   help='with --intent: check the zone PLAN against itself '
+                        'and the board, before any pose exists (#959) -- '
+                        'overlaps and exclusive-zone infeasibility, glob '
+                        'literals, locked members outside their zone, '
+                        'per-zone / per-edge / board area budgets, and the '
+                        'rule roster. Needs no placed board; exits 4 on an '
+                        'ERROR, which is a plan no arrangement can satisfy')
+    p.add_argument('--suggest-channels', action='store_true',
+                   help='print proposed copies of one channel drawn inside '
+                        'ONE sheet (#1480) as JSON and exit: chips of one '
+                        'footprint and value, each with the parts on its own '
+                        'nets, matched by footprint, value and chip pin, '
+                        'checked by place_pose replicate\'s own net rule. '
+                        'Suggestions only: an accepted one\'s `row` is the '
+                        'paste-ready replicate[] entry')
+    p.add_argument('--suggest-arrays', action='store_true',
+                   help='print the pose-blind array DETECTOR suggestions '
+                        '(#1051) as JSON and exit: rows of identical parts '
+                        'each on its own pin of one part (pin_run), caps on '
+                        'the rail pair of one chip (decap_row), or the '
+                        'repeated channel of one sheet (sheet_bank), each '
+                        'with its evidence. Suggestions only -- accept or '
+                        'decline each: an accepted suggestion\'s `row` is the '
+                        'paste-ready arrays[] entry (write your reason into '
+                        'its `why`). '
+                        'Stdout is the bare '
+                        'JSON document; with --json PATH the document goes '
+                        'there and stdout gets a short summary. Works on an '
+                        'unplaced board: it reads no pose')
+    p.add_argument('--json', metavar='PATH',
+                   help='write the full findings (every measurement) as JSON')
+    p.add_argument('--group-by', default='auto', metavar='SOURCES',
+                   help="how blocks are derived when an intent block names a "
+                        "`group`: comma list of kicad,sheet,netprefix,decap; "
+                        "'auto' = kicad,sheet (default); 'none' to disable. "
+                        "Deriving is read-only here, which is why this defaults "
+                        "ON unlike on the placement CLIs")
+    p.add_argument('--clearance', type=float, metavar='MM',
+                   help="clearance the legality model grades at (default: "
+                        "the board's own Default netclass floored at its "
+                        "Board Setup min_clearance, as KiCad grades it, "
+                        "else 0.25). "
+                        "Grading a fixed constant tighter than the board's "
+                        "floor manufactures phantom violations")
+    p.add_argument('--board-edge-clearance', type=float, metavar='MM',
+                   help="board-edge clearance for the outline gate (default: "
+                        "the board's own min_copper_edge_clearance, else "
+                        "the fab edge floor routing writes, 0.2)")
+    p.add_argument('--health', action='store_true',
+                   help="also report the routability signals from the intent's "
+                        "`health` block: how far each block sits from the parts "
+                        "it connects to, and what crosses each declared bus "
+                        "corridor. Advisory -- these say the floorplan will "
+                        "fight the router, not that it breaks the intent")
+    p.add_argument('--require-rules', type=int, default=0, metavar='N',
+                   help='fail unless at least N rules actually RAN. Default 0 '
+                        '(off), which keeps the long-standing contract that a '
+                        'vacuous intent exits 0 -- but that contract is how an '
+                        'intent running ZERO rules constrained two placement '
+                        'laps with nothing, twice, and every consumer stayed '
+                        'silent. A caller that means "grade this" should pass '
+                        '--require-rules 1.')
+    p.add_argument('--exit-zero', action='store_true',
+                   help='report violations but exit 0 anyway')
+    p.add_argument('-q', '--quiet', action='store_true',
+                   help='suppress the text report; keep JSON_SUMMARY')
+    add_board_state_args(p)
+    # The three decap flags share one dest, and argparse takes a shared
+    # dest's default from the FIRST action that declares it -- so a
+    # `default=` on either later flag is dead (the Phase-6 verifier set the
+    # constant to 'auto' on the third and still parsed None), and one on the
+    # first ties the default to the order the flags are declared in. Set it
+    # on the parser instead.
+    p.set_defaults(declare_decaps=DECLARE_DECAPS_DEFAULT)
+    return p
+
+
+def _brief_absence_reason(args, brief):
+    """Why `--require-brief` is unsatisfied. Three distinct cases.
+
+    Saying "no design brief was found" when the caller passed `--no-brief`
+    blames the board for the caller's own flag.
+    """
+    if getattr(args, 'no_brief', False):
+        return ("--no-brief was passed, so any sibling design brief was "
+                "deliberately not read")
+    if brief is None:
+        return "no design brief was found beside this board"
+    return "the brief found declares nothing gradable"
+
+
+def keep_away_unpriced(rows, board_path):
+    """#1253. The intent's `keep_away` rows that NO router will price, or
+    None when the intent carries none.
+
+    check_floorplan grades every `keep_away[]` row of the intent it is
+    given, but route.py, route_diff.py and the GUI read keep-away rules only
+    from the design brief beside the board they route (and a run's own
+    --keep-away), never from an intent. A row written straight into an
+    intent, or compiled from a brief the router does not read (`--brief`
+    naming another file), is therefore graded on the placement and never
+    priced on the tracks. Answered by the router's own reader
+    (`keep_away.unpriced_rules`), so this cannot disagree with what a route
+    step will read."""
+    rows = list(rows or ())
+    if not rows:
+        return None
+    from keep_away import brief_path_for, normalize_keep_away_specs, \
+        unpriced_rules
+    got = unpriced_rules([r.get('rule') for r in rows], board_path)
+    missing = set(got['rules'])
+    out = [{'index': i, 'rule': normalize_keep_away_specs(r['rule'])[0],
+            'source': r.get('source')}
+           for i, r in enumerate(rows)
+           if normalize_keep_away_specs(r['rule'])[0] in missing]
+    sibling = got['brief'] or brief_path_for(os.path.abspath(board_path))
+    name = os.path.basename(sibling)
+    rec = {'rules': out, 'checked': len(rows),
+           'router_brief': got['brief'] or None,
+           'router_brief_declares': got['brief_declares'],
+           'router_brief_error': got['brief_error'],
+           'warning': None, 'fix': None}
+    if not out:
+        return rec
+    if got['brief_error']:
+        where = (f"the design brief beside the board cannot be read, so the "
+                 f"route steps refuse to run ({got['brief_error']})")
+    elif got['brief']:
+        where = (f"the design brief beside the board ({name}) does not "
+                 f"declare {'it' if len(out) == 1 else 'them'}")
+    else:
+        where = f"no design brief sits beside the board ({name})"
+    rec['warning'] = (
+        f"{len(out)} keep_away rule(s) in this intent are graded on the "
+        f"placement but will NOT be priced by route.py, route_diff.py or the "
+        f"GUI: the routers read keep-away rules from the design brief beside "
+        f"the board, never from an intent, and {where}")
+    rec['fix'] = (
+        f"declare {'it' if len(out) == 1 else 'each rule'} in the "
+        f"`keep_away` list of {sibling}, the brief the route steps read "
+        f"beside this board, then re-run check_floorplan.py --emit-intent "
+        f"so the intent carries it from the brief")
+    return rec
+
+
+def _print_keep_away_unpriced(rec):
+    if not rec or not rec['rules']:
+        return
+    print(f"  WARNING keep_away: {rec['warning']}:")
+    for r in rec['rules']:
+        print(f"    - keep_away[{r['index']}] '{r['rule']}'"
+              + (f" (source {r['source']})" if r.get('source') else ''))
+    print(f"    fix: {rec['fix']}")
+
+
+def intent_doc_for_drift(path):
+    """The intent as a plain dict, for the drift diff. `{}` if unreadable --
+    the loader has already refused a bad file by the time this runs, so a
+    failure here can only be a race, and a drift report is not worth a crash.
+    """
+    try:
+        with open(path, encoding='utf-8') as fh:
+            return json.load(fh)
+    except (OSError, ValueError):
+        return {}
+
+
+#: What an emit writes about itself rather than about the design: provenance,
+#: and the reader version its rows ask for. A row they describe is named
+#: on its own.
+_EMIT_BOOKKEEPING = ('context', 'min_reader')
+#: The key that names a list's row, so a row found on both sides is compared
+#: field by field and one edited field is named rather than the whole row.
+#: A row with none of them still compares, as a whole.
+_ROW_ID_KEYS = ('ref', 'name', 'connector', 'pair')
+_ABSENT = object()
+
+
+def _row_id(row):
+    if isinstance(row, dict):
+        for k in _ROW_ID_KEYS:
+            if k in row:
+                return k, json.dumps(row[k], sort_keys=True)
+    return None
+
+
+def _row_label(row):
+    at = _row_id(row)
+    if at is None:
+        return json.dumps(row, sort_keys=True) if isinstance(row, (dict, list)) else str(row)
+    v = row[at[0]]
+    return ','.join(map(str, v)) if isinstance(v, list) else str(v)
+
+
+def _rows_not_carried(path, old, new, out):
+    canon = lambda r: json.dumps(r, sort_keys=True)     # noqa: E731
+    new = new if isinstance(new, list) else []
+    left = {}
+    for r in new:
+        left[canon(r)] = left.get(canon(r), 0) + 1
+    ids_old, ids_new = {}, {}
+    for rows, ids in ((old, ids_old), (new, ids_new)):
+        for r in rows:
+            ids.setdefault(_row_id(r), []).append(r)
+    for r in old:
+        if left.get(canon(r)):
+            left[canon(r)] -= 1
+            continue
+        at = _row_id(r)
+        where = f"{path}[{_row_label(r)}]"
+        if at is not None and len(ids_old[at]) == 1 and len(ids_new.get(at, ())) == 1:
+            _not_carried(where, r, ids_new[at][0], out)
+        elif isinstance(r, (dict, list)):
+            out.append(f"{where} = {canon(r)}")
+        else:
+            out.append(where)
+
+
+def _not_carried(path, old, new, out):
+    if old is None or old == '' or old == [] or old == {}:
+        return                      # holds nothing a new document could lose
+    if isinstance(old, dict):
+        sub = new if isinstance(new, dict) else {}
+        for k in sorted(old):
+            _not_carried(f'{path}.{k}' if path else k, old[k], sub.get(k, _ABSENT), out)
+    elif isinstance(old, list) and not all(
+            isinstance(v, (int, float)) for v in old):
+        _rows_not_carried(path, old, new, out)
+    elif new is _ABSENT:
+        out.append(f"{path} = {json.dumps(old)}")
+    elif old != new:
+        out.append(f"{path}: {json.dumps(old)} -> {json.dumps(new)}")
+
+
+def intent_rows_not_carried(old, new):
+    """#1661: what `new` no longer says that the intent document `old` said,
+    one line per row or value: `path = value` for one it does not have,
+    `path: old -> new` for one it says otherwise, values in full, since the
+    file holding them is about to be replaced. Compared by shape, not by a
+    list of keys, so a key added later is covered. Extra rows in `new` are
+    not reported: it carries those."""
+    out = []
+    for k in sorted(old):
+        if k not in _EMIT_BOOKKEEPING:
+            _not_carried(k, old[k], new.get(k, _ABSENT), out)
+    return out
+
+
+def _warn_rows_replaced(path, doc):
+    """#1661: `--emit-intent` writes a new document from the board, the brief
+    and mechanical.json, and never reads the file it replaces, so a row
+    written only in that file is lost with exit 0. Said here, whatever
+    `--quiet` says, because the old file is about to be gone."""
+    if not os.path.exists(path):
+        return
+    try:
+        with open(path, encoding='utf-8') as fh:
+            old = json.load(fh)
+        if not isinstance(old, dict):
+            raise ValueError('not a JSON object')
+    except (OSError, ValueError) as exc:
+        print(f"  WARNING: this emit replaces {path}, which could not be read "
+              f"as an intent, so nothing was compared ({exc})", file=sys.stderr)
+        return
+    lost = intent_rows_not_carried(old, json.loads(json.dumps(doc, sort_keys=True)))
+    if lost:
+        print(f"  WARNING: this emit replaces {path}, and the new document "
+              f"does not carry {len(lost)} row(s) of the old one. An emit is "
+              f"built from the board, the design brief and mechanical.json, "
+              f"never from the old file, so a row written only there is lost "
+              f"(put it in the brief if the brief has a key for it, else "
+              f"write it again now), and a value the emitter wrote moves with "
+              f"the board:", file=sys.stderr)
+        for row in lost:
+            print(f"    - {row}", file=sys.stderr)
+
+
+def _model_owed(intent, pcb, board, edge_clearance=None):
+    """The per-part questions the board's 3D models put to a plan
+    (`heights.for_board`, read once per board and cached): #1653's
+    `floorplan.model_short_owed`, #1662's `floorplan.body_floor_owed` and
+    #1694's `floorplan.pad_floor_owed`, at the run's own `edge_clearance` when
+    it gives one; [] when none resolve."""
+    from placement import heights as _heights
+    from placement.floorplan import body_floor_owed, model_short_owed, pad_floor_owed
+    h = _heights.for_board(pcb, board)
+    return (model_short_owed(intent, pcb, board, h) + body_floor_owed(intent, pcb, board, h)
+            + pad_floor_owed(intent, pcb, board, h, edge_clearance))
+
+
+def _plan_only(args, intent, pcb, sources, brief_fragment, brief_path,
+               mech=None, brief_report=None):
+    """`--plan-only` (#959, #998): the plan, checked before any pose.
+
+    `plan_check` plus the rule roster, with the declaration ledger in its
+    before-placement view (`pending` rows). Exits 4 on an ERROR -- every one
+    is a plan no arrangement can satisfy -- and 0 otherwise, WARNs included.
+    """
+    from list_nets import board_floor_knobs
+    from placement import reconcile as _rc
+    from placement.floorplan import plan_check
+    clearance, edge_clearance, knobs = board_floor_knobs(
+        args.board, args.clearance, args.board_edge_clearance)
+    try:
+        found, measured = plan_check(intent, pcb, args.board,
+                                     group_sources=sources or (),
+                                     clearance=clearance,
+                                     board_edge_clearance=edge_clearance)
+        rows = rule_roster(intent, pcb, args.board,
+                           group_sources=sources or (), clearance=clearance,
+                           board_edge_clearance=edge_clearance,
+                           brief_fragment=brief_fragment or None)
+    except UntrustworthyOutline as exc:
+        print(f"ERROR: {args.board}: {exc}", file=sys.stderr)
+        return UNPLACED_EXIT
+    errors = [v for v in found if v.severity == 'error']
+    # The channels reconciled here too, so the before-placement ledger names
+    # every contradiction the plan owes a disposition.
+    recon = _rc.reconcile(pcb, args.board, brief_fragment=brief_fragment,
+                          brief_source=brief_path or None, mechanical=mech,
+                          intent_doc=intent_doc_for_drift(args.intent),
+                          intent_source=args.intent, floors_used=knobs)
+    stale = stale_dispositions(intent, rows, pcb, reconciliation=recon)
+    ledger = declaration_ledger(
+        intent, rows, reconciliation=recon,
+        consequences=(brief_report or {}).get('consequences'))
+    answered_c = (intent.dispositions or {}).get('contradictions', {})
+    open_c = [r['id'] for r in _rc.contradictions(recon)
+              if r['id'] not in answered_c]
+    if not args.quiet:
+        print(f"PLAN {args.intent} on {args.board}: {len(errors)} error(s), "
+              f"{len(found) - len(errors)} warning(s) -- checked before any "
+              f"pose exists")
+        for v in found:
+            print(f"    [{'ERROR' if v.severity == 'error' else 'warn '}] "
+                  f"{v.rule}: {v.message}")
+        for line in format_roster(rows, stale,
+                                  _model_owed(intent, pcb, args.board,
+                                              args.board_edge_clearance)):
+            print(line)
+        for line in _rc.format_rows(recon):
+            print(line)
+    by_rule = {}
+    for v in found:
+        by_rule[v.rule] = by_rule.get(v.rule, 0) + 1
+    if args.json:
+        with open(args.json, 'w', encoding='utf-8') as fh:
+            json.dump({'intent': args.intent, 'board': args.board,
+                       'plan_findings': [v.to_dict() for v in found],
+                       'measured': measured, 'rule_roster': rows,
+                       'stale_dispositions': stale,
+                       'declaration_ledger': ledger}, fh, indent=1,
+                      sort_keys=True, default=str)
+            fh.write('\n')
+    s = {'intent': os.path.basename(args.intent),
+         'board': os.path.basename(args.board), 'plan_only': True,
+         'plan_errors': len(errors),
+         'plan_warnings': len(found) - len(errors),
+         'plan_findings_by_rule': by_rule,
+         'rules_dark_undispositioned': [r['rule'] for r in rows
+                                        if r['needs_disposition']],
+         'stale_dispositions': stale,
+         'contradictions': len(_rc.contradictions(recon)),
+         'contradictions_undispositioned': open_c,
+         'mechanical': (mech or {}).get('path'),
+         'clearance_used': knobs['clearance'],
+         'edge_clearance_used': knobs['board_edge_clearance']}
+    s.update(ledger_summary(ledger))
+    print("JSON_SUMMARY: " + json.dumps(s, sort_keys=True))
+    if errors and not args.exit_zero:
+        return VIOLATIONS_EXIT
+    return 0
+
+
+#: The dests `--suggest-arrays` reads; any other flag set is refused by name.
+_SUGGEST_ARRAYS_OWN = ('help', 'board', 'suggest_arrays', 'suggest_channels',
+                       'json', 'quiet')
+
+
+def _suggest_arrays(args) -> int:
+    """`--suggest-arrays`: the detector's candidates, evidence included.
+
+    No placement gate: the detector reads no pose, so an unplaced board --
+    the from-scratch case it exists for -- is as good as a placed one. The
+    parser's and the libraries' own prints go to stderr while the document
+    is built, because a bare-JSON stdout is the contract of this mode.
+    """
+    import contextlib
+    from placement import arrays as arr
+    with contextlib.redirect_stdout(sys.stderr):
+        pcb = parse_kicad_pcb(args.board)
+        declined = []
+        cands = arr.suggest_arrays(pcb, declined=declined)
+    doc = {'board': args.board, 'pose_blind': True,
+           'criteria': list(arr.CRITERIA), 'min_members': arr.MIN_MEMBERS,
+           'count': len(cands), 'suggestions': cands, 'declined': declined}
+    text = json.dumps(doc, indent=1, sort_keys=True)
+    if not args.json:
+        print(text)
+        return 0
+    try:
+        with open(args.json, 'w', encoding='utf-8') as fh:
+            fh.write(text + '\n')
+    except OSError as exc:
+        print(f"ERROR: --json {args.json}: {exc}", file=sys.stderr)
+        return 2
+    if not args.quiet:
+        print(f"{len(cands)} array suggestion(s) on {args.board} -- "
+              f"pose-blind, SUGGESTIONS: accept or decline each; an "
+              f"accepted one's `row` is the arrays[] entry to paste "
+              f"(evidence in {args.json})")
+        for c in cands:
+            print(f"  {c['criterion']:10s} {c['name']}: "
+                  f"{', '.join(c['members'])}"
+                  + (f" -> {c['serves']}" if c['serves'] else '')
+                  + f" (order {c['order']})")
+    return 0
+
+
+def _suggest_channels(args) -> int:
+    """`--suggest-channels` (#1480): copies of one channel inside one sheet,
+    with their correspondence, as `--suggest-arrays` prints rows."""
+    import contextlib
+    from placement import replicate as rep
+    with contextlib.redirect_stdout(sys.stderr):
+        pcb = parse_kicad_pcb(args.board)
+        declined = []
+        cands = rep.suggest_channels(pcb, declined=declined)
+    doc = {'board': args.board, 'pose_blind': True, 'count': len(cands),
+           'suggestions': cands, 'declined': declined}
+    text = json.dumps(doc, indent=1, sort_keys=True)
+    if not args.json:
+        print(text)
+        return 0
+    try:
+        with open(args.json, 'w', encoding='utf-8') as fh:
+            fh.write(text + '\n')
+    except OSError as exc:
+        print(f"ERROR: --json {args.json}: {exc}", file=sys.stderr)
+        return 2
+    if not args.quiet:
+        print(f"{len(cands)} channel suggestion(s) on {args.board} -- "
+              f"pose-blind, SUGGESTIONS: an accepted one's `row` is the "
+              f"replicate[] entry to paste (evidence in {args.json})")
+        for c in cands:
+            print(f"  {c['value'] or c['chip']}: "
+                  + ' | '.join(','.join(ch) for ch in c['channels']))
+    return 0
+
+
+def _bare_json_stdout(argv) -> bool:
+    """True when this invocation writes a bare JSON document to stdout,
+    where a `CMD:` banner line would be a JSONDecodeError at char 0."""
+    import contextlib
+    try:
+        # BOTH streams: `--help` prints its usage to STDOUT before the
+        # SystemExit, which put the usage ahead of the `CMD:` banner
+        # (test_run4_instruments' banner check).
+        with open(os.devnull, 'w') as null, \
+                contextlib.redirect_stderr(null), \
+                contextlib.redirect_stdout(null):
+            a = build_parser().parse_args(argv)
+    except SystemExit:
+        return False
+    return bool((a.suggest_arrays or a.suggest_channels) and not a.json)
+
+
+def main(argv=None):
+    args = build_parser().parse_args(argv)
+    parser_error = build_parser().error
+    if args.emit_intent:
+        from placement import run_record          # the placement record (#1486)
+        run_record.record('check_floorplan', argv, boards=[args.board])
+
+    if args.suggest_arrays or args.suggest_channels:
+        mode = '--suggest-arrays' if args.suggest_arrays else '--suggest-channels'
+        if args.suggest_arrays and args.suggest_channels:
+            parser_error('--suggest-arrays and --suggest-channels are two '
+                         'reports; ask for one')
+        if args.intent or args.emit_intent:
+            parser_error(f'{mode} runs alone: it suggests, and an '
+                         'intent is where a reader writes what it accepted')
+        # Every other flag the mode would silently IGNORE is refused by
+        # name: a `--brief` (even a missing file), `--plan-only` or
+        # `--group-by` that changed nothing reads as honoured otherwise.
+        ignored = []
+        _p = build_parser()
+        for act in _p._actions:
+            if act.dest in _SUGGEST_ARRAYS_OWN or not act.option_strings:
+                continue
+            # `get_default`, not `act.default`: the decap flags share one
+            # dest whose default is set once through `set_defaults`.
+            default = _p.get_default(act.dest)
+            if getattr(args, act.dest, default) != default:
+                ignored.append(act.option_strings[-1])
+        if ignored:
+            parser_error(f"{mode} does not use "
+                         f"{', '.join(sorted(set(ignored)))}: it reads only "
+                         f"the board's parts and nets (--json and --quiet "
+                         f"are its options)")
+        if not os.path.exists(args.board):
+            parser_error(f"{args.board}: no such file")
+        if args.json and not os.path.isdir(
+                os.path.dirname(os.path.abspath(args.json))):
+            parser_error(f"--json {args.json}: its directory does not "
+                         f"exist")
+        return _suggest_channels(args) if args.suggest_channels else _suggest_arrays(args)
+    if not args.intent and not args.emit_intent:
+        parser_error('one of --intent, --emit-intent, --suggest-arrays or '
+                     '--suggest-channels is required')
+    if not os.path.exists(args.board):
+        parser_error(f"{args.board}: no such file")
+
+    try:
+        sources = parse_sources(args.group_by)
+    except GroupError as exc:
+        parser_error(str(exc))
+
+    pcb = parse_kicad_pcb(args.board)
+
+    # The unplaced gate first: grading a pile of parts at the origin fires every
+    # rule at once, which is noise rather than a verdict.
+    if args.plan_only and not args.intent:
+        parser_error('--plan-only checks a plan: pass it with --intent')
+    gate_or_exit(pcb, args.board, 'check_floorplan',
+                 # A plan is checked BEFORE a placement exists, so the pile
+                 # is exactly the board --plan-only is for (#959).
+                 allow_unplaced=args.allow_unplaced or args.plan_only,
+                 allow_routed=True)          # copper is irrelevant to a floorplan
+
+    # #711. Discovery is HERE, in the CLI, never inside `emit_intent`: that
+    # function must stay a pure function of its arguments, or a brief dropped
+    # beside a corpus board silently changes the A/B fixture intents and the
+    # emit->grade round trip.
+    from placement import design_brief as _db
+    brief, brief_path, _rc = load_brief_or_exit(args, args.board)
+    if _rc:
+        return _rc
+    brief_report = {}
+    brief_fragment = {}
+    if brief is not None:
+        # #959 (#1000): compiled WITH the connector consequences, here and
+        # before the emit/grade branch, so both paths -- and drift -- see the
+        # same clauses.
+        brief_fragment, brief_report = _db.compile_with_consequences(
+            brief, pcb, args.board)
+        if not args.quiet:
+            print(_db.format_report(brief_report, path=brief_path))
+            for line in brief_report['unmatched']:
+                print(f"  brief names {line}, which is not on this board -- "
+                      f"the entry is KEPT so the grade says so, rather than "
+                      f"dropped so it grades clean")
+            if brief_report['not_graded']:
+                print(f"  carried, NOT graded: "
+                      f"{', '.join(brief_report['not_graded'])}")
+            for _r in brief_report.get('consequences') or ():
+                print(f"  {_r['status'].upper():10s} {_r['id']}"
+                      + (f" -> {_r['compiled_to']}"
+                         f" [{_r['basis']}]" if _r['compiled_to'] else '')
+                      + f": {_r['why']}")
+    elif not args.quiet and not getattr(args, 'no_brief', False):
+        # A SILENT absence is the failure this channel exists to fix, so the
+        # not-found branch says what is filling the gap instead.
+        print(_db.format_absent_note(args.board))
+
+    # #959 (#1001): the recorded mechanical facts, discovered beside the board
+    # the way the brief is. Read by nothing before this.
+    from placement import reconcile as _rc
+    mech, mech_path, _mrc = load_mechanical_or_exit(args, args.board)
+    if _mrc:
+        return _mrc
+    if mech is not None and not args.quiet:
+        print(f"mechanical declaration {mech_path}: {len(mech['poses'])} "
+              f"pose(s), {len(mech['edges'])} edge(s)")
+    from list_nets import board_floor_knobs as _bfk
+    _floors_used = _bfk(args.board, args.clearance,
+                        args.board_edge_clearance)[2]
+
+    _require_brief_failed = False
+    if args.decaps_from and not args.emit_intent:
+        print("ERROR: --decaps-from derives a limit INTO an emitted intent; "
+              "pass --emit-intent with it", file=sys.stderr)
+        return 2
+    if args.decaps_from and not os.path.isfile(args.decaps_from):
+        print(f"ERROR: --decaps-from {args.decaps_from}: no such board",
+              file=sys.stderr)
+        return 2
+    if args.emit_intent:
+        try:
+            from list_nets import board_floor_knobs
+            _ec, _ee, _ek = board_floor_knobs(args.board, args.clearance,
+                                              args.board_edge_clearance)
+            doc = emit_intent(pcb, args.board, group_sources=sources or (),
+                              declare_classes=args.declare_classes,
+                              derive_decaps=args.declare_decaps,
+                              brief_fragment=brief_fragment or None,
+                              decaps_from=args.decaps_from,
+                              clearance=_ec, board_edge_clearance=_ee)
+        except UntrustworthyOutline as exc:
+            print(f"ERROR: {args.board}: {exc}", file=sys.stderr)
+            return UNPLACED_EXIT
+        if brief_fragment:
+            doc = _db.merge_into_intent(doc, brief_fragment, brief_report)
+            if not args.quiet:
+                print(f"  merged the design brief into the emitted intent: "
+                      f"declared claims OUTRANK the edge this tool infers "
+                      f"from a part's current pose")
+                for line in brief_report['contradictions']:
+                    print(f"  CONTRADICTION {line}")
+        # #959 (#1001): every ref two channels speak to, and which mechanical
+        # refs the grade will anchor. The anchors themselves are NOT written
+        # into the plan: the grade compiles them from the file, so no plan
+        # can drop one or claim one.
+        _rows = _rc.reconcile(pcb, args.board, brief_fragment=brief_fragment,
+                              brief_source=brief_path or None,
+                              mechanical=mech, floors_used=_floors_used)
+        _ctx = doc.setdefault('context', {})
+        _ctx['reconciliation'] = _rows
+        _contra = _rc.contradictions(_rows)
+        if _contra and isinstance(_ctx.get('brief'), dict):
+            _ctx['brief'].setdefault('contradictions', []).extend(
+                line.strip() for line in _rc.format_rows(_contra))
+        if mech is not None:
+            _anchors, _skipped = _rc.anchor_blocks(
+                pcb, args.board, mech,
+                lost=_rc.lost_mechanical_refs(_rows))
+            _ctx['mechanical'] = {
+                'path': mech['path'], 'sha256': mech['sha256'],
+                'anchored': sorted(b['name'][len('mech:'):]
+                                   for b in _anchors),
+                'skipped': _skipped}
+            # #1054: the anchored poses also compile into `fixed_poses[]`,
+            # so place_simple can SEAT what the grade anchors. The grade
+            # still anchors from the FILE, so a plan that drops a row
+            # drops the seat, never the grade. A ref another claim of
+            # this intent already places is skipped by name -- the
+            # loader refuses a ref under two such claims.
+            # An emitted floor with no edge (#1662) places nothing, and a
+            # recorded pose answers what it asks: the row goes.
+            _basis = _ctx.get('basis') or {}
+            _kept = []
+            for _c in doc.get('edge_connectors') or ():
+                _k = f"edge_connectors[{_c.get('ref')}].overhang_mm"
+                if (str(_c.get('ref')) in _ctx['mechanical']['anchored']
+                        and not _c.get('edge')
+                        and _basis.get(_k + '.min') == 'derived_default'):
+                    _basis.pop(_k, None)
+                    _basis.pop(_k + '.min', None)
+                else:
+                    _kept.append(_c)
+            if 'edge_connectors' in doc:
+                doc['edge_connectors'] = _kept
+            _claimed = {}
+            for _c in doc.get('edge_connectors') or ():
+                _claimed[str(_c.get('ref'))] = (
+                    'an edge_connectors entry already places it')
+            for _pat in doc.get('must_lock') or ():
+                for _r in _ctx['mechanical']['anchored']:
+                    if fnmatch.fnmatchcase(_r, _pat):
+                        _claimed.setdefault(_r, f"must_lock {_pat!r} "
+                                                f"already names it")
+            for _f in doc.get('fixed_poses') or ():
+                _claimed.setdefault(str(_f.get('ref')),
+                                    'the design brief fixes its pose')
+            # An ARRAY member moves with its row, and the loader refuses a
+            # member that also has a fixed pose -- so a mechanical pose for
+            # one is skipped, by name, rather than emitted into an intent
+            # this tool's own loader then refuses (review item 2).
+            for _a in doc.get('arrays') or ():
+                for _m in _a.get('members') or ():
+                    _claimed.setdefault(str(_m), f"a member of array "
+                                                 f"{_a.get('name')!r}")
+            _fixed, _fskip = _rc.mechanical_fixed_poses(
+                mech, _ctx['mechanical']['anchored'], claimed=_claimed)
+            _ctx['mechanical']['fixed_poses'] = sorted(
+                f['ref'] for f in _fixed)
+            _ctx['mechanical']['fixed_skipped'] = _fskip
+            if _fixed:
+                doc['fixed_poses'] = (list(doc.get('fixed_poses') or ())
+                                      + _fixed)
+                doc['min_reader'] = max(int(doc.get('min_reader') or 0), 7)
+        # #1298: declared poses that overlap EACH OTHER at those poses (a
+        # human layout's FID inside a connector's courtyard). Compiled
+        # silently, they made every placement honouring the intent grade NOT
+        # BUILDABLE on a pair no move can clear. A courtyard overlap is
+        # written as an explicit waiver the author can delete; a pad or hole
+        # conflict, which no waiver covers, is said and left alone.
+        _decl_cy, _decl_hard = [], []
+        if len(doc.get('fixed_poses') or ()) >= 2:
+            try:
+                from list_nets import board_floor_knobs
+                from placement.floorplan import (accept_declared_overlaps,
+                                                 declared_pose_overlaps)
+                _dc, _de, _ = board_floor_knobs(args.board, args.clearance,
+                                                args.board_edge_clearance)
+                _already = ([tuple(w.get('pair') or ()) for w in
+                             doc.get('overlap_waivers') or ()]
+                            + [(str(f['ref']), str(o))
+                               for f in doc['fixed_poses']
+                               for o in f.get('accept_courtyard_overlap')
+                               or ()])
+                _decl_cy, _decl_hard = declared_pose_overlaps(
+                    doc['fixed_poses'], pcb, args.board, clearance=_dc,
+                    board_edge_clearance=_de, waived=_already)
+                _wrote = accept_declared_overlaps(doc, _decl_cy)
+                _ctx['declared_pose_overlaps'] = {
+                    'accepted': [list(p) for p in _wrote],
+                    'hard': [c['pair'] for c in _decl_hard]}
+            except Exception as exc:                         # noqa: BLE001
+                print(f"  WARNING: declared poses not checked against each "
+                      f"other: {type(exc).__name__}: {exc}", file=sys.stderr)
+        if _decl_cy:
+            print(f"  WARNING: {len(_decl_cy)} pair(s) of declared poses "
+                  f"overlap each other by courtyard at those poses: "
+                  + '; '.join(f"{c['pair'][0]}<->{c['pair'][1]} "
+                              f"({c['reason']})" for c in _decl_cy)
+                  + " -- written as fixed_poses[].accept_courtyard_overlap "
+                    "(courtyard only: check_assembly and the plan check waive "
+                    "exactly these pairs). Delete a ref from that list to "
+                    "refuse its overlap instead.", file=sys.stderr)
+        for c in _decl_hard:
+            print(f"  WARNING: declared poses {c['pair'][0]} and "
+                  f"{c['pair'][1]} also conflict past their courtyards: "
+                  f"{c['reason']} -- no waiver covers pads or holes, and "
+                  f"stage 0 refuses the pair; move one pose", file=sys.stderr)
+        if not args.quiet:
+            for line in _rc.format_rows(_rows):
+                print(line)
+            if mech is not None:
+                _m = _ctx['mechanical']
+                _sk = ', '.join(f"{k} ({v})"
+                                for k, v in sorted(_m['skipped'].items()))
+                print(f"  {len(_m['anchored'])} mechanical ref(s) the "
+                      f"grade anchors at their declared pose (compiled from "
+                      f"the file at grade time; each must be locked "
+                      f"there, or seated by a fixed_poses entry)"
+                      + (f"; skipped: {_sk}" if _sk else ''))
+                _fs = ', '.join(f"{k} ({v})" for k, v in
+                                sorted(_m['fixed_skipped'].items()))
+                print(f"  {len(_m['fixed_poses'])} of them compiled into "
+                      f"fixed_poses[] for place_simple to seat"
+                      + (f"; not compiled: {_fs}" if _fs else ''))
+        if args.require_brief and not brief_fragment:
+            print(f"  FAIL: --require-brief, but " + _brief_absence_reason(
+                args, brief)
+                  + ". The emitted intent describes the board as it is, "
+                    "including its damage.", file=sys.stderr)
+            _require_brief_failed = True
+        # The file is written BEFORE the --require-brief verdict: the flag
+        # says "exit 4 when nothing was declared", not "produce nothing".
+        # Returning early left `--emit-intent X --require-brief` with no X at
+        # all, so a caller could not even see what it was refusing.
+        _warn_rows_replaced(args.emit_intent, doc)
+        with open(args.emit_intent, 'w', encoding='utf-8') as fh:
+            json.dump(doc, fh, indent=1, sort_keys=True)
+            fh.write('\n')
+        if not args.quiet:
+            zoned = sum(1 for b in doc['blocks'] if 'zone' in b)
+            print(f"Wrote {args.emit_intent}")
+            print(f"  {len(doc['blocks'])} block(s), {zoned} with a zone, "
+                  f"{len(doc['edge_connectors'])} edge connector(s), "
+                  f"{len(doc['must_lock'])} locked part(s)")
+            print(f"  envelope {doc['envelope']['rect']} -- read from the "
+                  f"board. The outline is not editable by this toolchain")
+            # #1253: rules compiled from a `--brief` that is not the one
+            # beside the board are graded and never routed.
+            _print_keep_away_unpriced(keep_away_unpriced(
+                doc.get('keep_away'), args.board))
+            # #1479: rows are graded, and no placement step seats them.
+            from placement.arrays import graded_only_warning
+            _rows = graded_only_warning(doc.get('arrays'))
+            if _rows:
+                print(f"  WARNING {_rows}")
+            # #1103: a pile says what it did not read off its poses.
+            _pcw = (doc.get('context') or {}).get('pose_claims_withheld')
+            if _pcw:
+                print(f"  pile: {_pcw['reason']} -- withheld "
+                      f"{', '.join(_pcw['withheld'])} for "
+                      f"{len(_pcw['refs_off_board'])} unlocked part(s) off the board; "
+                      f"kept: {_pcw['kept']}")
+            # #704: the decap number and what it COSTS, next to each other.
+            cen = (doc.get('context') or {}).get('decap_census') or {}
+            lim = (doc.get('decaps') or {}).get('max_distance_mm')
+            held = ((doc.get('context') or {}).get('budget_withheld')
+                    or {}).get('decaps.max_distance_mm')
+            if lim is not None:
+                _src = (f"{cen.get('reference_tethers')} tether(s) on the "
+                        f"reference {os.path.basename(cen['reference_board'])}"
+                        if cen.get('reference_board')
+                        else f"{cen.get('tethers')} tether(s)")
+                print(f"  decaps: max_distance_mm {lim} from {_src}")
+            elif held:
+                print(f"  decaps: max_distance_mm WITHHELD -- {held}")
+            # #1102: the pin limit --decaps-from derives beside it.
+            _plim = (doc.get('decaps') or {}).get('max_pin_distance_mm')
+            if _plim is not None:
+                _pc = cen.get('reference_pin_census') or {}
+                print(f"  decaps: max_pin_distance_mm {_plim} from "
+                      f"{_pc.get('covered')} supply pin(s) on the reference")
+            elif cen.get('pin_limit_withheld'):
+                print(f"  decaps: max_pin_distance_mm not derived -- "
+                      f"{cen['pin_limit_withheld']}")
+            elif cen.get('auto_withheld'):
+                # #959: auto's withholding is kept out of budget_withheld
+                # (no exit change), and printed here so it is not silent.
+                print(f"  decaps: max_distance_mm not derived (auto) -- "
+                      f"{cen['auto_withheld']}")
+            # A severity the emit RAISED is said whether or not a pin limit
+            # came with it: it rides on the tether limit, and the esp_prog
+            # fixtures promote with the pin limit withheld (2 covered pins).
+            if cen.get('decap_ungraded_promoted'):
+                print(f"  decaps: decap_ungraded promoted to error -- "
+                      f"{cen['decap_ungraded_promoted']}")
+            # #1178: a placed reference with parts sharing an origin is read
+            # as placed (a pile is refused), and the shared ones are named.
+            if cen.get('reference_stacked_refs'):
+                print(f"  decaps: the reference was read as placed although "
+                      f"{', '.join(cen['reference_stacked_refs'])} share an "
+                      f"origin -- it is not a pile (#1109's `pile`)")
+            # The two causes are printed SEPARATELY (#792). One number
+            # used to carry both, and the doc explained it with a third
+            # cause -- a predicate mismatch -- that measurement says does
+            # not exist. A reader cannot act on a conflated count: the
+            # first is a grading hole to widen or accept, the second is a
+            # design fact about caps that have no IC at all.
+            # A limit read off a --decaps-from reference owes nothing to THIS
+            # board's census, so the "not derived from them" line is only
+            # true without one.
+            if cen.get('beyond_radius') and not cen.get('reference_board'):
+                print(f"  decap census: {cen['beyond_radius']} rail-sharing "
+                      f"cap(s) lie beyond the {cen['search_radius_mm']}mm "
+                      f"search radius (worst {cen['worst_beyond_mm']}mm), "
+                      f"so the limit was not derived from them -- "
+                      f"decap_ungraded reports them at WARN")
+            if cen.get('no_rail_chip'):
+                print(f"  decap census: {cen['no_rail_chip']} cap(s) have "
+                      f"NO chip carrying their rail "
+                      f"({', '.join(cen.get('no_rail_chip_refs') or [])}) "
+                      f"-- bulk or filter caps with no IC to be near; "
+                      f"graded by nothing, and correctly so")
+            # #959 (#997): what the emitted intent leaves dark, and what a
+            # plan built from it will owe -- said at the moment of emission.
+            try:
+                from list_nets import board_floor_knobs
+                _c, _e, _k = board_floor_knobs(args.board, args.clearance,
+                                               args.board_edge_clearance)
+                _it = intent_from_dict(doc, args.emit_intent)
+                _rows = rule_roster(
+                    _it, pcb, args.board, group_sources=sources or (),
+                    clearance=_c, board_edge_clearance=_e,
+                    brief_fragment=brief_fragment or None)
+                for line in format_roster(_rows,
+                                          stale_dispositions(_it, _rows),
+                                          _model_owed(_it, pcb, args.board,
+                                                      args.board_edge_clearance)):
+                    print(line)
+            except (IntentError, UntrustworthyOutline) as exc:
+                print(f"  rule roster not computed: {exc}")
+        # AFTER the document is written, not instead of it (see above).
+        if _require_brief_failed and not args.exit_zero:
+            return VIOLATIONS_EXIT
+        return 0
+
+    try:
+        intent = load_intent(args.intent)
+    except IntentError as exc:
+        parser_error(str(exc))
+
+    if args.plan_only:
+        return _plan_only(args, intent, pcb, sources, brief_fragment,
+                          brief_path, mech, brief_report)
+
+    # #711. On the --intent path the brief REPORTS DRIFT; it does not merge.
+    # Merging would make the graded document differ from the file on disk, so
+    # every violation would cite a claim its reader cannot find. The brief is
+    # the authority for AUTHORING an intent (--emit-intent); grading is
+    # against the artifact the caller pointed at.
+    brief_drift = (_db.drift(intent_doc_for_drift(args.intent), brief_fragment)
+                   if brief_fragment else [])
+    if brief_drift and not args.quiet:
+        print(f"  design brief DRIFT: {len(brief_drift)} claim(s) the brief "
+              f"declares that this intent does not carry. The intent is what "
+              f"is graded -- re-run --emit-intent to fold them in (it writes a "
+              f"new file: it names each row of this one it drops, to write "
+              f"again after it):")
+        for line in brief_drift:
+            print(f"    - {line}")
+
+    # Run-7 S1: unset knobs grade at the BOARD's floor, not fixed constants
+    # (a 0.25 default on a 0.15 board manufactured phantom oob findings).
+    from list_nets import board_floor_knobs
+    clearance, edge_clearance, knobs = board_floor_knobs(
+        args.board, args.clearance, args.board_edge_clearance)
+    if not args.quiet:
+        print(f"grading at clearance {clearance} "
+              f"({knobs['clearance']['source']}), edge {edge_clearance} "
+              f"({knobs['board_edge_clearance']['source']})")
+
+    _rows = _rc.reconcile(pcb, args.board, brief_fragment=brief_fragment,
+                          brief_source=brief_path or None, mechanical=mech,
+                          intent_doc=intent_doc_for_drift(args.intent),
+                          intent_source=args.intent, floors_used=knobs)
+    _lost = _rc.lost_mechanical_refs(_rows)
+    try:
+        result = grade(intent, pcb, args.board, group_sources=sources or (),
+                       clearance=clearance,
+                       board_edge_clearance=edge_clearance,
+                       with_health=args.health, with_roster=True,
+                       brief_fragment=brief_fragment or None,
+                       mechanical=mech, mechanical_skip=_lost,
+                       reconciliation=_rows,
+                       with_pad_stacks=True, edge_seats=True)
+    except UntrustworthyOutline as exc:
+        print(f"ERROR: {args.board}: {exc}", file=sys.stderr)
+        print("  Refused rather than graded: with no usable outline every "
+              "containment check silently degrades to the bounding box, and a "
+              "clean report would mean 'stopped checking'.", file=sys.stderr)
+        return UNPLACED_EXIT
+
+    if not args.quiet:
+        print(format_text(result))
+        for line in _rc.format_rows(_rows):
+            print(line)
+    # #1253. A keep_away row this intent carries without the brief beside
+    # the board is graded above and priced by no router.
+    ka_unpriced = keep_away_unpriced(intent.keep_away, args.board)
+    if not args.quiet:
+        _print_keep_away_unpriced(ka_unpriced)
+    _contra_ids = [r['id'] for r in _rc.contradictions(_rows)]
+    _answered = set((intent.dispositions or {}).get('contradictions', {}))
+
+    # #902. Computed on the --intent path only: an --emit-intent run produces
+    # no grade, so there is nothing for a clause to be covered BY, and saying
+    # "covered" there would be a claim about a document nobody graded.
+    # Written ALWAYS on this path, even with no brief -- then `clauses` is
+    # empty and `brief` is null. An absent block would be ambiguous between
+    # "this board declares nothing" and "an older build produced this
+    # document", and a consumer cannot refuse the second without also refusing
+    # the first, which would reverse #711's contract that a brief-less board
+    # costs nothing. Present-and-empty says "nothing was declared" out loud.
+    _graded_doc = intent_doc_for_drift(args.intent)
+    coverage = _db.clause_coverage(
+        brief_report, _graded_doc,
+        rules_run=result.rules_run,
+        abstained=result.budget_abstained,
+        drifted_ids=(_db.drifted_clause_ids(_graded_doc, brief_fragment)
+                     if brief_fragment else ()))
+    if brief_fragment:
+        if not args.quiet and coverage['clauses']:
+            print(f"  brief clause coverage: {coverage['graded']} graded, "
+                  f"{coverage['uncovered']} uncovered, "
+                  f"{coverage['abstained']} abstained, "
+                  f"{coverage['not_claimed']} declared unknown, "
+                  f"{coverage['carried']} carried")
+            for c in coverage['clauses']:
+                if c['state'] not in ('uncovered', 'abstained') \
+                        and not c['drifted']:
+                    continue
+                # The STATE wins the label when there is one. A clause the
+                # intent does not carry at all is both uncovered and drifted,
+                # and calling it DRIFTED buries the more basic fact: nothing
+                # looked at it. `drifted` is only the headline when the clause
+                # WAS graded -- against something the brief does not say.
+                tag = (c['state'].upper() if c['state'] != 'graded'
+                       else 'DRIFTED')
+                print(f"    {tag} {c['id']}"
+                      + (f" -- {c['why']}" if c['why'] else
+                         ' -- graded, but not against what the brief declares')
+                      )
+
+    # #959 (#997): one row per requirement, from the intent's rules and the
+    # brief's clauses together, so a carried fact cannot hide behind
+    # `complete`.
+    ledger = declaration_ledger(result.intent, result.roster, result=result,
+                                coverage=coverage, brief_source=brief_path,
+                                reconciliation=_rows,
+                                consequences=(brief_report or {}).get(
+                                    'consequences'))
+    ledger_s = ledger_summary(ledger)
+    # #1255: a carried fact ANOTHER instrument grades is named with it, so
+    # the sentence below stays true of the facts it lists.
+    from placement.design_brief import GRADED_ELSEWHERE as _elsewhere
+    _carried = [f for f in ledger_s['carried_facts'] if f not in _elsewhere]
+    _graded_by = [f for f in ledger_s['carried_facts'] if f in _elsewhere]
+    if not args.quiet and _carried:
+        print(f"  {len(_carried)} declared fact(s) are "
+              f"CARRIED, NOT physically checked -- no rule measures them, "
+              f"whatever `complete` says: "
+              f"{', '.join(_carried)}")
+    if not args.quiet and _graded_by:
+        print(f"  {len(_graded_by)} declared fact(s) are graded by another "
+              f"instrument, not by this one: "
+              + ', '.join(f"{f} ({_elsewhere[f]})" for f in _graded_by))
+
+    if args.json:
+        doc = to_json(result)
+        doc['brief_coverage'] = coverage
+        doc['declaration_ledger'] = ledger
+        doc['reconciliation'] = _rows
+        if ka_unpriced is not None:
+            doc['keep_away_unpriced'] = ka_unpriced
+        with open(args.json, 'w', encoding='utf-8') as fh:
+            json.dump(doc, fh, indent=1, sort_keys=True)
+            fh.write('\n')
+        if not args.quiet:
+            print(f"  wrote {args.json}")
+
+    s = summary(result)
+    s['brief'] = brief_path or None
+    s['brief_declared'] = len(brief_report.get('declared') or ())
+    s['brief_unknown'] = len(brief_report.get('unknown') or ())
+    s['brief_absent'] = len(brief_report.get('absent') or ())
+    s['brief_unknown_keys'] = sorted(brief_report.get('unknown') or ())
+    s['brief_drift'] = len(brief_drift)
+    s['keep_away_unpriced'] = len((ka_unpriced or {}).get('rules') or ())
+    if coverage.get('clauses'):
+        s['brief_clauses'] = len(coverage['clauses'])
+        for _k in ('graded', 'uncovered', 'abstained', 'not_claimed',
+                   'carried', 'drifted'):
+            s[f'brief_clauses_{_k}'] = coverage[_k]
+        s['brief_coverage_complete'] = coverage['complete']
+    s.update(ledger_s)
+    s['stale_dispositions'] = list(result.stale_dispositions)
+    s['mechanical'] = mech_path or None
+    s['contradictions'] = len(_contra_ids)
+    s['contradiction_ids'] = _contra_ids
+    s['contradictions_undispositioned'] = [i for i in _contra_ids
+                                           if i not in _answered]
+    s['clearance_used'] = knobs['clearance']
+    s['edge_clearance_used'] = knobs['board_edge_clearance']
+    print("JSON_SUMMARY: " + json.dumps(s, sort_keys=True))
+    # "0 violations" and "0 rules ran" must not look the same to a machine --
+    # this module's own docstring says so, and until now only the DATA said it
+    # (`rules_run` / `rules_skipped`); the exit code could not. Opt-in, so the
+    # pinned default contract is untouched.
+    if args.require_brief and not brief_fragment:
+        print(f"  FAIL: --require-brief, but " + _brief_absence_reason(
+            args, brief)
+              + ". Every `edge` in this intent is then an INFERENCE from a "
+                "part's current pose, not a declaration.", file=sys.stderr)
+        if not args.exit_zero:
+            return VIOLATIONS_EXIT
+    # #902. The CLAUSE gate, beside the RULE gate. They are different claims:
+    # run 25 graded six rules, passed, and measured not one clause its brief
+    # declared -- the count was satisfied by rules nobody had declared
+    # anything for.
+    if args.require_brief_coverage:
+        if not coverage.get('clauses'):
+            # Keyed on whether a brief was FOUND, not on the coverage block's
+            # truthiness. The block became unconditional in this same change,
+            # so `if not coverage` turned into a dead branch and every absence
+            # started printing "the brief that was found ..." -- a fabricated
+            # fact, and worse than the case `_brief_absence_reason`'s own
+            # docstring forbids ("saying 'no design brief was found' when the
+            # caller passed --no-brief blames the board for the caller's own
+            # flag"). Its three cases are the whole point of that function.
+            print("  FAIL: --require-brief-coverage, but "
+                  + (_brief_absence_reason(args, brief) if not brief_fragment
+                     else "the brief that was found declares no gradable "
+                          "clause")
+                  + ". There is nothing here to have covered, so this cannot "
+                    "be the check you meant.", file=sys.stderr)
+            if not args.exit_zero:
+                return VIOLATIONS_EXIT
+        elif not coverage['complete']:
+            # `drifted` is counted among the GRADED clauses only: a clause the
+            # intent does not carry is already counted as uncovered, and
+            # counting it twice would make the two numbers sum past the
+            # clauses that exist.
+            _graded_drift = sum(1 for c in coverage['clauses']
+                                if c['drifted'] and c['state'] == 'graded')
+            print(f"  FAIL: --require-brief-coverage. Of "
+                  f"{len(coverage['clauses'])} clause(s) the brief declares, "
+                  f"{coverage['uncovered']} reached no rule, "
+                  f"{coverage['abstained']} were abstained on, and "
+                  f"{_graded_drift} were graded against something the brief "
+                  f"does not say. `rules_run` counts RULES; this counts "
+                  f"CLAUSES, and the two can disagree completely.",
+                  file=sys.stderr)
+            if not args.exit_zero:
+                return VIOLATIONS_EXIT
+    _ran = s.get('rules_run', 0)
+    if args.require_rules and _ran < args.require_rules:
+        print(f"  FAIL: --require-rules {args.require_rules}, but {_ran} "
+              f"rule(s) ran. A grade that ran no rules is a VACUOUS PASS, not "
+              f"a clean board: {s.get('rules_skipped', 0)} rule(s) were "
+              f"skipped because the intent declares nothing they apply to.",
+              file=sys.stderr)
+        if not args.exit_zero:
+            return VIOLATIONS_EXIT
+    # Reported BEFORE the errors return, not after. The first draft put this
+    # block below it, so a board that both had errors and left a declared
+    # channel ungraded exited 4 for the errors and never said the grade was
+    # incomplete -- the reader then fixes the errors, sees a clean run, and
+    # still has not measured what was never measured.
+    if not result.complete:
+        # #713 item 5: an ungraded DECLARED channel is not a pass, and the exit
+        # code is what most callers actually branch on -- board_score (and
+        # check_complete through it) reads `errors` or the exit status, and
+        # none reads GradeResult.passed.
+        # `--exit-zero` still suppresses the code without lying about `pass`,
+        # exactly as it does for violations.
+        print(f"  NOT FULLY GRADED: "
+              + ', '.join(f'{n} {k}' for k, n in
+                          sorted(result.not_graded.items()))
+              + ". A channel the intent asked for was never measured, so this "
+                "is an absent verdict, not a clean one.", file=sys.stderr)
+        if not args.exit_zero:
+            return VIOLATIONS_EXIT
+    if result.errors and not args.exit_zero:
+        return VIOLATIONS_EXIT
+    return 0
+
+
+if __name__ == '__main__':
+    # No banner when stdout is a bare JSON document (`--suggest-arrays`
+    # without `--json`), the choice board_context / board_brief make too.
+    if not _bare_json_stdout(sys.argv[1:]):
+        import cli_banner; cli_banner.install()  # CMD/EXIT self-echo (run-3 B1)
+    sys.exit(main())

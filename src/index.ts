@@ -30,6 +30,10 @@ export interface KiCadRoutingToolsAutorouterOptions {
   collapseShortSameLayerTunnels?: boolean
 }
 
+export function getKiCadRoutingToolsVersion(): string {
+  return gridRouter.upstream_version()
+}
+
 export async function initKiCadRoutingToolsAutorouter() {
   // The wasm-pack nodejs target initializes synchronously when imported.
 }

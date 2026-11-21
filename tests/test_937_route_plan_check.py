@@ -1,0 +1,534 @@
+#!/usr/bin/env python3
+"""#937: the routing plan checker refuses the right plan, for the right rule.
+
+A checker that refuses everything is worth nothing, and a checker that refuses
+nothing is worth less. So this is built as a CONTROL plus one targeted break
+per rule:
+
+  * the compliant plan must exit 0 with every rule `ok` -- without that, every
+    refusal below is just a checker that says no;
+  * each break must exit 4 AND NAME ITS OWN RULE. `assert rc == 4` alone would
+    pass on a plan that failed for a different reason, which is how a gate
+    ends up testing nothing. CLAUDE.md states this directly: a non-zero exit
+    is not evidence, assert the REASON.
+  * and a break must not redden OTHER rules, or the naming is a coincidence.
+
+It also pins what this checker reads. `plan_steps_from_manifest` -- the GUI
+conversion -- drops `cd`, `cp`, pipes and every `check_*` command, so a
+checker built on it could not see six of these rules AT ALL and would report
+the broken plans clean. The cases that break those six are the regression
+test for that design choice.
+"""
+import os
+import subprocess
+import sys
+import tempfile
+
+ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+CHECKER = os.path.join(ROOT, '.claude', 'skills', 'plan-pcb-routing',
+                       'scripts', 'route_plan_check.py')
+
+RUN_ALL_TIMEOUT = 300
+
+#: A plan that satisfies every rule. Every break below is this file with ONE
+#: line changed, so a reddened rule is attributable to that change.
+COMPLIANT = """#!/bin/bash
+set -e
+cd /repo
+# cwd=/repo
+python3 -u -X utf8 py_router/bga_fanout.py b.kicad_pcb s1.kicad_pcb \
+--component U1 --nets '*' --clearance 0.09 --layers F.Cu B.Cu
+# cwd=/repo
+python3 -u -X utf8 py_placer/place_fanout_clearance.py s1.kicad_pcb \
+s2.kicad_pcb --clearance 0.09
+# cwd=/repo
+python3 -u -X utf8 py_router/route_planes.py s2.kicad_pcb s3.kicad_pcb \
+--nets GND +3V3 --plane-layers In1.Cu In2.Cu
+# cwd=/repo
+python3 -u -X utf8 py_router/route.py s3.kicad_pcb final.kicad_pcb \
+--nets '*' --power-nets GND +3V3 --clearance 0.09
+# Verification -- COMMENTS, never executable lines: this file's exit code is
+# read as the chain verdict.
+#   python3 -X utf8 py_router/check_drc.py final.kicad_pcb
+#   python3 -X utf8 py_router/check_connected.py final.kicad_pcb
+#   python3 -X utf8 py_tools/check_orphan_stubs.py final.kicad_pcb
+"""
+
+#: (rule, what the break is, the edit as (old, new)). `old` must appear in
+#: COMPLIANT exactly once -- asserted, because a break that edited nothing
+#: would be recorded as "the checker missed it".
+BREAKS = [
+    ('R01', 'no cd line', ('cd /repo\n', '')),
+    # #1735: without `set -e` the file exits with its last line's code.
+    ('R01', 'no set -e line', ('set -e\n', '')),
+    ('R02', 'a pipe on the route step',
+     ('--clearance 0.09\n# Verification',
+      "--clearance 0.09 2>&1 | tee route.log\n# Verification")),
+    ('R03', 'a checker as an executable line',
+     ('#   python3 -X utf8 py_router/check_drc.py final.kicad_pcb',
+      'python3 -X utf8 py_router/check_drc.py final.kicad_pcb')),
+    ('R04', 'the chain ends on a re-pour',
+     ('# Verification',
+      '# cwd=/repo\npython3 -u -X utf8 py_router/route_planes.py '
+      'final.kicad_pcb after.kicad_pcb --nets GND --plane-layers In1.Cu\n'
+      '# Verification')),
+    # #1646: a check_join WITHOUT --keep-staged writes nothing, so it is a
+    # read-only check like any other, and an executable one is refused.
+    ('R03', 'a hand join checked but not kept, as an executable line',
+     ('# Verification',
+      'python3 -X utf8 py_tools/check_join.py final.kicad_pcb SIG '
+      '1,1,F.Cu 2,1,F.Cu\n# Verification')),
+    # ...and a kept join is a board-mutating step: a route step after the
+    # joins is not the final route.py the joins follow.
+    ('R04', 'a diff step after the hand joins',
+     ('# Verification',
+      'python3 -X utf8 py_tools/check_join.py final.kicad_pcb SIG '
+      '1,1,F.Cu 2,1,F.Cu --keep-staged joined.kicad_pcb\n'
+      'python3 -u -X utf8 py_router/route_diff.py joined.kicad_pcb '
+      'd.kicad_pcb --nets /D+ /D-\n# Verification')),
+    ('R05', 'connectivity never named',
+     ('#   python3 -X utf8 py_router/check_connected.py final.kicad_pcb\n',
+      '')),
+    ('R06', 'diff gap below clearance',
+     ('# Verification',
+      '# cwd=/repo\npython3 -u -X utf8 py_router/route_diff.py '
+      'final.kicad_pcb d.kicad_pcb --nets /D+ /D- --clearance 0.1 '
+      '--diff-pair-gap 0.08\n# cwd=/repo\npython3 -u -X utf8 '
+      'py_router/route.py d.kicad_pcb final2.kicad_pcb --nets "*" '
+      '--power-nets GND +3V3\n# Verification')),
+    ('R07', 'teardrops requested',
+     ('--power-nets GND +3V3 --clearance 0.09',
+      '--power-nets GND +3V3 --clearance 0.09 --add-teardrops')),
+    ('R08', 'smoothing turned off',
+     ('--power-nets GND +3V3 --clearance 0.09',
+      '--power-nets GND +3V3 --clearance 0.09 --no-smoothing')),
+    ('R09', 'iterations capped',
+     ('--power-nets GND +3V3 --clearance 0.09',
+      '--power-nets GND +3V3 --clearance 0.09 --max-iterations 1000')),
+    ('R10', 'max-ripup above the ceiling',
+     ('--power-nets GND +3V3 --clearance 0.09',
+      '--power-nets GND +3V3 --clearance 0.09 --max-ripup 10')),
+    ('R11', 'a bare cp of a board',
+     ('# cwd=/repo\npython3 -u -X utf8 py_router/route_planes.py',
+      '# cwd=/repo\ncp s2.kicad_pcb copy.kicad_pcb\n'
+      '# cwd=/repo\npython3 -u -X utf8 py_router/route_planes.py')),
+    # The pour then reads the fanned board: dropping the step and leaving the
+    # pour on s2 would also read a board nothing writes (R18).
+    ('R12', 'no cap pass after fanout',
+     ('# cwd=/repo\npython3 -u -X utf8 py_placer/place_fanout_clearance.py '
+      's1.kicad_pcb s2.kicad_pcb --clearance 0.09\n'
+      '# cwd=/repo\npython3 -u -X utf8 py_router/route_planes.py s2.kicad_pcb',
+      '# cwd=/repo\npython3 -u -X utf8 py_router/route_planes.py s1.kicad_pcb')),
+    ('R13', 'the first pour carries a via tail',
+     ('--nets GND +3V3 --plane-layers In1.Cu In2.Cu',
+      '--nets GND +3V3 --plane-layers In1.Cu In2.Cu --add-gnd-vias')),
+    ('R14', 'a poured net with no route-step width',
+     ('--power-nets GND +3V3', '--power-nets GND')),
+    # Step 5b's asserts fail on different things. The row above breaks
+    # `unsized` (poured, no route-step width); this breaks `orphans` (excluded
+    # from the route step, claimed by no Step-2b impedance route and by no
+    # later route step) --
+    # which is the GNDA failure itself: a net excluded as "power" and never
+    # picked up, ending at 0/23 pads connected while the run reported success.
+    # tests/mutate_937.py found this gap by blinding `orphans` and SURVIVING.
+    ('R14', 'a net excluded from the route step and claimed by nothing',
+     ("--nets '*' --power-nets GND +3V3", "--nets '*' '!RF' --power-nets GND +3V3")),
+    # #1346: a claim counts only when it comes AFTER the exclusion. Here the
+    # first route step takes GND and a closing step excludes it, so the last
+    # route step to see the board -- the one whose finalize answers for the
+    # pours its own routing may cut -- never sees GND.
+    ('R14', 'a net excluded by the last route step, claimed only before it',
+     ('# Verification',
+      "# cwd=/repo\npython3 -u -X utf8 py_router/route.py final.kicad_pcb "
+      "final2.kicad_pcb --nets '*' '!GND' --power-nets GND +3V3 "
+      "--clearance 0.09\n# Verification")),
+    # The other direction of Step 5b's reconciliation: Step 2b routes a net
+    # that no route step excludes.
+    ('R14', 'a Step 2b impedance net no route step excludes',
+     ('# cwd=/repo\npython3 -u -X utf8 py_router/route.py s3.kicad_pcb '
+      'final.kicad_pcb ',
+      '# cwd=/repo\npython3 -u -X utf8 py_router/route.py s3.kicad_pcb '
+      's3i.kicad_pcb --nets RF --impedance 50 --clearance 0.09\n'
+      '# cwd=/repo\npython3 -u -X utf8 py_router/route.py s3i.kicad_pcb '
+      'final.kicad_pcb ')),
+    ('R15', 'gnd-via distance under the floor',
+     ('--power-nets GND +3V3 --clearance 0.09',
+      '--power-nets GND +3V3 --clearance 0.09 --via-size 0.45 '
+      '--gnd-via-distance 0.5')),
+    # The row above puts all three flags on one argv, which is the only shape
+    # the rule used to see. This one is the shape the SKILL's own Step 3
+    # command has -- a route_planes GND-via pass carrying the distance ALONE,
+    # with the via size and clearance fixed by earlier steps. #941 row 2 is
+    # exactly that command, and the rule used to `continue` past it.
+    #
+    # It is a SECOND route_planes step, for two reasons. Not the first pour:
+    # that would redden R13 as well, and a break that reddens two rules names
+    # neither. Not the route.py step: `route.py` has no `--add-gnd-vias` in
+    # its argparse, so putting it there would encode a command that dies at
+    # argparse as if it were a plan. Its CLEARANCE is set upstream: the
+    # fanout and the cap pass write --clearance 0.09 back into the project
+    # this pass inherits (#1735). Its via is its own -- the writeback never
+    # writes a class's via, so an upstream --via-size never reaches it, and a
+    # via resting on routing_defaults with no --board is NOTED, not refused
+    # (#1709); this harness passes no board.
+    ('R15', 'a gnd-via pass under the floor, with the clearance set upstream',
+     ('--nets GND +3V3 --plane-layers In1.Cu In2.Cu\n',
+      '--nets GND +3V3 --plane-layers In1.Cu In2.Cu\n'
+      '# cwd=/repo\n'
+      'python3 -u -X utf8 py_router/route_planes.py s3.kicad_pcb '
+      's3b.kicad_pcb \\\n'
+      '--nets GND +3V3 --plane-layers In1.Cu In2.Cu --add-gnd-vias '
+      '--via-size 0.45 --gnd-via-distance 0.5\n')),
+    # R17 had NO row here, and the rule additionally carried '[needs --board]'
+    # while reading only the plan's own argv -- so `check()` skipped it on the
+    # bare invocation THIS HARNESS uses (the skill's own command line passes
+    # --board, so the rule ran there), and every row above it passed
+    # without it ever running. Both are fixed; these three rows are what says
+    # so. The escape layer must be an INNER one: the top escape layer is never
+    # this rule's to refuse (bga_fanout refuses to forbid it).
+    ('R17', 'a fanout escapes onto a poured inner layer',
+     ('--component U1 --nets \'*\' --clearance 0.09 --layers F.Cu B.Cu',
+      '--component U1 --nets \'*\' --clearance 0.09 '
+      '--layers F.Cu In1.Cu B.Cu')),
+    # #1708: the route step reads a board no earlier step writes.
+    ('R18', 'a step reads a board no earlier step writes',
+     ('py_router/route.py s3.kicad_pcb final.kicad_pcb',
+      'py_router/route.py s3x.kicad_pcb final.kicad_pcb')),
+]
+
+#: Rows that must NOT be refused -- a rule demanding something the engine
+#: refuses is worse than a rule that is absent. Same shape as BREAKS.
+COMPLIANT_VARIANTS = [
+    # #1346: Step 8's pour-last flow. The signal step excludes GND, the pour
+    # comes after it, and the closing '*' route step claims GND -- Step 5b's
+    # "excluded from a stage, claimed by a later one". R14 used to union every
+    # route step's exclusions and refuse this plan, the skill's own recipe.
+    ('R14', 'GND excluded from the signal step and claimed by the closing '
+            'route step after a late pour (Step 8 pour-last)',
+     ('# cwd=/repo\npython3 -u -X utf8 py_router/route_planes.py s2.kicad_pcb '
+      's3.kicad_pcb ',
+      "# cwd=/repo\npython3 -u -X utf8 py_router/route.py s2.kicad_pcb "
+      "s2b.kicad_pcb --nets '*' '!GND' --power-nets GND +3V3 "
+      "--clearance 0.09\n"
+      '# cwd=/repo\npython3 -u -X utf8 py_router/route_planes.py s2b.kicad_pcb '
+      's3.kicad_pcb ')),
+    # The Step 2b shape: the impedance net is routed first and the route step
+    # excludes exactly it.
+    ('R14', 'a Step 2b impedance net, excluded from the route step',
+     ("# cwd=/repo\npython3 -u -X utf8 py_router/route.py s3.kicad_pcb "
+      "final.kicad_pcb --nets '*' ",
+      "# cwd=/repo\npython3 -u -X utf8 py_router/route.py s3.kicad_pcb "
+      "s3i.kicad_pcb --nets RF --impedance 50 --clearance 0.09\n"
+      "# cwd=/repo\npython3 -u -X utf8 py_router/route.py s3i.kicad_pcb "
+      "final.kicad_pcb --nets '*' '!RF' ")),
+    # #1646: hand joins FOLLOW the final route.py (a route step after one may
+    # rip its net), so a kept join is neither an executable check (R03) nor
+    # a chain end that is not route.py (R04) -- including its --keep-staged
+    # on a continuation line.
+    ('R03', 'hand joins kept after the final route.py',
+     ('# Verification',
+      'python3 -X utf8 py_tools/check_join.py final.kicad_pcb SIG '
+      '1,1,F.Cu 2,1,F.Cu --keep-staged j1.kicad_pcb\n'
+      'python3 -X utf8 py_tools/check_join.py j1.kicad_pcb SIG2 \\\n'
+      '    3,1,F.Cu 4,1,F.Cu --keep-staged j2.kicad_pcb\n# Verification')),
+    ('R04', 'hand joins kept after the final route.py',
+     ('# Verification',
+      'python3 -X utf8 py_tools/check_join.py final.kicad_pcb SIG '
+      '1,1,F.Cu 2,1,F.Cu --keep-staged j1.kicad_pcb\n'
+      'python3 -X utf8 py_tools/check_join.py j1.kicad_pcb SIG2 \\\n'
+      '    3,1,F.Cu 4,1,F.Cu --keep-staged j2.kicad_pcb\n# Verification')),
+    ('R17', 'a poured inner layer priced negative in --layer-costs is the '
+            'documented way to keep escapes off it (#288)',
+     ('--component U1 --nets \'*\' --clearance 0.09 --layers F.Cu B.Cu',
+      '--component U1 --nets \'*\' --clearance 0.09 '
+      '--layers F.Cu In1.Cu B.Cu --layer-costs 1.0 -1 1.0')),
+    ('R17', 'the TOP escape layer is poured -- bga_fanout raises rather than '
+            'forbid it, and an outer pour under a fanned part is Step 1\'s '
+            'own prescribed fix',
+     ('--nets GND +3V3 --plane-layers In1.Cu In2.Cu',
+      '--nets GND +3V3 --plane-layers F.Cu In2.Cu')),
+    # The shape that catches R15 resolving sizes across TOOLS. A coarse PGA
+    # escape via (0.8/0.1) sits beside a GND-via pass whose own pour declares
+    # 0.45/0.09, so the vias actually placed imply a floor of 1.62 and 2.0 is
+    # correct. Resolving `max()` over the whole plan reads 0.8/0.1 -> 2.70 and
+    # refuses it. Without this row the revert SURVIVES: the compliant plan has
+    # no two tools disagreeing about via size, which is exactly the condition
+    # the bug needs. tests/mutate_941_942.py `r15-max-across-plan` found that.
+    ('R15', 'a GND-via pass at a distance its OWN tool sizes as legal, beside '
+            'a coarser fanout via it never places',
+     # One row, because the bug needs BOTH halves present at once: a coarse
+     # fanout via AND a GND pass sized by its own tool. Split across two rows
+     # each would be vacuous -- one has no --gnd-via-distance for R15 to read,
+     # the other has no second tool to disagree with.
+     # The GND pass must NOT carry its own --via-size: that is the whole
+     # point. A step that states its size is resolved identically by both
+     # rules, so only a step relying on the FALLBACK can tell them apart --
+     # and relying on the fallback is the shape the skill's Step 3 has.
+     ("python3 -u -X utf8 py_router/bga_fanout.py b.kicad_pcb s1.kicad_pcb "
+      "--component U1 --nets '*' --clearance 0.09 --layers F.Cu B.Cu\n"
+      '# cwd=/repo\n'
+      'python3 -u -X utf8 py_placer/place_fanout_clearance.py s1.kicad_pcb '
+      's2.kicad_pcb --clearance 0.09\n'
+      '# cwd=/repo\n'
+      'python3 -u -X utf8 py_router/route_planes.py s2.kicad_pcb s3.kicad_pcb '
+      '--nets GND +3V3 --plane-layers In1.Cu In2.Cu\n',
+      "python3 -u -X utf8 py_router/bga_fanout.py b.kicad_pcb s1.kicad_pcb "
+      "--component U1 --nets '*' --clearance 0.09 --layers F.Cu B.Cu "
+      "--via-size 0.8 --via-drill 0.4\n"
+      '# cwd=/repo\n'
+      'python3 -u -X utf8 py_placer/place_fanout_clearance.py s1.kicad_pcb '
+      's2.kicad_pcb --clearance 0.09\n'
+      '# cwd=/repo\n'
+      'python3 -u -X utf8 py_router/route_planes.py s2.kicad_pcb s3.kicad_pcb '
+      '--nets GND +3V3 --plane-layers In1.Cu In2.Cu --via-size 0.45 '
+      '--clearance 0.09\n'
+      '# cwd=/repo\n'
+      'python3 -u -X utf8 py_router/route_planes.py s3.kicad_pcb s3b.kicad_pcb '
+      '--nets GND +3V3 --plane-layers In1.Cu In2.Cu --add-gnd-vias '
+      '--gnd-via-distance 2.0\n')),
+]
+
+
+def _run(path, *extra):
+    return subprocess.run(
+        [sys.executable, '-X', 'utf8', CHECKER, path] + list(extra),
+        capture_output=True, text=True, encoding='utf-8', errors='replace',
+        cwd=ROOT, timeout=120)
+
+
+def _write(tmp, name, text):
+    path = os.path.join(tmp, name)
+    with open(path, 'w', encoding='utf-8', newline='\n') as fh:
+        fh.write(text)
+    return path
+
+
+def t_the_compliant_plan_passes():
+    """The control. Without it every refusal below proves nothing."""
+    with tempfile.TemporaryDirectory() as tmp:
+        r = _run(_write(tmp, 'ok_plan.sh', COMPLIANT))
+        assert r.returncode == 0, (
+            f'the compliant plan was refused (rc={r.returncode}). A checker '
+            f'that cannot pass a good plan only ever says no.\n{r.stdout}')
+        assert 'FAIL' not in r.stdout, f'rules reddened:\n{r.stdout}'
+        print('  PASS: the compliant plan exits 0 with every rule ok')
+
+
+def t_each_break_is_refused_by_its_own_rule():
+    """Exit 4 AND the rule's own id -- see the module docstring."""
+    with tempfile.TemporaryDirectory() as tmp:
+        for rid, what, (old, new) in BREAKS:
+            assert COMPLIANT.count(old) == 1, (
+                f'{rid}: the break anchor matches {COMPLIANT.count(old)} '
+                f'times, so this row edits nothing and would be recorded as '
+                f'a checker miss')
+            r = _run(_write(tmp, f'broken_{rid}.sh',
+                            COMPLIANT.replace(old, new, 1)))
+            assert r.returncode == 4, (
+                f'{rid} ({what}): expected exit 4, got {r.returncode}\n'
+                f'{r.stdout}')
+            failed = {ln.split()[1] for ln in r.stdout.splitlines()
+                      if ln.strip().startswith('FAIL')}
+            assert rid in failed, (
+                f'{rid} ({what}) was refused, but by {sorted(failed)} -- not '
+                f'by its own rule. Asserting only on the exit code would have '
+                f'passed this.\n{r.stdout}')
+        print(f'  PASS: {len(BREAKS)} break(s), each refused by its own rule')
+
+
+def t_a_rule_does_not_refuse_what_the_engine_prescribes():
+    """The other half of a rule: what it must LET PASS.
+
+    Asserted per rule id rather than on the exit code, because these variants
+    are free to redden something else -- the claim is only that the named rule
+    stays quiet. A rule demanding something the engine refuses outright is
+    worse than an absent rule: it cannot be complied with, so it teaches the
+    reader to ignore the checker.
+    """
+    with tempfile.TemporaryDirectory() as tmp:
+        for rid, what, (old, new) in COMPLIANT_VARIANTS:
+            assert COMPLIANT.count(old) == 1, (
+                f'{rid}: the variant anchor matches {COMPLIANT.count(old)} '
+                f'times, so this row edits nothing and asserts nothing')
+            r = _run(_write(tmp, f'ok_{rid}_{abs(hash(what))}.sh',
+                            COMPLIANT.replace(old, new, 1)))
+            # The rule must have RUN. Without this, a revert that puts the
+            # rule back behind `[needs --board]` makes `check()` skip it, it
+            # is absent from `failed` for that reason, and every row here
+            # passes while asserting nothing at all.
+            skipped = {ln.split()[1] for ln in r.stdout.splitlines()
+                       if ln.strip().startswith('SKIP')}
+            assert rid not in skipped, (
+                f'{rid} was SKIPPED on this plan, so "not refused" says '
+                f'nothing about it -- {what}\n{r.stdout}')
+            failed = {ln.split()[1] for ln in r.stdout.splitlines()
+                      if ln.strip().startswith('FAIL')}
+            assert rid not in failed, (
+                f'{rid} refused a plan it must accept -- {what}\n{r.stdout}')
+        print(f'  PASS: {len(COMPLIANT_VARIANTS)} prescribed plan(s) not '
+              f'refused by the rule that could have')
+
+
+def t_the_gnd_via_floor_reads_a_clearance_ceiling():
+    """A chain spells its floor `--clearance-ceiling`, so the rule reads it,
+    on the step itself and upstream of it (a step whose ceiling is written
+    back into the project the GND pass inherits, #1735). It used to fall
+    through to the default clearance, which refuses a correct distance and
+    can pass a short one. Both directions, so neither arm is a default's
+    accident."""
+    step = ('# cwd=/repo\npython3 -u -X utf8 py_router/route_planes.py a.kicad_pcb '
+            'b.kicad_pcb --nets GND +3V3 --plane-layers In1.Cu In2.Cu ')
+    after = ('# cwd=/repo\npython3 -u -X utf8 py_router/route_planes.py b.kicad_pcb '
+             'c.kicad_pcb --nets GND +3V3 --plane-layers In1.Cu In2.Cu --via-size 0.45 ')
+    gnd = '--add-gnd-vias --gnd-via-distance %s'
+
+    def verdict(tmp, name, text):
+        r = _run(_write(tmp, name, text))
+        return [ln for ln in r.stdout.splitlines() if 'gnd-via-distance' in ln]
+
+    with tempfile.TemporaryDirectory() as tmp:
+        for name, spelled in (
+                ('same_step', step + '--via-size 0.45 --clearance-ceiling 0.09 '
+                 + gnd + '\n'),
+                ('upstream', step + '--clearance-ceiling 0.09\n'
+                 + after + gnd + '\n')):
+            # 3 x (0.45 + 0.09) = 1.62: the default 0.25 would ask for 2.1
+            ok = verdict(tmp, name + '_ok.sh', spelled % '2.0')
+            assert not ok, f'{name}: 2.0 is above the 1.62 floor, refused: {ok}'
+            low = verdict(tmp, name + '_low.sh', spelled % '1.5')
+            assert any('clearance 0.09' in ln and '1.620' in ln for ln in low), (
+                f'{name}: 1.5 is under the 1.62 floor, and the reason must '
+                f'read the ceiling: {low}')
+    print('  PASS: the floor reads --clearance-ceiling, on the step and upstream')
+
+
+def t_a_board_less_rule_is_not_gated_behind_the_board_flag():
+    """`check()` SKIPS every rule whose text says '[needs --board]'. A rule
+    that reads only the plan's argv and carries the marker anyway never runs
+    on the bare form this harness uses -- which is how R17 sat inert."""
+    import inspect
+    sys.path.insert(0, os.path.dirname(CHECKER))
+    import route_plan_check as rpc
+    inert = []
+    for rid, what, _cite, fn in rpc.RULES:
+        if 'needs --board' not in what:
+            continue
+        if 'p.board' not in inspect.getsource(fn):
+            inert.append(f'{rid} ({fn.__name__})')
+    assert not inert, (
+        f'rule(s) marked [needs --board] that never read p.board, so they are '
+        f'skipped for nothing: {", ".join(inert)}')
+    print(f'  PASS: every [needs --board] rule actually reads the board')
+
+
+def t_a_break_does_not_redden_unrelated_rules():
+    """Attribution. If one bad line reddens four rules, naming one of them is
+    a coincidence rather than a diagnosis."""
+    noisy = []
+    with tempfile.TemporaryDirectory() as tmp:
+        for rid, what, (old, new) in BREAKS:
+            r = _run(_write(tmp, f'n_{rid}.sh', COMPLIANT.replace(old, new, 1)))
+            failed = {ln.split()[1] for ln in r.stdout.splitlines()
+                      if ln.strip().startswith('FAIL')}
+            if failed - {rid}:
+                noisy.append(f'{rid} ({what}) also reddened '
+                             f'{sorted(failed - {rid})}')
+    # NO exemptions, and that is measured rather than hoped for: every one of
+    # every break reddens exactly its own rule. An allowlist was written
+    # here first, for a case that turned out not to happen -- and an exempted
+    # name is where this repo's guards have failed before, so it is gone.
+    assert not noisy, (
+        'a single broken line reddened rules it should not have, so naming '
+        'one of them is a coincidence rather than a diagnosis:\n  '
+        + '\n  '.join(noisy))
+    print(f'  PASS: all {len(BREAKS)} breaks are attributable to exactly one '
+          f'rule')
+
+
+def t_the_checker_writes_nothing():
+    """Read-only, because the standalone door runs under an analysis-only
+    constraint that forbids modifying any file."""
+    with tempfile.TemporaryDirectory() as tmp:
+        path = _write(tmp, 'ro_plan.sh', COMPLIANT)
+        before = {n: os.stat(os.path.join(tmp, n)).st_mtime_ns
+                  for n in os.listdir(tmp)}
+        _run(path)
+        after = {n: os.stat(os.path.join(tmp, n)).st_mtime_ns
+                 for n in os.listdir(tmp)}
+        assert before == after, (
+            f'the checker touched its input directory: '
+            f'{set(after) ^ set(before) or "mtime changed"}')
+        print('  PASS: no file created, changed or removed')
+
+
+def t_an_unreadable_plan_is_exit_3_not_a_crash():
+    """The dialect: 3 is "the plan could not be read", 1 is a crash. A
+    traceback must never be able to read as a verdict."""
+    with tempfile.TemporaryDirectory() as tmp:
+        r = _run(os.path.join(tmp, 'nope.sh'))
+        assert r.returncode == 3, (
+            f'a missing plan gave {r.returncode}, not 3\n{r.stderr}')
+        assert 'Traceback' not in r.stderr, r.stderr
+        print('  PASS: a missing plan is exit 3, with no traceback')
+
+
+def t_every_rule_and_every_delegation_is_listed():
+    """`--list` is the honesty surface: what is checked, and what is not with
+    the tool that owns it."""
+    r = subprocess.run(
+        [sys.executable, '-X', 'utf8', CHECKER, '--list'],
+        capture_output=True, text=True, encoding='utf-8', errors='replace',
+        cwd=ROOT, timeout=60)
+    assert r.returncode == 0, r.stderr
+    sys.path.insert(0, os.path.dirname(CHECKER))
+    import route_plan_check as rpc
+    for rid, _what, _cite, _fn in rpc.RULES:
+        assert rid in r.stdout, f'{rid} is not in --list'
+    for _what, who in rpc.DELEGATED:
+        assert who.split(',')[0].strip() in r.stdout, f'{who} not in --list'
+    assert len(rpc.DELEGATED) >= 9, (
+        f'only {len(rpc.DELEGATED)} delegated checks declared; the skill has '
+        f'at least nine rules a recorded plan cannot answer, and dropping one '
+        f'from this list is how it stops being anybody\'s job')
+    print(f'  PASS: --list names {len(rpc.RULES)} rules and '
+          f'{len(rpc.DELEGATED)} delegations')
+
+
+def t_the_skill_states_the_hand_join_exception():
+    """#1646: R03/R04 accept a kept hand join after the final route.py, so
+    the skill's end rule must say so -- or the text and the checker disagree,
+    and the plan that does what plan-pcb-placement says reads as a break."""
+    skill = open(os.path.join(ROOT, '.claude', 'skills', 'plan-pcb-routing',
+                              'SKILL.md'), encoding='utf-8').read()
+    end = skill[skill.index('### End every chain on route.py'):]
+    end = end[:end.index('\n### ', 5)]
+    for want in ('check_join.py', '--keep-staged', 'AFTER the closing `route.py`',
+                 'apply the joins again'):
+        assert want in end, f'"End every chain on route.py" does not say {want!r}'
+    print('  PASS: the end rule names the hand-join exception the checker accepts')
+
+
+TESTS = (t_the_compliant_plan_passes,
+         t_each_break_is_refused_by_its_own_rule,
+         t_a_rule_does_not_refuse_what_the_engine_prescribes,
+         t_the_gnd_via_floor_reads_a_clearance_ceiling,
+         t_a_board_less_rule_is_not_gated_behind_the_board_flag,
+         t_a_break_does_not_redden_unrelated_rules,
+         t_the_checker_writes_nothing,
+         t_an_unreadable_plan_is_exit_3_not_a_crash,
+         t_every_rule_and_every_delegation_is_listed,
+         t_the_skill_states_the_hand_join_exception)
+
+
+def _every_case_is_registered():
+    defined = {n for n in globals() if n.startswith('t_')}
+    listed = {f.__name__ for f in TESTS}
+    assert defined == listed, f'not registered: {sorted(defined - listed)}'
+
+
+if __name__ == '__main__':
+    _every_case_is_registered()
+    for fn in TESTS:
+        print(f'--- {fn.__name__}')
+        fn()
+    print('\nALL PASS')

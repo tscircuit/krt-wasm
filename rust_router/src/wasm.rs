@@ -1,8 +1,13 @@
 use crate::obstacle_map::GridObstacleMap;
-use crate::router::GridRouter;
+use crate::router::{GridRouter, TrackMarginArg};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use wasm_bindgen::prelude::*;
+
+#[wasm_bindgen]
+pub fn upstream_version() -> String {
+    env!("CARGO_PKG_VERSION").to_owned()
+}
 
 #[derive(Clone, Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -368,7 +373,7 @@ fn route_connections_with_order(
             } else {
                 0
             };
-            let mut router = GridRouter::new_core(
+            let mut router = GridRouter::new(
                 options.via_cost,
                 options.h_weight,
                 Some(options.turn_cost),
@@ -381,14 +386,16 @@ fn route_connections_with_order(
                 options.direction_preference_cost,
                 bus_attraction_radius,
                 options.bus_attraction_bonus.max(0),
+                0,
+                0,
             );
             if let Some(attraction_connection_name) = &route_plan_item.attraction_connection_name {
                 if let Some(attraction_path) = routed_paths.get(attraction_connection_name) {
-                    router.set_attraction_path_core(attraction_path.clone());
+                    router.set_attraction_path(attraction_path.clone());
                 }
             }
 
-            let (path, _iterations, _stats) = router.route_multi_core(
+            let (path, _iterations, _stats) = router.route_multi(
                 &obstacles,
                 sources,
                 targets,
@@ -398,6 +405,11 @@ fn route_connections_with_order(
                 None,
                 None,
                 2,
+                TrackMarginArg::Scalar(0.0),
+                0,
+                2.0,
+                2.0,
+                0,
                 0,
             );
 

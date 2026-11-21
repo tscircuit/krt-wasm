@@ -5,66 +5,92 @@ KiCad Routing Tools Plugin Installer
 Installs the plugin to the KiCad 9 plugins directory.
 
 Usage:
-    python install_plugin.py [--no-deps] [--uninstall] [--symlink]
+    python install_plugin.py [--no-deps] [--uninstall] [--symlink] [--keep-pcm]
 
 Options:
     --no-deps               Skip installing Python dependencies
     --uninstall             Remove the plugin instead of installing
     --symlink               Create symlink instead of copying (for development)
+    --keep-pcm              Don't disable conflicting PCM copies of this plugin
+
+On install, any copy of this plugin previously installed through KiCad's Plugin &
+Content Manager is detected (it sits next to the local install in
+3rdparty/plugins and would shadow it on sys.path) and moved aside, unless
+--keep-pcm is given.
 """
+from __future__ import annotations
+
+#: #937 registry: which door(s) show this tool, and whether it changes
+#: the board. Read by krt_registry.py -- by AST, never imported.
+KRT_TOOL = {'scope': [], 'kind': 'utility'}
 
 import os
 import sys
+import json
 import shutil
 import platform
 import argparse
 import subprocess
 from pathlib import Path
+from typing import Optional
 
-from startup_checks import get_cargo_version
+# the engine moved into py_router/ (#522). Import it as a package rather than
+# flat: python puts THIS script's directory (the repo root) on sys.path, so this
+# resolves no matter what cwd install_plugin.py is invoked from.
+from py_router.startup_checks import (IMPORT_TESTS, VERSION_MODULES, Problem,
+                                      externally_managed_advice,
+                                      get_cargo_version, requirement_floors,
+                                      version_satisfies)
+
+# ...and put py_router itself on sys.path so the shared modules can be imported
+# FLAT, the way they import each other (kicad_exact_fill does `import
+# kicad_locate`). #763: this installer used to carry its own hardcoded copy of
+# every KiCad path, which is how a KiCad on drive D: became invisible to it.
+# Both modules are stdlib-only, so this stays safe on the bare system python an
+# installer runs under, before any dependency exists.
+sys.path.insert(0, str(Path(__file__).resolve().parent / "py_router"))
+import kicad_locate  # noqa: E402
+from kicad_exact_fill import find_kicad_python  # noqa: E402
 
 
 PLUGIN_NAME = "KiCadRoutingTools"
 PLUGIN_DISPLAY_NAME = "KiCad Routing Tools"
 KICAD_VERSIONS = ["10.0", "9.99", "9.0"]  # Checked in order; 9.99 = nightly
+# PCM (Plugin & Content Manager) package identifier from metadata.json. A PCM
+# install lands in 3rdparty/plugins/<identifier-with-dots-as-underscores>/ next
+# to our dev install, putting the same top-level modules on sys.path and
+# shadowing the local version. We detect and disable such copies on install.
+PCM_IDENTIFIER = "com.github.drandyhaas.kicadroutingtools"
 
 
-def get_kicad_python() -> Path | None:
+def get_kicad_python() -> Optional[Path]:
     """
     Find KiCad's bundled Python executable.
+
+    #763: this was a hardcoded list of `C:\\Program Files\\KiCad\\<ver>\\...`
+    paths (plus two macOS paths and nothing at all for Linux), so KiCad on any
+    other drive -- or any version not in the list -- reported "not found" and
+    the installer silently fell back to the system python, which cannot import
+    pcbnew. Discovery now comes from the shared `kicad_locate`.
+
+    Prefers a VERIFIED interpreter (one that actually imports pcbnew) and falls
+    back to the best-looking unverified candidate, because installing
+    dependencies into a python that merely exists still beats installing them
+    into the wrong one.
 
     Returns:
         Path to KiCad's Python, or None if not found
     """
-    system = platform.system()
-
-    if system == "Windows":
-        # Check common KiCad installation paths (newest version first)
-        candidates = [
-            Path(r"C:\Program Files\KiCad\10.0\bin\python.exe"),
-            Path(r"C:\Program Files (x86)\KiCad\10.0\bin\python.exe"),
-            Path(r"C:\Program Files\KiCad\9.99\bin\python.exe"),
-            Path(r"C:\Program Files\KiCad\9.0\bin\python.exe"),
-            Path(r"C:\Program Files (x86)\KiCad\9.0\bin\python.exe"),
-        ]
-        for candidate in candidates:
-            if candidate.exists():
-                return candidate
-
-    elif system == "Darwin":  # macOS
-        candidates = [
-            Path("/Applications/KiCad/KiCad.app/Contents/Frameworks/Python.framework/Versions/Current/bin/python3"),
-            Path("/Applications/KiCad/KiCad.app/Contents/Frameworks/Python.framework/Versions/3.9/bin/python3"),
-        ]
-        for candidate in candidates:
-            if candidate.exists():
-                return candidate
-
-    elif system == "Linux":
-        # Linux KiCad typically uses system Python, but check for flatpak/snap
-        # For now, return None to use system Python
-        pass
-
+    verified = find_kicad_python()
+    if verified:
+        return Path(verified)
+    # Nothing verified: KiCad may be present but unable to run a probe (a
+    # locked-down box, a broken install). Take the first candidate that exists
+    # and is not this very interpreter -- returning our own python would be
+    # indistinguishable from "not found" to every caller below.
+    for cand in kicad_locate.kicad_python_candidates():
+        if cand and cand != sys.executable and Path(cand).is_file():
+            return Path(cand)
     return None
 
 
@@ -72,46 +98,155 @@ def get_kicad_base_dir() -> Path:
     """
     Get the KiCad base directory for the current platform.
 
+    #763: the Windows branch preferred `%OneDrive%\\Documents\\KiCad` whenever
+    it merely EXISTED. OneDrive creates a `Documents` folder on machines where
+    the Documents known folder is NOT redirected into it, so the installer
+    wrote the plugin somewhere KiCad never reads and the reporter had to move
+    it by hand. `kicad_locate` asks Windows where Documents actually is (the
+    same known-folder API KiCad calls) and breaks ties on EVIDENCE -- a
+    candidate already holding a version directory -- rather than on existence.
+
     Returns:
         Path to the KiCad base directory (without version)
     """
-    system = platform.system()
-
-    if system == "Linux":
-        return Path.home() / ".local" / "share" / "kicad"
-    elif system == "Darwin":  # macOS
-        return Path.home() / "Documents" / "KiCad"
-    elif system == "Windows":
-        return Path.home() / "Documents" / "KiCad"
-    else:
-        raise RuntimeError(f"Unsupported operating system: {system}")
+    return Path(kicad_locate.kicad_user_base())
 
 
 def get_kicad_plugin_dirs() -> list:
     """
     Get KiCad plugin directories for all installed versions.
 
+    #763: the "is this version installed" test was a hardcoded
+    `C:\\Program Files\\KiCad\\<version>`, so on Windows a KiCad anywhere else
+    counted as absent; and the versions considered came from a fixed list, so a
+    KiCad 11 install would need a code change to be seen. Both are now
+    discovered: version directories are GLOBBED under the user base, and the
+    install roots come from the registry / every drive.
+
     Returns:
         List of (version, plugin_dir) tuples for versions that exist
     """
     base_dir = get_kicad_base_dir()
-    plugin_dirs = []
-
-    for version in KICAD_VERSIONS:
-        version_dir = base_dir / version
-        # Check if this KiCad version is installed on the system
-        install_dir = Path(rf"C:\Program Files\KiCad\{version}") if platform.system() == "Windows" else version_dir
-        if install_dir.exists() or version_dir.exists():
-            # Use 3rdparty/plugins for plugins
-            plugin_dir = version_dir / "3rdparty" / "plugins"
-            plugin_dirs.append((version, plugin_dir))
-
-    return plugin_dirs
+    # Versions that already have a user-data directory -- the common case, and
+    # the only signal available on macOS/Linux where the install path carries
+    # no version.
+    versions = list(kicad_locate.kicad_user_versions(str(base_dir)))
+    # ...plus versions of the INSTALLS we found, so a KiCad that has never been
+    # launched (no user dir yet) is still a target.
+    for root in kicad_locate.kicad_install_roots():
+        v = kicad_locate.path_version_key(str(root) + os.sep)
+        if v:
+            name = ".".join(str(p) for p in v)
+            if name not in versions:
+                versions.append(name)
+    versions.sort(key=kicad_locate.version_key, reverse=True)
+    return [(v, base_dir / v / "3rdparty" / "plugins") for v in versions]
 
 
 def get_source_dir() -> Path:
     """Get the source directory (KiCadRoutingTools root)."""
     return Path(__file__).parent.resolve()
+
+
+def _target_dependency_problems(python_exe: str, floors: dict):
+    """[Problem] for each requirement `python_exe` cannot import at its floor.
+
+    [] when it already imports every one, None when the probe itself could not
+    run (the caller then falls through to pip, as it always did).
+
+    Probed out-of-process because the target is KiCad's interpreter, which need
+    not be the one running this installer. The probe is built from
+    startup_checks' own IMPORT_TESTS / VERSION_MODULES tables, so it cannot
+    drift from the runtime gate (those imports name a real submodule, which
+    catches a partial install a bare `import pkg` accepts). Every requirement
+    is probed, floored or not: a package with no floor must still import.
+    """
+    if not floors:
+        return []
+    probe = """\
+import json, sys
+imports = %r
+mods = %r
+out = {}
+for name in sys.argv[1].split(','):
+    try:
+        exec(imports.get(name, 'import ' + name), globals())
+        module = __import__(mods.get(name, name))
+        out[name] = str(getattr(module, '__version__', '') or '')
+    except Exception:
+        out[name] = None
+print(json.dumps(out))
+""" % (IMPORT_TESTS, VERSION_MODULES)
+    try:
+        r = subprocess.run([python_exe, "-c", probe, ",".join(floors)],
+                           capture_output=True, text=True, timeout=120)
+        reported = json.loads((r.stdout or "").strip().splitlines()[-1])
+    except Exception:
+        return None
+    problems = []
+    for name, floor in floors.items():
+        ver = reported.get(name)
+        if ver is None:
+            problems.append(Problem(name, 'absent', floor=floor))
+        elif not version_satisfies(ver, floor):
+            problems.append(Problem(name, 'outdated', installed=ver,
+                                    floor=floor))
+    return problems
+
+
+def _target_externally_managed(python_exe: str) -> Optional[str]:
+    """The target's PEP 668 marker path, or None -- answered BY the target.
+
+    Runs the shared `startup_checks.externally_managed_marker` inside
+    `python_exe`, because the answer depends on that interpreter's stdlib and
+    prefix, not this installer's. A probe that cannot run answers None, which
+    falls through to pip exactly as before -- pip then refuses on its own.
+    """
+    code = ("import sys; sys.path.append(sys.argv[1]); "
+            "from startup_checks import externally_managed_marker; "
+            "print(externally_managed_marker() or '')")
+    py_router = str(Path(__file__).resolve().parent / "py_router")
+    try:
+        r = subprocess.run([python_exe, "-c", code, py_router],
+                           capture_output=True, text=True, timeout=60)
+    except Exception:
+        return None
+    lines = (r.stdout or "").strip().splitlines()
+    if r.returncode != 0 or not lines:
+        return None
+    return lines[-1].strip() or None
+
+
+def _report_externally_managed(python_exe: str, problems, floors: dict,
+                               marker: str):
+    """Name the distro packages instead of running a pip that cannot succeed.
+
+    #1026: on a PEP 668 interpreter pip refuses before it resolves anything,
+    so this installer used to print pip's refusal and "run as Administrator"
+    even when every package was already installed. The satisfied case never
+    reaches here (install_dependencies probes first); this is the case where
+    something really is missing, and the answer is the one the GUI gives
+    (#944) -- from the same `externally_managed_advice`.
+    """
+    print("  KiCad's Python is managed by your distribution (PEP 668):")
+    print(f"    {marker}")
+    print("  pip cannot install into it, so this installer does not try.")
+    print()
+    if problems is None:
+        # The dependency probe could not run, so what is present is unknown:
+        # name every requirement rather than claim any one is missing.
+        print("  Could not probe which packages it already has; "
+              "naming all of them.")
+        problems = [Problem(name, 'absent', floor=floor)
+                    for name, floor in floors.items()]
+    else:
+        for problem in problems:
+            print(problem.describe())
+    print()
+    print("  Install the distribution's own packages instead:")
+    print()
+    for line in externally_managed_advice(problems, python_exe):
+        print(f"  {line}" if line else "")
 
 
 def install_dependencies():
@@ -123,14 +258,14 @@ def install_dependencies():
         print("  No requirements.txt found, skipping dependency installation")
         return True
 
-    # Parse and display requirements
+    # The shared reader, so the floors cannot drift from the runtime gate; it
+    # also resolves requirements.txt inside an installed plugin layout.
     print("Required packages:")
-    packages = []
+    floors = requirement_floors()
     with open(requirements_file, 'r') as f:
         for line in f:
             line = line.strip()
             if line and not line.startswith('#'):
-                packages.append(line)
                 print(f"  - {line}")
     print()
 
@@ -141,11 +276,31 @@ def install_dependencies():
         print(f"Installing to KiCad's Python: {kicad_python}")
         python_exe = str(kicad_python)
     else:
+        # #763: this said only "not found" and moved on, so the user could not
+        # tell a KiCad on an unsearched drive from no KiCad at all. Say where
+        # we looked and how to override.
         print("Warning: KiCad Python not found, using system Python.")
         print("  KiCad uses its own Python - you may need to install manually.")
+        for line in kicad_locate.describe_search():
+            print(f"  {line}")
+        print("  Override with KICAD_PYTHON=<path to KiCad's python>")
         python_exe = sys.executable
 
     print()
+
+    # Probe first. On distro Linux (Arch/Debian/Fedora) KiCad runs the system
+    # python, whose packages may already be there via pacman/apt/dnf -- and a
+    # pip run there could only fail with externally-managed-environment
+    # (PEP 668), satisfied or not.
+    problems = _target_dependency_problems(python_exe, floors)
+    if problems == []:
+        print("  Dependencies already satisfied in KiCad's Python, skipping pip.")
+        return True
+
+    marker = _target_externally_managed(python_exe)
+    if marker:
+        _report_externally_managed(python_exe, problems, floors, marker)
+        return False
 
     try:
         # Run pip with output visible to user (no capture)
@@ -223,8 +378,13 @@ def check_rust_router():
 
 def copy_plugin(source_dir: Path, dest_dir: Path):
     """Copy the entire KiCadRoutingTools directory to destination."""
-    # Remove existing installation if present
-    if dest_dir.exists():
+    # Remove existing installation if present. Handle symlinks separately:
+    # a prior `--symlink` dev install leaves a symlink here, and shutil.rmtree
+    # refuses to operate on a symlink (raises an opaque "[Errno None] None").
+    if dest_dir.is_symlink():
+        print(f"  Removing existing symlink at {dest_dir}")
+        dest_dir.unlink()
+    elif dest_dir.exists():
         print(f"  Removing existing installation at {dest_dir}")
         shutil.rmtree(dest_dir)
 
@@ -232,6 +392,16 @@ def copy_plugin(source_dir: Path, dest_dir: Path):
     def ignore_patterns(directory, files):
         ignored = []
         for f in files:
+            # Of .claude/, keep only skills/: a dev checkout also holds Claude
+            # Code's worktrees/ (whole repo copies) and the user's
+            # settings.local.json. package_pcm.py ships the same subset.
+            if os.path.basename(directory) == '.claude':
+                if f != 'skills':
+                    ignored.append(f)
+                continue
+            # Keep .claude/ (routing skills) for use from the installed plugin.
+            if f == '.claude':
+                continue
             # Skip hidden files, cache, and non-essential directories
             if f.startswith('.') or f == '__pycache__' or f.endswith('.pyc'):
                 ignored.append(f)
@@ -240,6 +410,12 @@ def copy_plugin(source_dir: Path, dest_dir: Path):
                 ignored.append(f)
             # Skip kicad_files (sample PCBs)
             elif f == 'kicad_files':
+                ignored.append(f)
+            # Skip the cargo build dir a --from-source build leaves behind
+            # (#1061): >100 MB of intermediates, while the plugin loads only
+            # the grid_router binary build_router.py copies next to Cargo.toml.
+            # package_pcm.py strips it from the PCM zip the same way.
+            elif f == 'target' and os.path.basename(directory) == 'rust_router':
                 ignored.append(f)
         return ignored
 
@@ -275,6 +451,90 @@ def uninstall_plugin(dest_dir: Path):
         print(f"  Plugin not installed at {dest_dir}")
 
 
+def _dir_is_our_pcm_plugin(d: Path) -> bool:
+    """True if directory `d` is a PCM-installed copy of THIS plugin.
+
+    Identified authoritatively by a metadata.json declaring our PCM identifier,
+    falling back to the PCM directory-naming convention (identifier with dots
+    replaced by underscores) if the metadata file is missing.
+    """
+    meta = d / "metadata.json"
+    if meta.is_file():
+        try:
+            data = json.loads(meta.read_text(encoding="utf-8"))
+            if data.get("identifier") == PCM_IDENTIFIER:
+                return True
+        except (OSError, ValueError):
+            pass
+    return d.name == PCM_IDENTIFIER.replace(".", "_")
+
+
+def find_conflicting_pcm_installs(plugins_dir: Path) -> list:
+    """Find PCM-installed copies of this plugin under `plugins_dir`.
+
+    Any PCM copy shares our top-level module names (route.py, obstacle_map.py,
+    ...) on sys.path and will shadow the locally-installed version, so every PCM
+    copy is treated as a conflict. Our own install (named PLUGIN_NAME) is skipped.
+    """
+    if not plugins_dir.is_dir():
+        return []
+    conflicts = []
+    for child in sorted(plugins_dir.iterdir()):
+        if not child.is_dir() or child.name == PLUGIN_NAME:
+            continue
+        if _dir_is_our_pcm_plugin(child):
+            conflicts.append(child)
+    return conflicts
+
+
+def disable_pcm_install(pcm_dir: Path, version: str) -> Optional[Path]:
+    """Move a conflicting PCM plugin copy out of the plugin search path.
+
+    Moved to <kicad_base>/disabled_pcm_plugins/<version>/ so it leaves sys.path
+    (resolving the conflict) but stays recoverable. Returns the backup path, or
+    None if the move failed.
+    """
+    backup_root = get_kicad_base_dir() / "disabled_pcm_plugins" / version
+    try:
+        backup_root.mkdir(parents=True, exist_ok=True)
+        dest = backup_root / pcm_dir.name
+        counter = 1
+        while dest.exists():
+            dest = backup_root / f"{pcm_dir.name}.{counter}"
+            counter += 1
+        shutil.move(str(pcm_dir), str(dest))
+        return dest
+    except OSError as e:
+        print(f"    Error: could not move PCM copy aside: {e}")
+        print(f"    Please remove it manually via KiCad's Plugin & Content Manager,")
+        print(f"    or delete: {pcm_dir}")
+        return None
+
+
+def handle_pcm_conflicts(plugins_dir: Path, version: str) -> int:
+    """Detect and disable PCM copies of this plugin that would shadow our install.
+
+    Returns the number of conflicting copies disabled.
+    """
+    conflicts = find_conflicting_pcm_installs(plugins_dir)
+    if not conflicts:
+        return 0
+    print(f"  Found {len(conflicts)} PCM-installed copy(ies) of this plugin that "
+          f"would shadow the local install:")
+    disabled = 0
+    for pcm_dir in conflicts:
+        print(f"    - {pcm_dir}")
+        backup = disable_pcm_install(pcm_dir, version)
+        if backup is not None:
+            print(f"      Disabled (moved to {backup})")
+            disabled += 1
+    if disabled:
+        print(f"  Note: the Plugin & Content Manager may still list this package as")
+        print(f"        installed; you can formally remove it there (Plugins -> Manage")
+        print(f"        -> Uninstall), or just delete the backup folder above.")
+    return disabled
+
+
 def main():
     parser = argparse.ArgumentParser(
         description=f"Install {PLUGIN_DISPLAY_NAME} plugin for KiCad 9+",
@@ -301,6 +561,11 @@ Examples:
         action="store_true",
         help="Create symlink instead of copying (for development)"
     )
+    parser.add_argument(
+        "--keep-pcm",
+        action="store_true",
+        help="Don't disable conflicting PCM (Plugin & Content Manager) copies of this plugin"
+    )
 
     args = parser.parse_args()
 
@@ -321,7 +586,41 @@ Examples:
 
     # Show which versions will be installed to
     versions_found = [v for v, _ in plugin_dirs]
+    # #763: an empty list used to print "KiCad versions found: " and then fail
+    # at the very end with nothing but a symlink hint -- the reporter's "it
+    # fails more or less silently ... nor any error". A failed search must say
+    # WHERE it looked, because from the outside a bad search and a bad install
+    # look identical.
+    if not versions_found:
+        print("KiCad versions found: NONE")
+        print()
+        if args.uninstall:
+            # Nothing to remove is a clean outcome, not an error -- don't send
+            # someone who is UNinstalling off to file a discovery bug.
+            print("Nothing to uninstall.")
+            return 0
+        print("Could not find a KiCad installation. Searched:")
+        for line in kicad_locate.describe_search():
+            print(f"  {line}")
+        print()
+        print("  If KiCad IS installed, tell the installer where:")
+        # Show the example in THIS platform's spelling -- a Windows path on a
+        # mac is noise the reader has to translate before they can act.
+        if platform.system() == "Windows":
+            print(r"    set KICAD_INSTALL_DIR=D:\Program Files\KiCad\10.0")
+            print(r"    set KICAD_PYTHON=D:\Program Files\KiCad\10.0\bin\python.exe")
+        elif platform.system() == "Darwin":
+            print("    export KICAD_INSTALL_DIR=/Applications/KiCad/KiCad.app")
+            print("    export KICAD_PYTHON=/Applications/KiCad/KiCad.app/Contents"
+                  "/Frameworks/Python.framework/Versions/Current/bin/python3")
+        else:
+            print("    export KICAD_INSTALL_DIR=/usr")
+            print("    export KICAD_PYTHON=/usr/bin/python3")
+        print("  and re-run. Please also report this with the lines above:")
+        print("    https://github.com/drandyhaas/KiCadRoutingTools/issues")
+        return 1
     print(f"KiCad versions found: {', '.join(versions_found)}")
+    print(f"Plugin base: {get_kicad_base_dir()}")
     print()
 
     # Install dependencies (once, not per version)
@@ -347,6 +646,10 @@ Examples:
         if args.uninstall:
             uninstall_plugin(dest_dir)
             continue
+
+        # Disable any PCM-installed copy that would shadow this install
+        if not args.keep_pcm:
+            handle_pcm_conflicts(dest_base, version)
 
         # Create destination directory if needed
         if not dest_base.exists():

@@ -4,6 +4,282 @@ KiCad Routing Tools - GUI Utilities
 Shared utilities for the plugin GUI.
 """
 
+# Re-entrancy latch for ui_thread_status (see below). Module-level, not
+# per-tab: a nested repaint can reach a DIFFERENT tab's helper.
+_IN_UI_STATUS = False
+
+# Secondary sink for ui_thread_status messages. The AI-tab plan executor
+# registers one while a plan runs: its own status mirror is POLL-driven
+# (wx.CallLater), so a step that runs ON the UI thread (fanout, cap
+# optimize, every tab's apply phase) blocks the poll and the AI tab froze
+# even while the working tab's label was repainting. ui_thread_status
+# pushes each message here as well, so the tab the user is actually
+# LOOKING at moves too. fn(message); None = no mirror.
+_UI_STATUS_MIRROR = None
+
+
+def set_ui_status_mirror(fn):
+    """Register (or clear, with None) the secondary ui_thread_status sink."""
+    global _UI_STATUS_MIRROR
+    _UI_STATUS_MIRROR = fn
+
+
+#: Set True on a plan step's owner (the routing dialog, or the tab that runs
+#: the step) when its operation PRODUCED ITS RESULT -- applied to the live
+#: board, an empty result included. It is the GUI's "the step's output board
+#: exists": a CLI step that refuses, fails or is interrupted writes no output,
+#: so the next step of the chain fails on the missing file and the chain stops
+#: there. The plan executor clears it before each step and stops the plan when
+#: the step ends without it, so a refusal path nobody marks still stops.
+PLAN_STEP_PRODUCED = '_plan_step_produced'
+
+
+def mark_plan_step_produced(owner):
+    """Record that `owner`'s operation produced its result (see above)."""
+    setattr(owner, PLAN_STEP_PRODUCED, True)
+
+
+# Timestamp of the last UI-category event-loop pump (see ui_thread_status):
+# throttles the YieldFor so a fast message burst stays cheap.
+_LAST_UI_YIELD = 0.0
+
+
+def save_board_via_ui_thread(path, board, timeout_s=None):
+    """Plugin-side alias for :func:`ui_thread.save_board_on_ui_thread` (#688).
+
+    The implementation is ENGINE-side because the engine makes worker-thread
+    pcbnew calls of its own (the live-fill provider in
+    ``kicad_parser.build_pcb_data_from_board``), so the guard cannot live only
+    here. See that module for the py-spy evidence and the reasoning.
+    """
+    return save_board_via_ui_thread_ex(path, board, timeout_s)[0]
+
+
+def save_board_via_ui_thread_ex(path, board, timeout_s=None):
+    """Plugin-side alias for :func:`ui_thread.save_board_on_ui_thread_ex`
+    (#828): ``(ok, SaveStatus)``, so a caller can tell the 120 s expiry
+    (this machine, this moment -- retryable) from a ``SaveBoard`` exception
+    (this board -- it will throw again) instead of one bare ``False``."""
+    from ui_thread import save_board_on_ui_thread_ex, SAVE_BOARD_UI_TIMEOUT_S
+    return save_board_on_ui_thread_ex(
+        path, board,
+        SAVE_BOARD_UI_TIMEOUT_S if timeout_s is None else timeout_s)
+
+
+def remove_listed_segments(board, pcbnew, segments) -> int:
+    """Remove the live board's tracks a strip list names, as the CLI writer's
+    strip does (kicad_writer.match_stack_members, #1556): matched by span,
+    canonical layer and net, COUNTED, and the listed width first. A set of
+    endpoint keys removed EVERY member of a same-span stack, the keeper too,
+    and matched across layers. Returns the number removed."""
+    if not segments:
+        return 0
+    from kicad_parser import POSITION_DECIMALS as D, pcbnew_copper_layer_names
+    from kicad_writer import match_stack_members
+    id_to_name = pcbnew_copper_layer_names()
+
+    def _span(a, b, layer, net):
+        return (frozenset((a, b)), layer, net)
+    targets = [(_span((round(s.start_x, D), round(s.start_y, D)),
+                      (round(s.end_x, D), round(s.end_y, D)),
+                      s.layer, s.net_id), s.width)
+               for s in segments]
+    tracks = [t for t in board.GetTracks()
+              if t.Type() == pcbnew.PCB_TRACE_T]  # not vias / arcs
+    items = []
+    for track in tracks:
+        a = (round(pcbnew.ToMM(track.GetStart().x), D),
+             round(pcbnew.ToMM(track.GetStart().y), D))
+        b = (round(pcbnew.ToMM(track.GetEnd().x), D),
+             round(pcbnew.ToMM(track.GetEnd().y), D))
+        # Canonical layer name, as s.layer is: a renamed layer's display
+        # name matched no key and left ripped copper (#1056).
+        items.append((_span(a, b, id_to_name.get(track.GetLayer()),
+                            track.GetNetCode()),
+                      pcbnew.ToMM(track.GetWidth())))
+    gone, _unmatched = match_stack_members(targets, items)
+    for i in sorted(gone):
+        board.RemoveNative(tracks[i])
+    return len(gone)
+
+
+def ui_thread_status(status_text, progress_bar, message):
+    """Show `message` for work running ON the wx main thread.
+
+    Engine-thread progress reaches the UI through wx.CallAfter, so the main
+    loop paints it. Work that runs ON the main thread (the apply phase, the
+    fanout, the plane-copper cleanup) BLOCKS that loop, so a bare SetLabel
+    would not repaint until the work finished -- the previous phase's label
+    stays on screen and reads as a hang.
+
+    Repainting from inside a KiCad ACTION PLUGIN is the delicate part, and the
+    reason this is one guarded helper rather than three hand-rolled copies:
+
+      * Only ever touch wx from the main thread. Off-thread callers are
+        marshalled with CallAfter instead (never dropped).
+      * Refresh + Update ONLY the static text. `wx.Gauge.Pulse()` starts an
+        indeterminate ANIMATION -- on macOS that schedules timers and can
+        dispatch events re-entrantly, which is exactly what corrupts the
+        thread state PYTHON_ACTION_PLUGIN::CallMethod releases on return
+        (a PyGILState_Release fatal abort takes KiCad down with it).
+      * A latch, because Update() runs the paint path and a nested call from
+        it must not recurse.
+      * Fully guarded: a status update must never break the work it reports.
+
+    macOS caveat that shaped this function: wxWindow.Update() CANNOT force a
+    synchronous repaint on wxOSX/Cocoa -- painting only happens when the run
+    loop turns (the wx docs call this out; Andy's report confirms it: labels
+    set + Refresh + Update during a blocking fanout never appeared on screen).
+    So after invalidating the label(s), this pumps the event loop for the
+    UI/paint CATEGORY ONLY, throttled: wx.EventLoopBase.YieldFor(
+    wx.EVT_CATEGORY_UI) dispatches paint/geometry events and RE-QUEUES
+    everything else -- user input (a stray click, the dialog's close button)
+    and timers (the plan executor's poll) are NOT dispatched, so nothing can
+    re-enter a handler mid-run. This is deliberately narrower than the plain
+    wx.Yield() the tabs use once at run start.
+
+    Escape hatch: KICAD_NO_UI_STATUS_REPAINT=1 sets the label but never forces
+    the paint or pumps the loop. The status then lags on blocking phases (the
+    pre-fix behaviour), which is strictly cosmetic -- so if a repaint from
+    inside the plugin ever destabilises a KiCad build, the label is the thing
+    to give up, not the run.
+    """
+    global _IN_UI_STATUS, _LAST_UI_YIELD
+    if _IN_UI_STATUS:
+        return
+    try:
+        import os
+        import time
+        import wx
+        if not wx.IsMainThread():
+            wx.CallAfter(ui_thread_status, status_text, progress_bar, message)
+            return
+        _IN_UI_STATUS = True
+        try:
+            no_repaint = os.environ.get('KICAD_NO_UI_STATUS_REPAINT', '') in \
+                ('1', 'yes', 'true')
+            if status_text:
+                status_text.SetLabel(message)
+                if not no_repaint:
+                    status_text.Refresh()
+                    status_text.Update()
+            if _UI_STATUS_MIRROR is not None:
+                # Push to the AI tab's mirror (inside the latch, so a
+                # paint-triggered nested call cannot recurse). Guarded
+                # separately: a dead mirror widget must not break the
+                # working tab's own status.
+                try:
+                    _UI_STATUS_MIRROR(message)
+                except Exception:
+                    pass
+            if not no_repaint:
+                # Actually PAINT the invalidated labels (see macOS caveat in
+                # the docstring). Throttled so a fast per-ball burst costs a
+                # bounded number of loop turns; a slow phase paints every
+                # message. Guarded: a failed pump degrades to the lagging
+                # label, never breaks the run.
+                now = time.monotonic()
+                if now - _LAST_UI_YIELD >= 0.05:
+                    _LAST_UI_YIELD = now
+                    try:
+                        loop = wx.EventLoopBase.GetActive()
+                        # IsRunning guard: only pump a loop that is actually
+                        # dispatching (KiCad's MainLoop). An activated-but-
+                        # never-run loop (synthetic harnesses) asserts inside
+                        # YieldFor's pending-event sweep.
+                        if loop is not None and loop.IsRunning():
+                            loop.YieldFor(wx.EVT_CATEGORY_UI)
+                    except Exception:
+                        pass
+        finally:
+            _IN_UI_STATUS = False
+    except Exception:
+        _IN_UI_STATUS = False
+
+
+def layer_costs_for_layers(costs, layers, selected_layers, copper_layers):
+    """The Basic tab's Layer Costs values as one cost per entry of `layers`.
+
+    The control is read the way it is written: one value per SELECTED routing
+    layer, else one per board copper layer (its default, its tooltip's order
+    and an AI plan's order). Either way the values are placed on `layers` BY
+    NAME -- the engines price them positionally, and a plane step routes on
+    F.Cu + its pour layers + B.Cu, not on the selected layers. Returns [] when
+    the control is empty. A count that matches neither list is returned as
+    typed: the engine reads it positionally against `layers`, and refuses it
+    when it is not one value per layer (routing_config.layer_costs_count_error).
+    Raises ValueError, naming the layers, when the values are for the selected
+    layers and `layers` holds one that is not selected (found reviewing #1269:
+    the Planes tab handed create_plane the selected layers' costs against its
+    own layer list, so a 4-layer board's default costs priced the wrong
+    layers and left the unrequested inner layer routable)."""
+    costs = list(costs or [])
+    if not costs:
+        return []
+    by_name = None
+    for names in (selected_layers, copper_layers):
+        if names and len(costs) == len(names):
+            by_name = dict(zip(names, costs))
+            break
+    if by_name is None:
+        return costs
+    missing = [l for l in layers if l not in by_name]
+    if missing:
+        raise ValueError(
+            f"Layer Costs gives {len(costs)} value(s), one per selected layer "
+            f"({' '.join(selected_layers)}), but this step also routes on "
+            f"{' '.join(missing)}: give one value per copper layer "
+            f"({' '.join(copper_layers)}) instead")
+    return [by_name[l] for l in layers]
+
+
+from contextlib import contextmanager
+
+
+@contextmanager
+def redirect_prints_to_log(append_log):
+    """Route print() output into the GUI log for the duration of a block,
+    while preserving the original stdout (StdoutRedirector tees, not swallows).
+
+    One shared helper because the audit found the coverage was accidental:
+    the route/diff/planes WORKERS redirected, but the fanout tab never did,
+    and every tab's APPLY phase runs after its worker restored stdout -- so
+    engine narration (fanout escapes, the oracle reconnect, zone refills,
+    plane cleanup) reached the terminal but never the log tab. Guarded:
+    append_log=None (or a failure) degrades to plain stdout, never breaks
+    the work.
+    """
+    import sys
+    if not append_log:
+        yield
+        return
+    original = sys.stdout
+    try:
+        sys.stdout = StdoutRedirector(append_log, original)
+    except Exception:
+        yield
+        return
+    try:
+        yield
+    finally:
+        sys.stdout = original
+
+
+#: What was said before a tab's log capture began, for the next capture to carry.
+_log_notes = []
+
+
+def note_for_the_log(text):
+    """Say `text` in the log of the run it concerns. A run's parameters are read
+    before its tab starts capturing stdout, so a plain print there reaches the
+    terminal and never the log a GUI user reads: held until the next capture
+    starts, or printed now inside one."""
+    import sys
+    if isinstance(sys.stdout, StdoutRedirector):
+        print(text)
+    else:
+        _log_notes.append(text)
+
 
 class StdoutRedirector:
     """Redirects stdout to a callback function while preserving original output."""
@@ -11,15 +287,1421 @@ class StdoutRedirector:
     def __init__(self, callback, original_stdout):
         self.callback = callback
         self.original = original_stdout
+        while _log_notes:
+            self.write(_log_notes.pop(0) + '\n')
 
     def write(self, text):
         if text:
-            # Write to original stdout
+            # Write to original stdout. Guard against a non-ASCII glyph (arrows,
+            # Ω, ...) that a cp1252 Windows console can't encode, so a log line
+            # never crashes the run (issue #152, GUI analog of route.py's UTF-8
+            # reconfigure).
             if self.original:
-                self.original.write(text)
-            # Also send to callback
+                try:
+                    self.original.write(text)
+                except UnicodeEncodeError:
+                    enc = getattr(self.original, 'encoding', None) or 'ascii'
+                    self.original.write(text.encode(enc, errors='replace').decode(enc, errors='replace'))
+            # Also send to callback (the wx log control handles Unicode fine)
             self.callback(text)
 
     def flush(self):
         if self.original:
             self.original.flush()
+
+
+def apply_via_protection(pcb_via, tenting_attrs):
+    """Put a Via's parsed protection spec back onto a pcbnew PCB_VIA (#489 §8).
+
+    GUI counterpart of the writer's tenting round-trip: without it, a via the GUI
+    RE-PLACES (rip-up/reroute, sub-grid nudge, tap relocation) comes back with the
+    board default and silently loses its own tenting/plugging/filling -- the loss
+    the CLI side now avoids. A via with NO spec is deliberately left alone:
+    pcbnew's *_MODE_FROM_BOARD already means "inherit the board setting".
+
+    Best-effort; does nothing on a KiCad without these accessors. Returns True
+    when something was applied.
+    """
+    if not tenting_attrs:
+        return False
+    try:
+        import pcbnew
+    except ImportError:
+        return False
+    import re
+
+    def _sides(inner):
+        """'(front no) (back yes)' -> {'front': False, 'back': True}"""
+        return {m.group(1): (m.group(2) == 'yes')
+                for m in re.finditer(r'\((front|back)\s+(yes|no)\)', inner or '')}
+
+    applied = False
+    for token, front_set, back_set, yes_name, no_name in (
+            ('tenting', 'SetFrontTentingMode', 'SetBackTentingMode',
+             'TENTING_MODE_TENTED', 'TENTING_MODE_NOT_TENTED'),
+            ('covering', 'SetFrontCoveringMode', 'SetBackCoveringMode',
+             'COVERING_MODE_COVERED', 'COVERING_MODE_NOT_COVERED'),
+            ('plugging', 'SetFrontPluggingMode', 'SetBackPluggingMode',
+             'PLUGGING_MODE_PLUGGED', 'PLUGGING_MODE_NOT_PLUGGED')):
+        if token not in tenting_attrs:
+            continue
+        yes_const = getattr(pcbnew, yes_name, None)
+        no_const = getattr(pcbnew, no_name, None)
+        if yes_const is None or no_const is None:
+            continue
+        sides = _sides(tenting_attrs[token])
+        for side, setter_name in (('front', front_set), ('back', back_set)):
+            if side not in sides:
+                continue
+            setter = getattr(pcb_via, setter_name, None)
+            if setter is None:
+                continue
+            try:
+                setter(yes_const if sides[side] else no_const)
+                applied = True
+            except Exception:
+                pass
+
+    for token, setter_name, yes_name, no_name, flag_setter in (
+            ('capping', 'SetCappingMode', 'CAPPING_MODE_CAPPED', 'CAPPING_MODE_NOT_CAPPED',
+             'SetPrimaryDrillCappedFlag'),
+            ('filling', 'SetFillingMode', 'FILLING_MODE_FILLED', 'FILLING_MODE_NOT_FILLED',
+             'SetPrimaryDrillFilledFlag')):
+        if token not in tenting_attrs:
+            continue
+        value = (tenting_attrs[token] or '').strip().lower()
+        if value not in ('yes', 'no'):
+            continue
+        yes_const = getattr(pcbnew, yes_name, None)
+        no_const = getattr(pcbnew, no_name, None)
+        setter = getattr(pcb_via, setter_name, None)
+        if yes_const is not None and no_const is not None and setter is not None:
+            try:
+                setter(yes_const if value == 'yes' else no_const)
+                applied = True
+                continue
+            except Exception:
+                pass
+        # #962: the shipping KiCad 10.0.0 SWIG exports no *_MODE_* constants
+        # (#751), so the enum setter above cannot be called. The plain-bool
+        # flag setter can: probed, SetPrimaryDrillCappedFlag(True) /
+        # SetPrimaryDrillFilledFlag(True) save as `(capping yes)` /
+        # `(filling yes)` and nothing else. Without this, a Type VII stamp was
+        # a silent no-op in the GUI.
+        fsetter = getattr(pcb_via, flag_setter, None)
+        if fsetter is None:
+            continue
+        try:
+            fsetter(value == 'yes')
+            applied = True
+        except Exception:
+            pass
+
+    return applied
+
+
+def live_via_is_micro(via) -> bool:
+    """A pcbnew PCB_VIA typed micro (#1842): the project writeback leaves it
+    out of the via diameter, via drill, annular ring and smallest-hole
+    minimums, as the file-side `fix_kicad_drc_settings.board_size_values`
+    does."""
+    try:
+        from kicad_parser import pcbnew_via_type
+        return pcbnew_via_type(via) == 'micro'
+    except Exception:                                          # noqa: BLE001
+        return False
+
+
+def set_via_layers(pcb_via, top_id, bottom_id, via_type=None):
+    """Give a PCB_VIA its type, THEN its layer pair -- in that order.
+
+    A PCB_VIA is born THROUGH, and pcbnew snaps a through via's pair to
+    F.Cu/B.Cu as it is set: setting the pair first and the type after leaves
+    a microvia spanning the whole stack (probed on pcbnew 10.0.3 and 9.0.6).
+    `via_type` is the Via's own Via.via_type; None or 'through' (every via the
+    tool adds) keeps pcbnew's default type, as before. Found reviewing #1268:
+    every site re-created an existing blind/micro via as a through via."""
+    from kicad_parser import pcbnew_viatype_value
+    vt = pcbnew_viatype_value(via_type)
+    if vt is not None:
+        pcb_via.SetViaType(vt)
+    pcb_via.SetLayerPair(top_id, bottom_id)
+
+
+def apply_castellated_landing_retract(board, board_edge_clearance):
+    """CLI/GUI parity twin of pcb_modification.retract_castellated_landings
+    (run-6 fix 1.7): compute the shared castellated-landing retract delta on
+    PCBData built from the LIVE board, then move the matching live track
+    endpoints in place. Returns the number of endpoints moved. Best-effort --
+    a failure never blocks an already-applied routing result."""
+    if not board_edge_clearance or board_edge_clearance <= 0:
+        return 0
+    try:
+        import pcbnew
+        from kicad_parser import build_pcb_data_from_board, mm_to_iu
+        from pcb_modification import compute_castellated_landing_retract
+        pcb = build_pcb_data_from_board(board)
+        delta = compute_castellated_landing_retract(pcb, board_edge_clearance)
+        if delta.is_empty:
+            return 0
+        # Match live tracks by rounded endpoints + net, the same key style as
+        # the planes tab's cleanup applier.
+        moves = {}
+        for s, end, nx, ny in delta.moves:
+            k = (round(s.start_x, 3), round(s.start_y, 3),
+                 round(s.end_x, 3), round(s.end_y, 3), s.net_id)
+            moves[k] = (end, nx, ny)
+        moved = 0
+        for item in board.GetTracks():
+            if item.Type() != pcbnew.PCB_TRACE_T:
+                continue
+            k = (round(pcbnew.ToMM(item.GetStart().x), 3),
+                 round(pcbnew.ToMM(item.GetStart().y), 3),
+                 round(pcbnew.ToMM(item.GetEnd().x), 3),
+                 round(pcbnew.ToMM(item.GetEnd().y), 3),
+                 item.GetNetCode())
+            mv = moves.get(k)
+            if mv is None:
+                continue
+            end, nx, ny = mv
+            # mm_to_iu, never pcbnew.FromMM: FromMM truncates (1 nm low on
+            # ~2% of 4-decimal coordinates), so the GUI would store a
+            # different integer than the CLI's text write of the same
+            # retracted endpoint -- the #493 divergence class this module's
+            # own docstring promises cannot happen.
+            pt = pcbnew.VECTOR2I(mm_to_iu(nx), mm_to_iu(ny))
+            if end == 'start':
+                item.SetStart(pt)
+            else:
+                item.SetEnd(pt)
+            moved += 1
+        if moved:
+            board.SetModified()
+            print(f"  Castellated landings: {moved} track end(s) retracted "
+                  f"inside the edge-clearance zone (pad_prop_castellated)")
+        return moved
+    except Exception as e:
+        print(f"  (skipped castellated-landing retract: {e})")
+        return 0
+
+
+def apply_teardrops_to_board(board):
+    """Enable teardrops on every pad and via of the live board (#489 §9).
+
+    GUI counterpart of the writers' `add_teardrops_to_pads` /
+    `add_teardrops_to_vias`: the CLI applies teardrops to the output FILE, while
+    the GUI applies copper straight into pcbnew, so without this the "Add
+    teardrops" checkbox did nothing on the tabs that apply in memory (fanout, and
+    the planes tabs, whose config key was read but never supplied).
+
+    Matches the writers' scope -- all pads and all vias, not just the ones this
+    run added -- so the two fronts produce the same board. Best-effort; returns
+    (pads_changed, vias_changed), (0, 0) on a KiCad without the accessors.
+    """
+    try:
+        import pcbnew
+    except ImportError:
+        return (0, 0)
+
+    pads = vias = 0
+    try:
+        for fp in board.GetFootprints():
+            for pad in fp.Pads():
+                if not pad.GetTeardropsEnabled():
+                    pad.SetTeardropsEnabled(True)
+                    pads += 1
+        for track in board.GetTracks():
+            if track.GetClass() != 'PCB_VIA':
+                continue
+            if not track.GetTeardropsEnabled():
+                track.SetTeardropsEnabled(True)
+                vias += 1
+    except AttributeError as e:
+        print(f"(teardrops skipped: this KiCad has no teardrop API: {e})")
+        return (0, 0)
+    if pads or vias:
+        print(f"Teardrops enabled on {pads} pad(s) and {vias} via(s)")
+    return (pads, vias)
+
+
+def refill_all_zones(board):
+    """Re-fill EVERY copper zone, then rebuild connectivity -- the ONLY safe
+    way to register freshly added copper while filled zones exist (#362).
+
+    Two distinct corruptions this prevents:
+    - STALE FILLS (#362): a signal routed after planes exist leaves the plane
+      fill with no antipad around the new track/via, which KiCad DRC flags as
+      clearance / shorting violations on the saved board (the CLI board is
+      graded with kicad-cli --refill-zones, so it never shows these).
+    - NET FLIPS (mez_rx): ``board.BuildConnectivity()`` over a stale fill
+      REASSIGNS a new via's netcode to the zone's net (the fill has no
+      knockout, so pcbnew's net propagation sees them touching -- measured:
+      a fresh RGMII_TX_CTL via under the BGA came back GND/V1P8/V3P3, 42 of
+      131 fanout vias misnetted). Once flipped, the via is same-net with the
+      zone, so a LATER refill keeps no knockout and the wrong net STICKS.
+      ``pcbnew.LoadBoard`` propagates the same way, so a saved board with
+      stale fills is corrupted for every pcbnew consumer that opens it.
+
+    Therefore: call THIS (never a bare ``BuildConnectivity``) as the first
+    connectivity rebuild after adding copper. ZONE_FILLER computes knockouts
+    from the still-correct netcodes, and only then is connectivity rebuilt.
+    Best-effort; builds connectivity even when the board has no zones.
+    Returns the number of zones refilled (0 if none / on error)."""
+    try:
+        import pcbnew
+        zones = list(board.Zones())
+        if zones:
+            pcbnew.ZONE_FILLER(board).Fill(zones)
+        board.BuildConnectivity()
+        return len(zones)
+    except Exception as e:
+        print(f"(zone refill skipped: {e})")
+        try:
+            board.BuildConnectivity()
+        except Exception:
+            pass
+        return 0
+
+
+def live_footprints_by_key(board):
+    """{PCBData key: live pcbnew footprint} for a live board (#726).
+
+    `board.FindFootprintByReference(ref)` returns the FIRST footprint with that
+    reference, and `PCBData` keys duplicated references `TP4`, `TP4~2`, ... So
+    a bare lookup silently returns the WRONG twin for one of them and `None`
+    for the other -- and `None` is a `continue` at every call site, which is a
+    part the GUI quietly declines to apply.
+
+    Built with the same `disambiguate_references` over the same
+    `board.GetFootprints()` order that `build_pcb_data_from_board` uses, so the
+    keys are the ones the engine was handed. Returns `{}` if pcbnew is absent
+    or the board cannot be walked; callers fall back to their old lookup, which
+    is exactly today's behaviour.
+    """
+    try:
+        from kicad_parser import disambiguate_references
+        live = list(board.GetFootprints())
+        raw = []
+        for f in live:
+            r = f.GetReference()
+            if not r:
+                try:
+                    r = "#" + f.m_Uuid.AsString()
+                except Exception:
+                    r = "?"
+            raw.append(r)
+        return dict(zip(disambiguate_references(raw), live))
+    except Exception:                                            # noqa: BLE001
+        return {}
+
+
+def sync_footprint_positions_from_board(board, pcb_data):
+    """Refresh footprint and pad POSITIONS in pcb_data from the live pcbnew board
+    (#362).
+
+    pcb_data is parsed once when the dialog opens and then reused across plan
+    steps. optimize_caps (and manual edits) relocate footprints on the board via
+    SetPosition, but the cached pcb_data keeps their load-time positions -- so a
+    LATER signal/diff route step routes around where a cap USED to be, and the
+    moved cap's pad then shorts the fresh copper (rp2350: +1V1 vias grazing moved
+    decoupling caps C18/C22/C23/C24).
+
+    Re-reads each footprint's x/y/rotation and its pads' absolute positions.
+    Pad objects are shared with pcb_data.pads_by_net and net.pads, so updating
+    them here updates every view the router consults. Best-effort; never raises.
+    Returns the number of footprints synced (0 on error).
+
+    Pads are matched to pcb_data by ITERATION ORDER, not pad number: a single
+    footprint routinely carries many pads sharing one number (U6 has 11 pads
+    numbered "61" for its GND array, plus 4 blank-numbered pads). Matching by
+    number collapses them all onto the first pad's position, deleting the copper
+    obstacle everywhere else and letting the router short straight through it.
+    build_pcb_data_from_board iterates fp.Pads() once with no skips, so order is
+    a faithful 1:1 map. The position math below mirrors that function's
+    copper-offset fold (#324/#325) so a no-op sync is a true no-op."""
+    try:
+        import math
+        import pcbnew
+        from kicad_parser import disambiguate_references
+        n = 0
+        # Names are resolved for the WHOLE board and zipped on, exactly as
+        # `build_pcb_data_from_board` does (#726). A bare `GetReference()`
+        # lookup was the footprint-level twin of the pad bug this function's
+        # docstring already describes: on a board with two `TP4` blocks both
+        # of them looked up the ONE `TP4` entry, so the second overwrote the
+        # first's pose and the parts moved onto each other in the cached model
+        # -- the same class of silent corruption, one level up.
+        _live = list(board.GetFootprints())
+        _raw = []
+        for _f in _live:
+            _r = _f.GetReference()
+            if not _r:
+                try:
+                    _r = "#" + _f.m_Uuid.AsString()
+                except Exception:
+                    _r = "?"
+            _raw.append(_r)
+        _keys = disambiguate_references(_raw)
+        for bfp, ref in zip(_live, _keys):
+            pd_fp = pcb_data.footprints.get(ref)
+            if pd_fp is None:
+                continue
+            fpos = bfp.GetPosition()
+            pd_fp.x = pcbnew.ToMM(fpos.x)
+            pd_fp.y = pcbnew.ToMM(fpos.y)
+            try:
+                pd_fp.rotation = bfp.GetOrientationDegrees()
+            except Exception:
+                pass
+            bpads = list(bfp.Pads())
+            if len(bpads) != len(pd_fp.pads):
+                # Order alignment can't be trusted if the counts disagree
+                # (should never happen from a live board); skip pads for safety.
+                n += 1
+                continue
+            for pd_pad, bp in zip(pd_fp.pads, bpads):
+                ppos = bp.GetPosition()
+                gx = pcbnew.ToMM(ppos.x)
+                gy = pcbnew.ToMM(ppos.y)
+                # Fold the rotated copper offset into the position, exactly as
+                # build_pcb_data_from_board does, so global_x/global_y stays the
+                # copper center for offset pads.
+                try:
+                    off = bp.GetOffset()
+                    if off.x or off.y:
+                        oa = math.radians(-bp.GetOrientationDegrees())
+                        ox, oy = pcbnew.ToMM(off.x), pcbnew.ToMM(off.y)
+                        gx += ox * math.cos(oa) - oy * math.sin(oa)
+                        gy += ox * math.sin(oa) + oy * math.cos(oa)
+                        if bp.GetDrillSize().x:
+                            pd_pad.hole_x = pcbnew.ToMM(ppos.x)
+                            pd_pad.hole_y = pcbnew.ToMM(ppos.y)
+                except Exception:
+                    pass
+                pd_pad.global_x = gx
+                pd_pad.global_y = gy
+            n += 1
+        return n
+    except Exception as e:
+        print(f"Warning: Error syncing footprint positions from board: {e}")
+        return 0
+
+
+def move_copper_graphics_to_silkscreen_board(board):
+    """Move copper graphic shapes (logos / artwork drawn as polys, lines, arcs,
+    circles, rects, curves) from F.Cu/B.Cu to the matching silkscreen layer on the
+    live pcbnew board.
+
+    Mirrors kicad_writer.move_copper_graphics_to_silkscreen so the GUI matches CLI
+    output (issue #146): a net-less copper graphic is not modelled as a router
+    obstacle, so plane pours and routed copper run straight over it and short
+    against it. Relocating it to silkscreen preserves it visually while taking it
+    out of copper.
+
+    Walks both board-level drawings AND footprint graphics - a copper logo is
+    frequently a footprint fp_poly (e.g. the orangecrab OSHW logo). Footprint text
+    and board text are handled separately by the copper-text mover, so only
+    PCB_SHAPE items are touched here. Returns the number of shapes moved.
+
+    #908: the net guard cannot separate a logo from a part's own land-pattern
+    copper, because a footprint shape carries no net at all -- so a footprint
+    WITH pads is exempted here and its copper stays on copper, which the parser
+    now models. Same shared predicate as the CLI writer, so the two fronts
+    cannot answer this differently. Returns the number of shapes moved.
+    """
+    import pcbnew
+    from kicad_parser import footprint_copper_is_functional
+
+    moved = 0
+
+    def _relocate(item):
+        nonlocal moved
+        # PCB_SHAPE covers gr_line/poly/arc/circle/rect/curve, and footprint
+        # graphics (unified onto PCB_SHAPE in modern KiCad).
+        if not isinstance(item, pcbnew.PCB_SHAPE):
+            return
+        # #337: a NET-TIED copper graphic is functional copper the router models
+        # as an immutable obstacle -- LEAVE it (moving it deletes a real
+        # connection). Only net-less decoration (a copper logo) is relocated.
+        # Mirrors the net guard in kicad_writer.move_copper_graphics_to_silkscreen.
+        try:
+            if item.GetNetCode() > 0:
+                return
+        except Exception:
+            pass  # older PCB_SHAPE without a net accessor: treat as net-less
+        layer = item.GetLayer()
+        if layer == pcbnew.F_Cu:
+            item.SetLayer(pcbnew.F_SilkS)
+            moved += 1
+        elif layer == pcbnew.B_Cu:
+            item.SetLayer(pcbnew.B_SilkS)
+            moved += 1
+
+    for drawing in board.GetDrawings():
+        _relocate(drawing)
+    for footprint in board.GetFootprints():
+        # #908: a pad-bearing footprint's copper is the part's own land
+        # pattern. The loop already holds the owning FOOTPRINT, so the pad
+        # count is read here rather than through a parent lookup (board-level
+        # drawings have no parent to look up).
+        # NPTH pads are not copper, so they cannot make a footprint
+        # "functional" -- the text writer and BOTH parse paths exclude them by
+        # name, and counting them here is how the one front that shares the
+        # predicate still answers differently (a logo footprint carrying a
+        # mounting hole would be kept on copper here and modelled nowhere).
+        _npads = 0
+        for _pd in footprint.Pads():
+            try:
+                if _pd.GetAttribute() == pcbnew.PAD_ATTRIB_NPTH:
+                    continue
+            except Exception:
+                pass
+            _npads += 1
+        if footprint_copper_is_functional(_npads):
+            continue
+        for item in footprint.GraphicalItems():
+            _relocate(item)
+    return moved
+
+
+def live_room_width_test(board):
+    """#1843: ``(held, unread)`` for the live board's track scans, the GUI
+    twin of `fix_kicad_drc_settings._board_track_widths`: ``held`` is
+    `area_clearance.room_width_test` (None without a rule-area track_width
+    rule) and ``unread`` True when the board has such a rule that could not
+    be read -- said on the console, and the caller then measures no track,
+    so it never lowers the board's minimum to a width it could not judge."""
+    try:
+        import pcbnew
+        from area_clearance import room_width_test
+        return room_width_test(
+            board_path=board.GetFileName() or '',
+            copper=[board.GetLayerName(l) for l in board.GetEnabledLayers().Seq()
+                    if pcbnew.IsCopperLayer(l)]), False
+    except Exception as e:
+        print(f"  ERROR: the board's rule-area track_width rules could not be "
+              f"read ({type(e).__name__}: {e}); min_track_width is not measured "
+              f"on this board")
+        return None, True
+
+
+def live_track_held(board, track, held) -> bool:
+    """`live_room_width_test`'s ``held`` for one live track."""
+    if held is None:
+        return False
+    import pcbnew
+    a, b = track.GetStart(), track.GetEnd()
+    return bool(held(pcbnew.ToMM(a.x), pcbnew.ToMM(a.y), pcbnew.ToMM(b.x),
+                     pcbnew.ToMM(b.y), board.GetLayerName(track.GetLayer()),
+                     pcbnew.ToMM(track.GetWidth())))
+
+
+def board_minima_from_live(board):
+    """The GUI twin of fix_kicad_drc_settings.scan_board_minima(), read from the
+    LIVE pcbnew board instead of re-parsing the board file.
+
+    Same five keys, same meaning: the smallest track width / via diameter / via
+    drill / via annular ring / through-hole diameter actually present, so KiCad's
+    min-size rules can be floored at or below the board's own copper.
+
+    Why not just call scan_board_minima: it runs parse_kicad_pcb over the whole
+    file, allocating thousands of GC-tracked objects. The GUI calls it from
+    _write_drc_floors, which runs inside a wx TIMER dispatch, and that allocation
+    burst triggers an automatic gen0 collection mid-dispatch which walks a dict
+    holding a stale pointer and segfaults (visit_decref -> dict_traverse ->
+    collect, faulting on a read-only page). Measured at 3-7 crashes in 10 runs.
+    The dangling reference is in a C extension, not here; the tractable fix is to
+    stop doing a full board re-parse in that context when the live board -- which
+    the GUI already holds -- has every number we need.
+
+    Best-effort: returns {} on error, which makes compute_targets() fall back to
+    its param-only behaviour exactly as an unparseable board would.
+    """
+    try:
+        import pcbnew
+        widths, via_sizes, via_drills, annular, holes = [], [], [], [], []
+        _held, _widths_unread = live_room_width_test(board)
+        for t in board.GetTracks():
+            try:
+                if t.Type() == pcbnew.PCB_VIA_T:
+                    # GetFrontWidth() first: a bare PCB_VIA::GetWidth() trips a
+                    # wxASSERT for every via on KiCad 10 (see
+                    # update_live_drc_floors).
+                    try:
+                        w = pcbnew.ToMM(t.GetFrontWidth())
+                    except Exception:
+                        w = pcbnew.ToMM(t.GetWidth())
+                    d = pcbnew.ToMM(t.GetDrillValue())
+                    # #1842: a micro via is graded at the micro via minimums,
+                    # and its ring at the micro via rule the step writes
+                    # (fix_kicad_drc_settings.micro_via_floors)
+                    _micro = live_via_is_micro(t)
+                    if w and not _micro:
+                        via_sizes.append(w)
+                    if d and not _micro:
+                        via_drills.append(d)
+                        holes.append(d)
+                    if w and d and w > d and not _micro:
+                        annular.append((w - d) / 2.0)
+                else:
+                    w = pcbnew.ToMM(t.GetWidth())
+                    if w and live_track_held(board, t, _held):
+                        continue
+                    if w:
+                        widths.append(w)
+            except Exception:
+                continue
+        for fp in board.GetFootprints():
+            for pad in fp.Pads():
+                try:
+                    ds = pad.GetDrillSize()
+                    d = pcbnew.ToMM(max(ds.x, ds.y))
+                    if d:
+                        holes.append(d)
+                except Exception:
+                    continue
+        # #530: the smallest pad / footprint clearance OVERRIDE on a copper
+        # pad -- KiCad floors an override at rules.min_clearance, so the
+        # writeback must not raise min_clearance above one the run honoured.
+        # Best-effort across SWIG shapes (std::optional on KiCad 9/10).
+        ovr = []
+        for fp in board.GetFootprints():
+            fp_v = None
+            try:
+                v = fp.GetLocalClearance()
+                fp_v = v.value() if hasattr(v, 'has_value') and v.has_value() else (
+                    None if hasattr(v, 'has_value') else v)
+            except Exception:
+                fp_v = None
+            for pad in fp.Pads():
+                try:
+                    # IsCopperLayer, not the display name: a renamed copper
+                    # layer ("GND") does not end in '.Cu' (#1056).
+                    if not any(pcbnew.IsCopperLayer(i)
+                               for i in pad.GetLayerSet().Seq()):
+                        continue
+                    v = pad.GetLocalClearance()
+                    pv = v.value() if hasattr(v, 'has_value') and v.has_value() else (
+                        None if hasattr(v, 'has_value') else v)
+                    eff = pv if pv else fp_v
+                    if eff and eff > 0:
+                        ovr.append(pcbnew.ToMM(int(eff)))
+                except Exception:
+                    continue
+        out = {}
+        if ovr:
+            out['min_pad_clearance_override'] = min(ovr)
+        if widths and not _widths_unread:
+            out['min_track_width'] = min(widths)
+        if via_sizes:
+            out['min_via_diameter'] = min(via_sizes)
+        if via_drills:
+            out['min_via_drill'] = min(via_drills)
+        if annular:
+            out['min_via_annular_width'] = min(annular)
+        if holes:
+            out['min_through_hole_diameter'] = min(holes)
+        return out
+    except Exception as e:
+        print(f"(live board minima scan skipped: {e})")
+        return {}
+
+
+def default_netclass(board):
+    """The board's Default NETCLASS, or None.
+
+    `board.GetNetClasses()` returns an EMPTY map on KiCad 10 -- the Default
+    class moved to `GetDesignSettings().m_NetSettings.GetDefaultNetclass()`.
+    Every `for name, nc in board.GetNetClasses().items(): if name == 'Default'`
+    loop therefore iterated ZERO times, and because they all sit inside
+    `except Exception: pass`, the entire netclass half of the GUI's DRC-floor
+    writeback was a silent no-op. That is why a GUI plan run left the Default
+    class at stock values (eth_tap: 0.125 / via 0.5-0.25) while the CLI chain
+    tightened it per step (0.0889 / via 0.25-0.15) -- and every later step
+    resolves its geometry from that class, so the two fronts routed with
+    different parameters.
+
+    Tries the KiCad 10 accessor first, then the legacy map."""
+    try:
+        ns = board.GetDesignSettings().m_NetSettings
+        nc = ns.GetDefaultNetclass()
+        if nc is not None:
+            return nc
+    except Exception:
+        pass
+    try:
+        for _name, _nc in board.GetNetClasses().items():
+            if _name == 'Default':
+                return _nc
+    except Exception:
+        pass
+    return None
+
+
+def persist_live_tool_records(board, same_net_pad_clearance=None):
+    """Record the step's tool records on the live board: protected nets,
+    impedance declarations, pour-served balls and an active same-net pad via
+    clearance. The GUI twin of the CLI's record block, and INDEPENDENT of the
+    DRC-floor writeback: "Fix DRC settings after routing" unchecked keeps the
+    floors where they are, it must not void the protection of the step's
+    routed pairs (#1415). Callers run it whether or not
+    ``update_live_drc_floors`` does (which itself calls it first). Best-effort:
+    never raises."""
+    # #521: manual (non-plan) runs consume the engine-noted protection
+    # candidates here -- the per-step floor update is the GUI's step boundary.
+    # Recorded in the board's records (tool_records): its .kicad_pro, like the
+    # CLI writeback, AND the board itself, because KiCad's own project save
+    # rewrites the .kicad_pro from the copy it loaded and drops them. A board
+    # with no project, or no file yet, records on the board alone.
+    try:
+        from protected_nets import (consume_protection_candidates,
+                                    consume_impedance_specs,
+                                    consume_pour_served_pads,
+                                    persist_protected_nets,
+                                    persist_impedance_specs,
+                                    persist_pour_served_pads,
+                                    pro_path_for_board)
+        if board is not None:
+            _bf = board.GetFileName() or ""
+            _pro = pro_path_for_board(_bf) if _bf else ""
+            persist_protected_nets(_pro, consume_protection_candidates(),
+                                   board=board)
+            persist_impedance_specs(_pro, consume_impedance_specs(), board=board)
+            # #1503: the pairs matched P to N, and the skew each was matched to
+            from protected_nets import (consume_intra_pair_tolerances,
+                                        persist_intra_pair_tolerances)
+            persist_intra_pair_tolerances(_pro, consume_intra_pair_tolerances(),
+                                          board=board)
+            # #1379: the power widths this step was asked for, measured and disclosed.
+            from protected_nets import consume_power_widths, persist_power_widths
+            persist_power_widths(_pro, consume_power_widths(), board=board)
+            # #678: the fanout tab's pour-served balls, same step boundary.
+            persist_pour_served_pads(_pro, consume_pour_served_pads(),
+                                     board=board)
+            # #1807: the improvement gate's record of this step's trade.
+            from improvement_gate import consume_lap_history
+            from protected_nets import persist_lap_history
+            persist_lap_history(_pro, consume_lap_history(), board=board)
+            # #581: an ACTIVE same-net pad via clearance, as every CLI routing
+            # step records it, so a later chain step keeps vias off same-net
+            # pads too (the persist is a no-op for <= 0).
+            if same_net_pad_clearance is not None:
+                from protected_nets import persist_same_net_pad_clearance
+                persist_same_net_pad_clearance(_pro, same_net_pad_clearance,
+                                               board=board)
+    except Exception:
+        pass
+
+
+def _live_step_board(pcb_data, results_data):
+    """``(board, segs, vias)``: the board the step's copper was drawn on --
+    the routed PCBData without the copper this step removed, as a namespace
+    the copper-to-hole census reads -- and the copper the step drew."""
+    segs, vias = [], []
+    for result in results_data.get('results', []):
+        segs.extend(result.get('new_segments', []))
+        vias.extend(result.get('new_vias', []))
+    segs.extend(results_data.get('all_swap_segments', []))
+    vias.extend(results_data.get('all_swap_vias', []))
+    from types import SimpleNamespace
+
+    def _sk(s):
+        a = (round(s.start_x, 4), round(s.start_y, 4))
+        b = (round(s.end_x, 4), round(s.end_y, 4))
+        return (min(a, b), max(a, b), s.layer, s.net_id)
+
+    def _vk(v):
+        return (round(v.x, 4), round(v.y, 4), v.net_id)
+    _gone_s = {_sk(s) for s in results_data.get('segments_to_remove') or ()}
+    _gone_v = {_vk(v) for v in results_data.get('vias_to_remove') or ()}
+    pcb = SimpleNamespace(
+        segments=[s for s in pcb_data.segments if _sk(s) not in _gone_s],
+        vias=[v for v in pcb_data.vias if _vk(v) not in _gone_v],
+        footprints=pcb_data.footprints,
+        board_info=pcb_data.board_info)
+    return pcb, segs, vias
+
+
+def live_micro_via_rule(pcb_data, board, results_data, clearance):
+    """#1842: the GUI twin of fix_project_for_output's micro via rule: the
+    micro vias of the board as this step leaves it (the routed PCBData and
+    the copper the step drew) held by `fix_kicad_drc_settings.
+    MICRO_VIA_RULE` in the `.kicad_dru` beside the board file, against the
+    minimums the live board declares before this step's writeback --
+    `write_micro_via_rule`, the writer both fronts call. KiCad reads the
+    rules file when its DRC runs. A board with no file writes none. Every
+    tab's writeback calls it, under the same "Fix DRC settings" gate the
+    CLI's --no-fix-drc-settings is."""
+    try:
+        path = board.GetFileName() or ''
+        if not path:
+            return None
+        from fix_kicad_drc_settings import live_declared_rules, write_micro_via_rule
+        pcb, segs, vias = _live_step_board(pcb_data, results_data)
+        if not any(getattr(v, 'via_type', None) == 'micro' for v in list(pcb.vias) + vias):
+            return None
+        from types import SimpleNamespace
+        after = SimpleNamespace(segments=list(pcb.segments) + segs,
+                                vias=list(pcb.vias) + vias,
+                                footprints=pcb.footprints, board_info=pcb.board_info)
+        rules = live_declared_rules(board, ('min_via_annular_width',
+                                            'min_hole_clearance')) or {}
+        return write_micro_via_rule(after, path, rules, clearance)
+    except Exception as e:                                  # noqa: BLE001
+        print(f"(micro via rule not written: {e})")
+        return None
+
+
+def held_hole_clearance_live(pcb_data, board, results_data, clearance):
+    """The copper-to-hole floor to write for this step (#1369): the
+    board's declared hole clearance the engine held
+    (``obstacle_map.declared_hole_clearance`` on the PCBData it routed),
+    lowered only to what the copper this step drew needs
+    (``fix_kicad_drc_settings.step_copper_to_hole``) -- the GUI twin of
+    route_diff.py's ``step_hole_clearance``, shared by the differential
+    and route tabs (#1493). None (write the copper clearance, as before)
+    when the board declares none. The micro vias' pairs are left out: they
+    are held by the board's micro via rule (`live_micro_via_rule`, #1842)."""
+    try:
+        from obstacle_map import declared_hole_clearance
+        from fix_kicad_drc_settings import (step_copper_to_hole,
+                                            held_hole_clearance)
+        held, _src = declared_hole_clearance(
+            pcb_data, board.GetFileName() or None)
+        if not held or clearance is None or held <= clearance:
+            return None
+        pcb, segs, vias = _live_step_board(pcb_data, results_data)
+        # (#1842: a micro via's pairs are left out -- their rule's)
+        step_min = step_copper_to_hole(pcb, segs, vias, held, clearance)
+        v = held_hole_clearance(held, clearance, step_min)
+        # #1493: a floor written under the one held is ledgered, as the CLI's
+        # step_hole_clearance ledgers it
+        if v is not None and v < float(held) - 1e-6:
+            from fab_tiers import note_narrowing
+            note_narrowing(None, 'hole_clearance', float(held), v,
+                           "copper-to-hole floor written under the board's own: "
+                           "this step's copper sits closer to a foreign hole")
+        return v
+    except Exception as e:                                  # noqa: BLE001
+        print(f"(copper-to-hole floor: {e}; following the copper clearance)")
+        return None
+
+
+def _dict_results(tracks, vias):
+    """An engine's track and via DICTS as the results_data the live
+    helpers read."""
+    from kicad_parser import Segment, Via
+    segs = [Segment(start_x=t['start'][0], start_y=t['start'][1],
+                    end_x=t['end'][0], end_y=t['end'][1], width=t['width'],
+                    layer=t['layer'], net_id=t['net_id']) for t in tracks]
+    new_vias = [Via(x=v['x'], y=v['y'], size=v['size'], drill=v['drill'],
+                    layers=list(v.get('layers') or ['F.Cu', 'B.Cu']),
+                    net_id=v['net_id'],
+                    # #1842: a via of a span keeps its type (a micro via's
+                    # pairs are its rule's, micro_via_floors)
+                    via_type=v.get('via_type') or 'through') for v in vias]
+    return {'results': [{'new_segments': segs, 'new_vias': new_vias}]}
+
+
+def live_micro_via_rule_dicts(pcb_data, board, tracks, vias, clearance):
+    """:func:`live_micro_via_rule` for a tab whose copper is the engine's
+    track and via DICTS (the fanout and Planes tabs)."""
+    return live_micro_via_rule(pcb_data, board, _dict_results(tracks, vias), clearance)
+
+
+def held_hole_clearance_dicts(pcb_data, board, tracks, vias, clearance):
+    """:func:`held_hole_clearance_live` for a tab whose copper is the
+    engine's track and via DICTS (the fanout tab, #1568; the Planes tab,
+    #1577) rather than routing results."""
+    return held_hole_clearance_live(pcb_data, board, _dict_results(tracks, vias),
+                                    clearance)
+
+
+def update_live_drc_floors(board, *, clearance=None, track_width=None,
+                           via_size=None, via_drill=None,
+                           hole_to_hole=None, edge_clearance=None,
+                           nondefault_clamp_mm=None, log=None,
+                           same_net_pad_clearance=None):
+    """Per-step live DRC floor update -- the GUI twin of the CLI's
+    per-step fix_project_for_output (#160). KiCad holds project settings in
+    memory, so only the design-settings API affects a DRC run right after a
+    step. Two rules, both mirroring the CLI:
+
+    * values only ever RELAX downward (min-merge, like the clearance
+      ledger);
+    * constraints are clamped to the board's ACTUAL minima (the CLI's
+      scan_board_minima step): fine-pitch taps route below the step's
+      nominal width/via floor, and a floor of 0.127 still flags a
+      legitimate 0.089 tap -- 48 of the 51 'violations' in Andy's bitaxe
+      DRC.rpt were this class.
+
+    ``nondefault_clamp_mm`` (#782) additionally clamps every NON-Default net
+    class's clearance down to that value. THE PRESENCE OF A VALUE IS THE SWITCH,
+    exactly as `--clearance` is on the CLI: None means the run honoured the
+    board's classes and they are preserved; a number means the run was given a
+    ceiling, priced every class at min(class, ceiling), and the classes must be
+    lowered to match or KiCad grades correct copper against a class the run never
+    used (#439/#768).
+
+    Pass the CEILING, not the effective clearance. They differ whenever the
+    board's Default sits below the ceiling -- flat_hierarchy is Default 0.2 /
+    Wide 0.4, so an operator ceiling of 0.3 prices Wide at 0.3 while the
+    effective clearance is 0.2. Clamping to 0.2 would ship a class BELOW the
+    value the pass was priced at, which is #768's own shape in the safe
+    direction, and it is still #768's shape.
+
+    RETURNS the list of non-Default clamp change strings (empty when nothing was
+    clamped, which includes every call that passes no ceiling). Returned rather
+    than logged from in here on purpose: the caller decides how to disclose a
+    change to the board's declared spec, and routing that through this
+    function's `log` would have meant handing it a logger the fanout tab
+    deliberately does not pass -- which would have added the generic
+    "floors relaxed" line to every fanout run as a side effect of a clamp fix.
+
+    Best-effort: never raises."""
+    persist_live_tool_records(board, same_net_pad_clearance)
+    _clamped = []
+    try:
+        import pcbnew
+        # mm_to_iu, NOT pcbnew.FromMM: FromMM TRUNCATES (#493). Measured on this
+        # KiCad: FromMM(1.001) = 1000999 where the correct value is 1001000 --
+        # 24 of 2010 swept floor values are 1 nm low, all >= 1mm. Today's floors
+        # are sub-millimetre so nothing on the current corpus is affected, but a
+        # board declaring e.g. a 1.27mm (50 mil) edge clearance would have its
+        # DRC floor stamped 1 nm below what was routed, which is exactly the
+        # phantom-violation class #493 fixed elsewhere.
+        from kicad_parser import mm_to_iu
+        bds = board.GetDesignSettings()
+        # The fab-floor ORIGIN, before anything below lowers a floor -- the
+        # file writers' rule (seed_fab_floor_origin), on the live board. A
+        # no-op when apply_targets_to_board already seeded it this step.
+        try:
+            from fix_kicad_drc_settings import seed_live_fab_floor_origin
+            _fab_origin = seed_live_fab_floor_origin(board)
+        except Exception:
+            _fab_origin = {}
+        _objs = {'min_track_width': [], 'min_via_diameter': [],
+                 'min_via_annular_width': [],
+                 'min_via_drill': []}   # mm, for the disclosure census
+
+        # Actual board minima (copper tracks/vias only). #1843: a track a
+        # rule area's track_width rule binds is graded at the rule
+        _held1843, _unread1843 = live_room_width_test(board)
+        min_w = min_via = min_drill = min_ann = None
+        for t in board.GetTracks():
+            try:
+                if t.Type() == pcbnew.PCB_VIA_T:
+                    # GetFrontWidth() FIRST. On KiCad 10 a bare
+                    # PCB_VIA::GetWidth() trips a wxASSERT ("GetWidth called
+                    # without a layer argument") for EVERY via on the board. It
+                    # does not raise, so the old order hit the assert path
+                    # hundreds of times per call and then fell through to the
+                    # same answer -- pure noise in every headless log.
+                    # NOT the segfault: with this reversed the asserts are gone
+                    # (verified 0 in the log) and a 1-step replay still crashed
+                    # 4 runs in 6. Tidy-up only; see the open crash note.
+                    try:
+                        w = t.GetFrontWidth()
+                    except Exception:
+                        w = t.GetWidth()
+                    d = t.GetDrillValue()
+                    # #1842: a micro via is no statement about the board's via,
+                    # drilled-hole or annular minimums: its ring is held by the
+                    # micro via rule the step writes (micro_via_floors)
+                    _micro = live_via_is_micro(t)
+                    if not _micro:
+                        min_via = w if min_via is None else min(min_via, w)
+                        min_drill = d if min_drill is None else min(min_drill, d)
+                        ann = (w - d) // 2
+                        min_ann = ann if min_ann is None else min(min_ann, ann)
+                    if not _micro:
+                        _objs['min_via_diameter'].append(w / 1e6)
+                    if d and not _micro:
+                        _objs['min_via_drill'].append(d / 1e6)
+                    if w > d and not _micro:
+                        _objs['min_via_annular_width'].append((w - d) / 2e6)
+                else:
+                    w = t.GetWidth()
+                    if _unread1843 or live_track_held(board, t, _held1843):
+                        continue
+                    min_w = w if min_w is None else min(min_w, w)
+                    _objs['min_track_width'].append(w / 1e6)
+            except Exception:
+                continue
+        # The hole-diameter floor spans EVERY hole on the board, pads included,
+        # as the file writer's scan_board_minima reads it: KiCad grades a pad
+        # drill against min_through_hole_diameter too.
+        min_hole = min_drill
+        try:
+            for _fp in board.GetFootprints():
+                for _pad in _fp.Pads():
+                    try:
+                        _ds = _pad.GetDrillSize()
+                        _d = max(_ds.x, _ds.y)
+                    except Exception:
+                        continue
+                    if _d:
+                        min_hole = _d if min_hole is None else min(min_hole, _d)
+        except Exception:
+            pass
+
+        from fix_kicad_drc_settings import (
+            LIVE_RULE_ATTR, DEFAULT_CLASS_CLEARANCE_KEY, live_declared_rules,
+            live_declares_default_class, note_live_declared,
+            note_live_session_rule)
+        _rule_of = {a: k for k, a in LIVE_RULE_ATTR.items()}
+        # What the board DECLARES before this writer touches it. A rule it does
+        # not declare is a MISSING key to the file writer, which writes the
+        # target there outright rather than only-lowering against pcbnew's
+        # factory stand-in (fix_kicad_drc_settings.apply_targets_to_board).
+        _declared = live_declared_rules(board) or {}
+        _class_declared = live_declares_default_class(board)
+
+        def lower(attr, mm, board_min_iu=None):
+            if mm is None and board_min_iu is None:
+                return
+            # The CLI's writeback writes every rule it targets, so it is
+            # declared from here on (fix_kicad_drc_settings.live_declared_rules)
+            # even where only-lower leaves the live value where it was.
+            if attr in _rule_of:
+                note_live_declared(board, (_rule_of[attr],))
+            iu = mm_to_iu(float(mm)) if mm is not None else None
+            if board_min_iu is not None:
+                iu = board_min_iu if iu is None else min(iu, board_min_iu)
+            if getattr(bds, attr) > iu or _rule_of.get(attr) not in _declared:
+                setattr(bds, attr, iu)
+        # #498 parity with fix_project_for_output: cap the board's ABSOLUTE
+        # min-clearance floor at the smallest .kicad_dru layer rule -- the
+        # floor outranks custom rules, so leaving it above a relaxing rule
+        # re-manufactures phantom violations on that rule's layer.
+        _clr_floor = clearance
+        try:
+            from kicad_dru import min_rule_clearance
+            _dru_min = min_rule_clearance(board.GetFileName() or "")
+            if _dru_min is not None and _clr_floor is not None \
+                    and _dru_min < float(_clr_floor):
+                _clr_floor = _dru_min
+        except Exception:
+            pass
+        # #1369: the floor WITHOUT the pad-override cap below, and the rule
+        # the board declared before this writer, for the provenance record.
+        _mc_uncapped = float(_clr_floor) if _clr_floor is not None else None
+        _mc_before = (bds.m_MinClearance / 1e6
+                      if 'min_clearance' in _declared else None)
+        # #530: never above the smallest pad override the run honoured (KiCad
+        # floors an override at min_clearance) -- parity with compute_targets.
+        try:
+            _ovr = board_minima_from_live(board).get('min_pad_clearance_override')
+            if _ovr and _clr_floor is not None and float(_clr_floor) > _ovr:
+                _clr_floor = _ovr
+        except Exception:
+            pass
+        lower('m_MinClearance', _clr_floor)
+        # #1369: a rule lowered for a pad override is recorded as such, so
+        # --escalation board reads the board's own minimum (the file
+        # writeback records the same in the project).
+        from fix_kicad_drc_settings import record_live_pad_override_floor
+        record_live_pad_override_floor(board, _mc_before, _mc_uncapped)
+        lower('m_TrackMinWidth', track_width, min_w)
+        lower('m_ViasMinSize', via_size, min_via)
+        lower('m_MinThroughDrill', via_drill, min_hole)
+        # The annular-ring floor is the board's own smallest ring, as the file
+        # writer's compute_targets sets it -- not one derived from this step's
+        # via size and drill, which a step that laid no such via never drew.
+        lower('m_ViasMinAnnularWidth', None, min_ann)
+        # The repo's via-drill floor (pcbnew has no attribute for it): what the
+        # file writer writes, min(this step's drill, the board's smallest via
+        # drill), held for the session and disclosed with the others.
+        _vdr = [v for v in (via_drill, (min_drill / 1e6) if min_drill else None)
+                if v is not None]
+        if _vdr:
+            note_live_session_rule(board, 'min_via_drill', min(float(v) for v in _vdr))
+        lower('m_HoleToHoleMin', hole_to_hole)
+        # CLI parity (#338/#441): 0.0 edge clearance means "not enforced this
+        # step", NOT "lower the rule to zero". Unlike every other floor here,
+        # copper-to-edge is PINNED UP to the fab minimum (0.20 mm): a board
+        # declaring a sub-fab (or 0) edge rule would otherwise grade clean while
+        # copper runs to the milled edge. Raise to max(routed edge, fab floor);
+        # a board rule already above the fab floor (e.g. 0.5) is preserved.
+        from fix_kicad_drc_settings import fab_edge_floor
+        _edge_pin = max(edge_clearance or 0.0, fab_edge_floor())
+        if _edge_pin > 0:
+            note_live_declared(board, ('min_copper_edge_clearance',))
+            _pin_iu = mm_to_iu(float(_edge_pin))
+            if getattr(bds, 'm_CopperEdgeClearance', 0) < _pin_iu \
+                    or 'min_copper_edge_clearance' not in _declared:
+                bds.m_CopperEdgeClearance = _pin_iu
+        try:
+            _nc = default_netclass(board)
+            if _nc is not None:
+                def _nc_lower(get, set_, mm, board_min_iu=None):
+                    if mm is None and board_min_iu is None:
+                        return
+                    iu = mm_to_iu(float(mm)) if mm is not None else None
+                    if board_min_iu is not None:
+                        iu = board_min_iu if iu is None else min(iu, board_min_iu)
+                    # pcbnew's stock class on a project-less board is not a
+                    # declared one: the file writer creates the class at the
+                    # routed clearance there.
+                    if get() > iu or not _class_declared:
+                        set_(iu)
+                    note_live_declared(board, (DEFAULT_CLASS_CLEARANCE_KEY,))
+                # Clearance only: the class track/via/drill are DRAW defaults
+                # (KiCad loads them SetOpt, not SetMin). Lowering them to the
+                # board's smallest object was the #842 ratchet -- one 0.127
+                # neck made the Default class 0.127 and every later run
+                # routed at it. Parity with fix_kicad_drc_settings.
+                _nc_lower(_nc.GetClearance, _nc.SetClearance, clearance)
+        except Exception:
+            pass
+        # #782: the NON-Default classes. Delegated, never re-implemented -- this
+        # is the same clamp `apply_targets_to_board` applies for the signal /
+        # differential / planes tabs, and a second copy here is the bug class
+        # #736/#747/#775 each fixed once in the placement engine.
+        if nondefault_clamp_mm is not None:
+            try:
+                from fix_kicad_drc_settings import (
+                    clamp_nondefault_netclasses_on_board)
+                _clamped = clamp_nondefault_netclasses_on_board(
+                    board, {'min_clearance': float(nondefault_clamp_mm)})
+            except Exception as _nde:                          # noqa: BLE001
+                _clamped = [f'(non-Default net-class clamp skipped: {_nde})']
+        if log:
+            log("Live DRC floors relaxed to this step's routed values "
+                "(clamped to actual board minima)\n")
+        # FAB FLOOR RELAXED, as the CLI's writeback says it: against the
+        # board's ORIGINAL floors, every step it is still true, counted off the
+        # live copper. print(), not `log` -- every tab's apply phase routes
+        # prints into its log (redirect_prints_to_log), and no caller passes
+        # `log`. Silent when nothing is under its origin. The floors compared
+        # are the ones the board DECLARES, as the CLI compares its project's:
+        # pcbnew's factory values on a project-less board are not a floor
+        # anyone set.
+        # The step's own input is passed too, as the file writer passes its
+        # rules_before: it says whether THIS step lowered a floor or inherited
+        # it, and stands in for a floor the origin does not carry.
+        try:
+            from fix_kicad_drc_settings import (live_fab_floor_disclosure,
+                                                live_declared_fab_floor_rules,
+                                                live_step_rules_before)
+            for _line in live_fab_floor_disclosure(
+                    _fab_origin, live_declared_fab_floor_rules(board), _objs,
+                    rules_before=live_step_rules_before(board)):
+                print(_line)
+        except Exception:
+            pass
+        return _clamped
+    except Exception as e:
+        if log:
+            log(f"(live DRC floor update skipped: {e})\n")
+    finally:
+        # The step's last live writer. #1160: a Default class this step's
+        # automatic descents lowered below what it asked for is recorded and
+        # said, as the file writeback does. Whatever an engine wrote into the
+        # project during the step (the planes engine's #581 record, say) goes
+        # onto the board too, the copy KiCad's save keeps. Then the next origin
+        # seed is the next step's.
+        try:
+            from fix_kicad_drc_settings import (close_live_step,
+                                                record_live_class_clearance_descent)
+            for _line in record_live_class_clearance_descent(board):
+                print(_line)
+            import tool_records
+            tool_records.mirror_project_to_live_board(board)
+            close_live_step(board)
+        except Exception:
+            pass
+    return _clamped
+
+
+def apply_cap_moves_to_live_board(board, pcb_data, moves):
+    """#666's scoped cap move on the LIVE board.
+
+    The GUI twin of route.py's file-mode `write_placed_output(output_file,
+    output_file, moves)` and its pcb_data mirror: the bare-ball rescue shipped
+    an escape via onto a MOVABLE cap with a relocation verified at rescue time,
+    and batch_route posts the move as results_data['pending_cap_moves']
+    because only the applier holds the live board. Each move names a PCBData
+    key (#726: `C5~2` for a duplicated reference), resolved through
+    `live_footprints_by_key`. The footprint is set to (new_x, new_y); its
+    rotation is the cap's own and is set only if it differs. The applied moves
+    are mirrored into `pcb_data` with the CLI's own mirror
+    (`net_rescue.mirror_cap_moves`, idempotent). A part that draws the board
+    outline is not moved (#829, where write_placed_output raises), and a
+    reference the live board lacks is named rather than skipped silently.
+
+    Returns the moves applied (each carrying its `net_names`, the re-weld
+    scope). Never raises: like the CLI's block, a failed move is reported and
+    the apply carries on.
+    """
+    moves = list(moves or [])
+    if not moves:
+        return []
+    try:
+        import pcbnew
+        from kicad_parser import mm_to_iu
+        from net_rescue import mirror_cap_moves
+        print(f"  #666 scoped cap move: relocating {len(moves)} cap(s) off "
+              f"rescue via(s): " + ', '.join(m['reference'] for m in moves))
+        live = live_footprints_by_key(board)
+        applied, skipped = [], []
+        for mv in moves:
+            ref = mv['reference']
+            fp = live.get(ref) or board.FindFootprintByReference(ref)
+            pd = (pcb_data.footprints.get(ref)
+                  if pcb_data is not None else None)
+            if fp is None:
+                skipped.append(f"{ref} (not on the live board)")
+                continue
+            if getattr(pd, 'owns_board_outline', False):
+                skipped.append(f"{ref} (draws the board outline, #829)")
+                continue
+            rot = mv.get('new_rotation')
+            if rot is not None and abs(
+                    (fp.GetOrientationDegrees() - rot + 180.0) % 360.0
+                    - 180.0) > 1e-6:
+                fp.SetOrientationDegrees(rot)
+            # mm_to_iu, never FromMM: FromMM truncates (#493).
+            fp.SetPosition(pcbnew.VECTOR2I(mm_to_iu(mv['new_x']),
+                                           mm_to_iu(mv['new_y'])))
+            applied.append(mv)
+        if skipped:
+            print(f"  #666 scoped cap move: NOT MOVED: {', '.join(skipped)}")
+        if applied:
+            board.SetModified()
+            if pcb_data is not None:
+                mirror_cap_moves(pcb_data, applied)
+        return applied
+    except Exception as e:
+        print(f"  (scoped cap move failed: {e})")
+        return []
+
+
+def run_kicad_oracle_on_live_board(board, net_names, *, clearance,
+                                   track_width, via_size, via_drill,
+                                   grid_step, track_via_clearance=None,
+                                   hole_to_hole_clearance=None,
+                                   layer_clearances=None,
+                                   layers=None, layer_costs=None,
+                                   net_widths_by_name=None,
+                                   progress_callback=None,
+                                   net_clearances_by_name=None,
+                                   board_edge_clearance=None,
+                                   same_net_pad_clearance=None):
+    """Staged-save kicad-oracle recheck against the LIVE pcbnew board.
+
+    The CLI plane fronts (and route.py's plane finalize, #562) finish with
+    oracle_reconnect on their WRITTEN file; kicad-cli's exact fill needs a
+    real file, so the GUI counterpart temp-saves the live board, routes the
+    exact links KiCad reports missing, and applies the returned copper (and
+    stranded-fragment deletions, #508 finding 15) back onto the live board.
+
+    Shared core for the planes tab's post-apply recheck and the signal tab's
+    plane-finalize oracle leg and #666 cap-move re-weld -- one
+    implementation, both fronts. Callers
+    refill zones AFTER this returns (the routed links change the fill).
+    Returns the oracle result dict, or None when skipped (no kicad-cli).
+    Skips quietly on any error: the recheck is an earner, never a blocker.
+
+    `net_clearances_by_name` (#1137) is the engine run's resolved net-class
+    map by net NAME, and `net_widths_by_name` (#1133) its per-net width maps
+    the same way ({'power_net_widths' | 'net_track_widths' |
+    'net_layer_widths': {net name: value}}, kicad_oracle.
+    oracle_net_widths_by_name). Both are handed to the oracle as they are: the
+    staged save numbers its nets afresh (pcbnew writes a KiCad 10 board by
+    net NAME and the parser numbers them by first appearance), and the oracle
+    re-keys them onto it. For the same reason the oracle hands its copper
+    back on the LIVE board's netcodes (`net_ids_by_name` below) before this
+    applies it with SetNetCode.
+
+    `board_edge_clearance` and `same_net_pad_clearance` (#1290) are the
+    engine run's resolved copper-to-edge floor and #581 via clearance, which
+    the CLI's oracle config carries. Omitted (or not > 0), the edge is the
+    live board's own rule and vias may land in same-net pads, as before.
+    """
+    try:
+        import os
+        import tempfile
+        import pcbnew
+        from kicad_parser import mm_to_iu
+        from kicad_oracle import oracle_reconnect, find_kicad_cli
+        import routing_defaults as defaults
+        if find_kicad_cli() is None:
+            return None
+        nets = [n for n in (net_names or []) if n]
+        if not nets:
+            return None
+        from routing_config import GridRouteConfig
+        # #338: the temp save has no sibling .kicad_pro, so oracle_reconnect
+        # cannot resolve the board's copper-to-edge rule itself -- read it
+        # from the live board's design settings (nm -> mm).
+        try:
+            _edge_mm = (board.GetDesignSettings().m_CopperEdgeClearance
+                        or 0) / 1e6
+        except Exception:
+            _edge_mm = 0.0
+        if board_edge_clearance and board_edge_clearance > 0:
+            _edge_mm = board_edge_clearance       # the run's floor (#1290)
+        # #658 (audit finding): this config used to be BARE -- no layers, no
+        # layer_costs, no power_net_widths -- so the weld router here ran at
+        # UNIFORM layer economics while the CLI finalize priced them, and the
+        # #658 forbidden-layer guards inside oracle_reconnect were inert.
+        # Costs are soft, so a weld that MUST cross a plane layer still can.
+        # Omitted values fall back to the dataclass defaults, so an older
+        # caller that passes none behaves exactly as before.
+        # The per-net maps (#658 power-net membership, #1033 widths) are not
+        # put on this config: they travel by NAME (net_widths_by_name, #1133)
+        # and the oracle installs them on each parse of the staged save.
+        _cfg_kw = {}
+        if layers:
+            _cfg_kw['layers'] = list(layers)
+        if layer_costs:
+            _cfg_kw['layer_costs'] = list(layer_costs)
+        if same_net_pad_clearance and same_net_pad_clearance > 0:
+            _cfg_kw['same_net_pad_clearance'] = same_net_pad_clearance
+        ocfg = GridRouteConfig(
+            clearance=clearance, track_width=track_width,
+            via_size=via_size, via_drill=via_drill, grid_step=grid_step,
+            board_edge_clearance=_edge_mm, **_cfg_kw)
+        # #498: the temp save has no sibling .kicad_dru, so the oracle's own
+        # auto-read finds nothing -- install the map explicitly (caller's
+        # resolved map when given, else read the LIVE board's project file).
+        try:
+            from kicad_dru import install_layer_clearances
+            install_layer_clearances(
+                ocfg, layer_clearances,
+                (board.GetFileName() or None) if layer_clearances is None
+                else None, None)
+        except Exception:
+            pass
+        with tempfile.NamedTemporaryFile(suffix='.kicad_pcb',
+                                         delete=False) as f:
+            tmp = f.name
+        # aSkipSettings: the implicit settings save aborts KiCad on worker
+        # threads for pre-KiCad-10 projects (uncaught C++ type_error in the
+        # .kicad_pro merge; see _stage_live_board in swig_gui.py). But the
+        # sibling .kicad_pro it used to write carried the session's LIVE
+        # rules to the oracle's exact-fill refill -- project_from below only
+        # stages the on-disk project, which is missing every clamp
+        # update_live_drc_floors applied in memory (#627). Re-author the
+        # sibling from the live board instead, crash-free.
+        # tool_records.save_board keeps the record on the file (#1906)
+        import tool_records
+        tool_records.save_board(pcbnew.SaveBoard, tmp, board,
+                                aSkipSettings=True)
+        try:
+            from kicad_parser import stage_live_project_rules
+            stage_live_project_rules(tmp, board)
+        except Exception:
+            pass
+        # #490: stage the REAL project's netclasses for the refill, or the
+        # exact-fill link source runs at stock rules.
+        try:
+            _proj_from = board.GetFileName() or None
+        except Exception:
+            _proj_from = None
+        # #1133: the LIVE board's {net name: netcode}, so the copper the
+        # oracle returns is applied (SetNetCode below) on the right nets.
+        _live_ids = {'': 0}
+        for _nm, _ni in board.GetNetInfo().NetsByName().items():
+            _nm = str(_nm)
+            if _nm:
+                _live_ids[_nm] = _ni.GetNetCode()
+        orc = oracle_reconnect(
+            tmp, nets, ocfg,
+            project_from=_proj_from,
+            track_via_clearance=(track_via_clearance
+                                 if track_via_clearance is not None
+                                 else defaults.PLANE_TRACK_VIA_CLEARANCE),
+            hole_to_hole_clearance=(hole_to_hole_clearance
+                                    if hole_to_hole_clearance is not None
+                                    else defaults.HOLE_TO_HOLE_CLEARANCE),
+            progress_callback=progress_callback,
+            net_clearances_by_name=net_clearances_by_name,
+            net_widths_by_name=net_widths_by_name,
+            net_ids_by_name=_live_ids)
+        from copy_board import SIBLING_EXTS as _sib_exts
+        for _p in (tmp,) + tuple(os.path.splitext(tmp)[0] + _e
+                                 for _e in _sib_exts):
+            try:
+                os.unlink(_p)
+            except OSError:
+                pass
+        # #713 item 3: this front never inspected `available`, so an oracle
+        # that COULD NOT RUN was byte-for-byte indistinguishable here from one
+        # that ran and found everything already connected -- both are an empty
+        # results dict and both were silent. Say which, on the GUI's own log,
+        # since the CLI front has said so since #508.
+        if not orc.get('available'):
+            print(f"KiCad-oracle: did NOT run -- "
+                  f"{orc.get('why', 'no reason recorded')}. The zone-aware "
+                  f"completion check behind this apply is UNBACKED; a clean "
+                  f"result here is 'not checked', not 'checked and clean'.")
+        # #508 finding 15: the oracle's stranded-fragment deletions are
+        # stripped from its temp file, but the LIVE board still holds that
+        # copper -- delete it here, BEFORE the adds, so a same-position
+        # emission is never collateral.
+        _orc_rm = ((orc.get('removed_segments') or [])
+                   + (orc.get('removed_vias') or []))
+        if _orc_rm:
+            # Segments counted and width-preferring, as the CLI's fragment
+            # delete (remove_segments_from_content, #1556); vias by position.
+            _n_orc_rm = remove_listed_segments(
+                board, pcbnew, [s for s in _orc_rm if hasattr(s, 'start_x')])
+            _rm_keys = {(round(s.x, 3), round(s.y, 3), s.net_id)
+                        for s in _orc_rm if not hasattr(s, 'start_x')}
+            for item in list(board.GetTracks()) if _rm_keys else ():
+                if item.Type() == pcbnew.PCB_VIA_T and (
+                        round(pcbnew.ToMM(item.GetPosition().x), 3),
+                        round(pcbnew.ToMM(item.GetPosition().y), 3),
+                        item.GetNetCode()) in _rm_keys:
+                    board.RemoveNative(item)
+                    _n_orc_rm += 1
+            if _n_orc_rm:
+                print(f"KiCad-oracle (GUI): deleted {_n_orc_rm} stranded "
+                      f"fragment piece(s) from the live board")
+        for s in orc.get('new_segments') or []:
+            track = pcbnew.PCB_TRACK(board)
+            track.SetStart(pcbnew.VECTOR2I(
+                mm_to_iu(s.start_x), mm_to_iu(s.start_y)))
+            track.SetEnd(pcbnew.VECTOR2I(
+                mm_to_iu(s.end_x), mm_to_iu(s.end_y)))
+            track.SetWidth(mm_to_iu(s.width))
+            track.SetLayer(board.GetLayerID(s.layer))
+            track.SetNetCode(s.net_id)
+            board.Add(track)
+        # #962: the oracle's vias are new copper. One placed in a pad or paste
+        # opening declares Type VII, decided by the same core the CLI fronts
+        # use (fab_notes.via_protection_stamps), against the live board.
+        _orc_vias = orc.get('new_vias') or []
+        if _orc_vias:
+            try:
+                from kicad_parser import build_pcb_data_from_board
+                from fab_notes import (via_protection_stamps, apply_stamps_in_memory,
+                                       print_via_protection_record)
+                _st962, _rec962 = via_protection_stamps(
+                    _orc_vias, [], build_pcb_data_from_board(board))
+                apply_stamps_in_memory(_st962)
+                print_via_protection_record(_rec962, 'KiCad-oracle (GUI)')
+                orc['via_in_pad'] = _rec962
+            except Exception as _e962:
+                print(f"KiCad-oracle (GUI): via protection stamp skipped: {_e962}")
+        for v in _orc_vias:
+            via = pcbnew.PCB_VIA(board)
+            via.SetPosition(pcbnew.VECTOR2I(mm_to_iu(v.x), mm_to_iu(v.y)))
+            via.SetDrill(mm_to_iu(v.drill))
+            via.SetWidth(mm_to_iu(v.size))
+            via.SetNetCode(v.net_id)
+            lys = v.layers or ['F.Cu', 'B.Cu']
+            set_via_layers(via, board.GetLayerID(lys[0]),
+                           board.GetLayerID(lys[-1]),
+                           getattr(v, 'via_type', None))
+            apply_via_protection(via, getattr(v, 'tenting_attrs', None))
+            board.Add(via)
+        if orc.get('links_routed'):
+            print(f"KiCad-oracle (GUI): routed {orc['links_routed']} "
+                  f"missing link(s), applied to the live board")
+        return orc
+    except Exception as e:
+        print(f"KiCad-oracle (GUI) skipped: {e}")
+        return None

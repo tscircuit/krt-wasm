@@ -1,0 +1,359 @@
+# Release Pipeline
+
+This document describes how a new version of KiCad Routing Tools is built, published on GitHub, and submitted to the official KiCad Plugin and Content Manager (PCM) repository.
+
+The release pipeline is mostly automated by `.github/workflows/release.yml`. A maintainer's job is:
+
+1. Run the two pre-release gates: the CLI/GUI parity audit and the obstacle ref-count check.
+2. Bump the version.
+3. Tag and push.
+4. Wait for CI to publish the GitHub Release.
+5. Submit / update the PCM metadata via a merge request to `gitlab.com/kicad/addons/metadata`.
+
+---
+
+## Components involved
+
+| File | Purpose |
+|---|---|
+| `VERSION` | Source of truth for the project version (e.g. `0.15.5`). |
+| `metadata.json` | KiCad PCM package manifest at repo root, one `versions[]` entry per release. CI patches the new entry's `download_*` fields after building. |
+| `check_release_version.py` | Fails fast when `VERSION`, `metadata.json` and the tag disagree; with `--tag`, also the CLI/GUI parity gate. Run before tagging, and as CI's first job. |
+| `package_pcm.py` | Builds one PCM-compatible zip per version, bundling all 4 prebuilt Rust binaries. |
+| `update_metadata.py` | Patches `metadata.json` with sha256 / sizes from `package_pcm.py`'s sidecar. |
+| `.github/workflows/release.yml` | CI: builds Rust binaries, runs `package_pcm.py`, publishes GitHub Release. |
+| `__init__.py` (root) | `_resolve_rust_binary()` picks the right platform binary at plugin startup. |
+| `kicad_routing_plugin/deps_check.py` | First-launch wx dialog that pip-installs missing or too-old Python deps (read from `requirements.txt`) into KiCad's Python. |
+
+---
+
+## Versioning rules
+
+- **`VERSION`**: 2- or 3-part dotted decimal, e.g. `0.15.5`. The KiCad PCM regex `^\d{1,4}(\.\d{1,4}(\.\d{1,6})?)?$` rejects 4-part versions.
+- **`rust_router/Cargo.toml`**: bumped only when the Rust crate itself changes; the release that ships the change sets `VERSION` and `metadata.json` to the same version (the release triple). Python-only releases keep the crate version and bump only `VERSION`'s patch, so `VERSION` can lead `Cargo.toml`: such a release republishes the current crate's binaries, which still match its `Cargo.toml`. The table in `rust_router/README.md` lists which crate each recent release carries.
+- Git tag must be `v<VERSION>`, e.g. `v0.15.5`.
+
+---
+
+## Adding a Python dependency
+
+`requirements.txt` at the repo root is the **single source of truth** for the plugin's Python dependencies, and its `>=` floors are enforced: `startup_checks.requirement_floors()` reads them, and a package older than its floor counts as missing. It's consumed by three things:
+
+1. `install_plugin.py` — pip-installs everything into KiCad's Python during manual install.
+2. `kicad_routing_plugin/deps_check.py` — parses it at plugin startup, checks each package imports and is new enough, and offers a wx pip-install dialog for anything missing or too old (the PCM install path skips pip otherwise).
+3. The routing CLIs (`route.py`, `route_diff.py`, `route_planes.py`, `repair_planes.py`) — `py_router/startup_checks.py` stops them with an install message when a package in `ROUTING_PACKAGES` is missing or too old.
+
+The dependency tables live in `py_router/startup_checks.py`, shared by the CLI gate and the plugin. To add a dependency:
+
+1. Append it to `requirements.txt` with a floor (e.g. `mypkg>=1.2`).
+2. If its import name differs from its pip name (Pillow imports as `PIL`), add it to `IMPORT_TESTS` and `VERSION_MODULES`; otherwise the check runs `import <pip name>`. `IMPORT_TESTS` can also name a submodule the code uses, which catches a broken compiled install better than a bare import (the existing `scipy` and `shapely` entries do).
+3. If routing needs it, add it to `ROUTING_PACKAGES`, which the CLI gate checks. If the plugin can run without it, add it to `OPTIONAL_PACKAGES` in `deps_check.py` with the feature it turns off (as Pillow is). If only standalone scripts use it and it must never load inside KiCad's process, add it to `CLI_ONLY_PACKAGES` instead (as ortools is: its Windows DLLs clash with KiCad's, #1937); the script's own gate checks it.
+
+You do **not** need to update `metadata.json` — Python deps live entirely outside the PCM manifest.
+
+## Cutting a release
+
+### 1. Confirm CLI/GUI parity
+
+The CLI scripts and the `kicad_routing_plugin/` GUI call the same routing
+engine, but a new engine parameter, results-data key, writer argument, or
+changed default has to be threaded through **both** the argparse layer and
+every GUI call site (and file-text `parse_kicad_pcb` fixes must be mirrored in
+`build_pcb_data_from_board`). A release must not ship an engine fix the GUI
+silently drops. Audit every commit since the last-confirmed SHA:
+
+```bash
+LAST=$(awk 'NR==1 {print $1}' .gui-parity-checked)   # the first token is the audited SHA
+git log --oneline $LAST..HEAD
+git diff $LAST..HEAD -- py_router/route.py py_router/route_diff.py py_router/route_planes.py \
+    py_router/repair_planes.py py_router/bga_fanout.py py_placer/place_fanout_clearance.py \
+    py_placer/placement/ py_router/single_ended_routing.py py_router/layer_swap_optimization.py \
+    py_router/stub_layer_switching.py py_router/obstacle_map.py py_router/kicad_parser.py
+git diff $LAST..HEAD -- kicad_routing_plugin/
+```
+
+For each new engine parameter / results key / writer arg / changed default,
+confirm the matching `kicad_routing_plugin/` call site was updated (see the
+parity rules in `CLAUDE.md`). Fix any gap and commit it, then update
+`.gui-parity-checked` to the new HEAD (SHA + date + outcome) and commit that.
+
+`check_release_version.py --tag vX.Y.Z` (step 3) **fails** when any file under
+`py_router/` or `kicad_routing_plugin/` changed after the SHA recorded in
+`.gui-parity-checked`, so this audit is mandatory. Commits touching only other
+paths (docs, tests, the marker itself) do not trip it; `--skip-parity-check`
+turns the failure into a warning. Run it locally: CI's `validate` job checks
+out only the tagged commit, so it cannot diff against the recorded SHA and
+skips the parity half with a warning.
+
+### 2. Confirm obstacle ref-count integrity
+
+The working obstacle map is reference-counted. When a net's cache entry is
+replaced while its footprint is still added to the map, the old object's cells
+are stranded there and the next `prepare()` subtracts the *new* footprint
+instead -- driving shared cells below their true refcount, so real copper stops
+blocking and a later net routes straight through it. That ships as foreign
+Via<->Seg DRC violations on a board that graded clean.
+
+Run the audit on a board that actually reproduces, and read the REAL counts:
+
+```bash
+python3 tests/release/check_obstacle_balance.py --self-test   # gate logic, ms
+python3 tests/release/check_obstacle_balance.py               # the real run, ~6 min
+```
+
+It is **self-contained**: it routes `kicad_files/glasgow_revC.kicad_pcb` and its
+`.kicad_pro` sibling, both in this repo, so it runs on a fresh clone with no
+stress corpus. (`--manifest <redo_commands.sh>` replays a recorded corpus run
+instead, for comparison.) The board is byte-identical to the corpus's
+`boards_unrouted_set1/glasgow_revC.kicad_pcb`; the chain is the recorded
+`runs_set1/glasgow_revC` manifest verbatim, duplicated route step included --
+that step re-reads the sibling `.kicad_pro` floor and changes the routing, so
+it is load-bearing, not redundant.
+
+It enforces four invariants and records two more:
+
+| | invariant | |
+|---|---|---|
+| A | hard ref-counted maps return to base | ENFORCED |
+| B | no unbalanced cache OBJECT | ENFORCED |
+| C | no cells unaccounted for by any net cache | ENFORCED |
+| D | raw add/remove op deltas cancel | RECORDED, not enforced |
+| E | map CONTENT matches the board (#806) | RECORDED here, not enforced |
+| F | a multipoint tap pass leaves no per-route state on its map | ENFORCED |
+
+**F covers what A-D cannot see.** They follow the working map alone and count
+only ref-counted cells, while Phase 3 routes each multipoint net on a per-net
+clone, and a tap pass's own search state -- free vias, terminal allowed-cell
+rects, source/target overrides -- lives in plain sets that no cache object
+carries and that `restore_obstacles_inplace` empties on the working map before
+the end-of-run audit looks. With the ledger armed, `route_multipoint_taps`
+checks every call on whatever map it was handed (the ledger's SCAFFOLD WATCH)
+and prints a `SCAFFOLD LEAK` line for each one that left state behind; F fails
+on any.
+
+**Do not substitute a faster board.** Measured 2026-08-29: `splitflap_driver`
+(8 s) reports every invariant BALANCED with the fix *disabled*, so a gate
+pointed at it passes no matter what. `glasgow_revC` reproduces -- an unbalanced
+cache object and 30510/23699/22244 cells unaccounted, alongside 7 DRC
+violations. The ~6 minute cost is why this is a release gate rather than a
+`run_all` test.
+
+**E** recomputes every cached net from the board and queries the map cell by
+cell, which catches an entry computed before its net was routed and never
+refreshed (A-C see it as balanced). `tests/test_806_diff_pair_working_map.py`
+enforces it at zero on route_diff's pre-sync line; the end-of-run line is only
+recorded here, because route.py's post-passes legitimately move copper after
+the last map consumer ran.
+
+**D is a separate pre-existing leak**, recorded so it stays a change detector
+instead of folklore: `add_segments_list @ phase3_routing.py:try_phase3_ripup`
+is unbalanced with the stub-debris trim OFF too, and *larger* there
+(+19529 cells vs +11326). Enforcing it today would fail every release for a bug
+this gate did not find. When it is fixed, promote it to ENFORCED.
+
+The `.kicad_pro` is required, not decoration: it carries `min_hole_to_hole
+0.25`, the rule the violating via pair breaks. Routing without it resolves a
+looser floor from the stock netclass (#441).
+
+A chain step that exits non-zero **aborts and prints the reason** rather than
+grading a partial log, and a log with no audit output reports `BROKEN GATE`
+rather than passing -- a check that dies before it checks anything must not
+read as a satisfied guard. `--manifest` replays rewrite the recorded paths into
+a workdir and abort if any still point at the recorded run (replaying
+unrewritten overwrites the corpus board -- measured, it cost 7 intermediate
+boards of a graded run).
+
+### 3. Bump and edit metadata
+
+```bash
+# Edit:
+#   VERSION                                  -> new x.y.z
+#   metadata.json                            -> append a versions[] entry for x.y.z (copy the last one),
+#                                               download_url .../releases/download/vx.y.z/KiCadRoutingTools-x.y.z.zip
+#                                               (sha/sizes stay zero; CI patches them)
+#   rust_router/Cargo.toml (only if Rust changed -- then x.y.z is the crate version too)
+#   rust_router/README.md  (only if Rust changed: Version History entry, current version, release note)
+```
+
+Then verify the bump is consistent **before** tagging — this is the same check
+CI runs first, so catch a half-bumped `VERSION`/`metadata.json` here instead of
+~10 minutes into the release build:
+
+```bash
+python3 check_release_version.py --tag v0.15.5
+```
+
+It must print `OK:`. (A `VERSION`-only bump that forgets `metadata.json` is the
+exact mistake that failed the v0.17.0 release.)
+
+### 4. Commit and tag
+
+```bash
+git add -u
+git commit -m "v0.15.5: <short summary>"
+git tag -a v0.15.5 -m "v0.15.5 - <short summary>"
+git push origin main
+git push origin v0.15.5
+```
+
+The tag push triggers `.github/workflows/release.yml`.
+
+### 5. Watch the CI
+
+```bash
+gh run watch $(gh run list --workflow=release.yml --limit 1 --json databaseId -q '.[0].databaseId')
+```
+
+The workflow has four jobs:
+
+1. **`validate`**: runs `check_release_version.py --tag` to gate the release on VERSION/metadata/tag consistency before anything is built (the parity half only warns here; see step 1).
+2. **`build`** (matrix, ~2–3 min each): builds the Rust binary for `linux-x86_64`, `macos-arm64`, `macos-x86_64`, and `windows-x86_64`. The macOS x86_64 build is cross-compiled from the macOS arm64 runner (cheaper / available capacity than `macos-13`).
+3. **`package`** (~1 min): runs `package_pcm.py` to produce one `KiCadRoutingTools-<ver>.zip` bundling all 4 binaries under platform-suffix filenames, then runs `update_metadata.py` to patch the real sha256 / size into `metadata.json`.
+4. **`release`**: creates / updates the GitHub Release at `v<VERSION>` with all 4 raw binaries, the PCM zip, and the patched `metadata.json` attached.
+
+When `release` completes successfully, the public Release URL is:
+
+```
+https://github.com/drandyhaas/KiCadRoutingTools/releases/tag/v<VERSION>
+```
+
+---
+
+## Submitting to the KiCad PCM
+
+The KiCad PCM repository at `gitlab.com/kicad/addons/repository` is **read-only**; it is generated from `gitlab.com/kicad/addons/metadata`. Submissions and updates go to the metadata repo as merge requests.
+
+### One-time prerequisites
+
+1. A GitLab account verified for shared runners (free tier requires identity verification before CI minutes work).
+2. `glab` CLI installed and authenticated:
+
+   ```bash
+   brew install glab
+   glab auth login --hostname gitlab.com   # pick Web auth
+   ```
+
+### First submission
+
+1. **Download the patched `metadata.json`** from the GitHub Release:
+
+   ```bash
+   curl -fsSL -o /tmp/metadata.json \
+     https://github.com/drandyhaas/KiCadRoutingTools/releases/download/v0.15.5/metadata.json
+   ```
+
+   It carries every `versions[]` entry of the repo's `metadata.json`, but only
+   the release's own version has real `download_*` values; the others hold the
+   placeholder zero sha256 and sizes. Delete them before submitting.
+
+2. **Fork** `kicad/addons/metadata` (one time):
+
+   ```bash
+   glab api -X POST 'projects/kicad%2Faddons%2Fmetadata/fork'
+   ```
+
+3. **Clone the fork** and create a feature branch (do not commit to `main`; the validator pipeline rejects pushes to `main`):
+
+   ```bash
+   git clone https://gitlab.com/<your-user>/metadata.git /tmp/kicad-addons-fork
+   cd /tmp/kicad-addons-fork
+   git checkout -b add-com.github.drandyhaas.kicadroutingtools
+   ```
+
+4. **Drop in the package files** at `packages/<identifier>/`:
+
+   ```bash
+   mkdir -p packages/com.github.drandyhaas.kicadroutingtools
+   cp /tmp/metadata.json   packages/com.github.drandyhaas.kicadroutingtools/metadata.json
+   cp <KiCadRoutingTools>/kicad_routing_plugin/icon_64.png packages/com.github.drandyhaas.kicadroutingtools/icon.png
+   ```
+
+5. **Validate locally** (catches the same errors the upstream CI catches):
+
+   ```bash
+   git remote add target https://gitlab.com/kicad/addons/metadata.git
+   git fetch -n target
+   pip install jsonschema pillow munch requests tqdm
+
+   export MERGE_BASE_SHA=$(git merge-base target/main HEAD)
+   export DIFF_FILES=$(git diff --name-status "${MERGE_BASE_SHA}..HEAD")
+   ./ci/validate.sh
+   ```
+
+   Both files should report `Validation passed`. If not, fix locally and re-run before pushing.
+
+6. **Commit and push** to your fork:
+
+   ```bash
+   git add packages/com.github.drandyhaas.kicadroutingtools/
+   git commit -m "Add com.github.drandyhaas.kicadroutingtools v0.15.5"
+   git push -u origin add-com.github.drandyhaas.kicadroutingtools
+   ```
+
+7. **Open the merge request** against the upstream:
+
+   ```bash
+   glab mr create \
+     --repo kicad/addons/metadata \
+     --target-branch main \
+     --source-branch add-com.github.drandyhaas.kicadroutingtools \
+     --remove-source-branch \
+     --title "Add com.github.drandyhaas.kicadroutingtools v0.15.5" \
+     --description "..."
+   ```
+
+8. **Smoke-test the package** end-to-end before maintainers review. The successful `build` CI job on the MR exposes a temporary PCM repository URL. Find it with:
+
+   ```bash
+   PIPE_ID=<the head_pipeline id from the MR>
+   BUILD_JOB=$(glab api projects/<your-fork-id>/pipelines/$PIPE_ID/jobs \
+     | python3 -c "import sys,json; print([j['id'] for j in json.load(sys.stdin) if j['name']=='build'][0])")
+   glab api projects/<your-fork-id>/jobs/$BUILD_JOB/trace | grep "Repository should be available"
+   ```
+
+   The URL looks like `https://gitlab.com/<you>/metadata/-/jobs/<id>/artifacts/raw/artifacts/repository.json`. Add it to KiCad: **Plugin Manager → Manage… → +**, paste the URL, install the package, and verify the plugin loads and works on Pcbnew.
+
+A KiCad maintainer will then review. After it merges, expect up to one day for the package to appear in the public PCM catalogue (the public `kicad/addons/repository` is regenerated on a schedule).
+
+### Updating an existing PCM submission (subsequent releases)
+
+After the initial MR is merged, the metadata file `packages/com.github.drandyhaas.kicadroutingtools/metadata.json` already exists upstream. To add a new version:
+
+1. Build and publish the new GitHub Release as above (steps 1–5 of *Cutting a release*).
+2. In your `kicad-addons-fork` clone, pull upstream and create a new branch:
+
+   ```bash
+   git fetch target
+   git checkout target/main
+   git checkout -b update-kicadroutingtools-v0.15.6
+   ```
+
+3. **Append** the new version object to `versions[]` in `packages/com.github.drandyhaas.kicadroutingtools/metadata.json` (keep older entries — PCM history shows them). Take it from the release's `metadata.json`, whose other entries are placeholders.
+
+4. Validate locally (`./ci/validate.sh`), commit, push, open MR — same as before.
+
+---
+
+## Common pitfalls
+
+- **Duplicate `version` strings in `versions[]`** — PCM rejects two entries with the same version string regardless of their `platforms` arrays. Ship one zip per version that supports multiple platforms via runtime resolver, not one zip per platform.
+- **Inner `metadata.json` with `download_*` fields** — the `metadata.json` *inside* the PCM zip must have exactly one version entry and no `download_*` fields. `package_pcm.py` strips these automatically; don't bypass it.
+- **4-part `VERSION`** (e.g. `0.15.3.1`) — PCM regex rejects this. Use 3-part versions.
+- **GitLab pipeline fails before any job runs** (status `failed`, no jobs, no `started_at`) — the GitLab account isn't identity-verified for shared compute yet. Try <https://gitlab.com/-/identity_verification>. After verifying, retrigger with a force-push (see next item).
+- **MR widget keeps showing the old failed pipeline** — GitLab's MR `head_pipeline` only updates when a new `merge_request_event`-source pipeline runs. Manually creating a pipeline via `POST /projects/<id>/pipeline?ref=...` produces a `push`-source pipeline that does *not* update the MR widget. To get a fresh head_pipeline, force-push the same commit with a new timestamp:
+
+  ```bash
+  git commit --amend --no-edit --date=now
+  git push --force-with-lease origin <branch>
+  ```
+
+- **`schema-v2.json` showing up in your commits** — the local validator overwrites this when running. Always `git checkout target/main -- schema-v2.json` (or stash it) before committing.
+- **macOS x86_64 runners stuck queued** — `macos-13` runners are scarce. The workflow cross-compiles x86_64 from `macos-14` (arm64) instead.
+
+---
+
+## See also
+
+- KiCad addon submission guide: <https://dev-docs.kicad.org/en/addons/>
+- Upstream metadata repo: <https://gitlab.com/kicad/addons/metadata>
+- PCM schema v1: <https://go.kicad.org/pcm/schemas/v1>

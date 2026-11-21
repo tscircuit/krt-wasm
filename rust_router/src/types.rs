@@ -1,7 +1,7 @@
 //! Shared types and constants for the grid router.
 
-use rustc_hash::FxHashSet;
 use std::cmp::Ordering;
+use rustc_hash::FxHashSet;
 
 /// 8 directions for octilinear routing
 pub const DIRECTIONS: [(i32, i32); 8] = [
@@ -17,7 +17,7 @@ pub const DIRECTIONS: [(i32, i32); 8] = [
 
 pub const ORTHO_COST: i32 = 1000;
 pub const DIAG_COST: i32 = 1414; // sqrt(2) * 1000
-pub const DEFAULT_TURN_COST: i32 = 1000; // Default penalty for changing direction (encourages straighter paths)
+pub const DEFAULT_TURN_COST: i32 = 1000;  // Default penalty for changing direction (encourages straighter paths)
 
 /// Pack (gx, gy) into a single u64 for fast hashing
 #[inline]
@@ -25,6 +25,12 @@ pub fn pack_xy(gx: i32, gy: i32) -> u64 {
     let x = (gx as u64) & 0xFFFFFFFF;
     let y = (gy as u64) & 0xFFFFFFFF;
     (x << 32) | y
+}
+
+/// Inverse of pack_xy
+#[inline]
+pub fn unpack_xy(key: u64) -> (i32, i32) {
+    ((key >> 32) as u32 as i32, key as u32 as i32)
 }
 
 /// Grid state: (x, y, layer) packed into a single u64 for fast hashing
@@ -63,9 +69,7 @@ pub struct OpenEntry {
 impl Ord for OpenEntry {
     fn cmp(&self, other: &Self) -> Ordering {
         // Reverse ordering for min-heap (lowest f_score first)
-        other
-            .f_score
-            .cmp(&self.f_score)
+        other.f_score.cmp(&self.f_score)
             .then_with(|| other.counter.cmp(&self.counter))
     }
 }
@@ -81,19 +85,14 @@ impl PartialOrd for OpenEntry {
 pub struct PoseState {
     pub gx: i32,
     pub gy: i32,
-    pub theta_idx: u8, // 0-7, corresponding to DIRECTIONS indices
+    pub theta_idx: u8,  // 0-7, corresponding to DIRECTIONS indices
     pub layer: u8,
 }
 
 impl PoseState {
     #[inline]
     pub fn new(gx: i32, gy: i32, theta_idx: u8, layer: u8) -> Self {
-        Self {
-            gx,
-            gy,
-            theta_idx,
-            layer,
-        }
+        Self { gx, gy, theta_idx, layer }
     }
 
     #[inline]
@@ -113,10 +112,13 @@ impl PoseState {
         DIRECTIONS[self.theta_idx as usize]
     }
 
-    /// Get theta in radians
+    /// Get theta in radians, in the grid's own y-down frame: atan2(dy, dx) of
+    /// `direction()`, so North (0,-1) is -pi/2. The Dubins calculator measures
+    /// headings against raw grid coordinates, so a y-up angle would mirror every
+    /// heading with a vertical component (#1441).
     #[inline]
     pub fn theta_radians(&self) -> f64 {
-        (self.theta_idx as f64) * std::f64::consts::FRAC_PI_4
+        -(self.theta_idx as f64) * std::f64::consts::FRAC_PI_4
     }
 }
 
@@ -140,9 +142,7 @@ impl PartialEq for PoseOpenEntry {
 impl Ord for PoseOpenEntry {
     fn cmp(&self, other: &Self) -> Ordering {
         // Reverse ordering for min-heap (lowest f_score first)
-        other
-            .f_score
-            .cmp(&self.f_score)
+        other.f_score.cmp(&self.f_score)
             .then_with(|| other.counter.cmp(&self.counter))
     }
 }
@@ -183,7 +183,9 @@ impl BlockedCellTracker {
             // Return all cells, sorted for determinism
             let mut keys: Vec<u64> = self.blocked.iter().copied().collect();
             keys.sort_unstable();
-            keys.iter().map(|&key| Self::unpack_key(key)).collect()
+            keys.iter()
+                .map(|&key| Self::unpack_key(key))
+                .collect()
         } else {
             // Evenly sample MAX_BLOCKED_CELLS from sorted keys
             let mut keys: Vec<u64> = self.blocked.iter().copied().collect();
@@ -207,18 +209,11 @@ impl BlockedCellTracker {
         let y = ((key >> 8) & 0xFFFFF) as i32;
         let x = ((key >> 28) & 0xFFFFF) as i32;
         // Sign extension for negative coordinates
-        let x = if x & 0x80000 != 0 {
-            x | !0xFFFFF_i32
-        } else {
-            x
-        };
-        let y = if y & 0x80000 != 0 {
-            y | !0xFFFFF_i32
-        } else {
-            y
-        };
+        let x = if x & 0x80000 != 0 { x | !0xFFFFF_i32 } else { x };
+        let y = if y & 0x80000 != 0 { y | !0xFFFFF_i32 } else { y };
         (x, y, layer)
     }
+
 }
 
 impl Default for BlockedCellTracker {
@@ -228,6 +223,7 @@ impl Default for BlockedCellTracker {
 }
 
 /// Statistics from an A* search for debugging and performance analysis.
+/// (C2: the never-written max_f_score stat was removed.)
 #[derive(Clone, Debug, Default)]
 pub struct RouteStats {
     /// Cells popped from open set and processed (not skipped as duplicates)
@@ -244,14 +240,90 @@ pub struct RouteStats {
     pub path_cost: i32,
     /// Initial heuristic estimate from best source to targets
     pub initial_h: i32,
+    /// Closest approach: min cost-to-go (f - g) over expanded nodes (#529)
+    pub best_h: i32,
+    /// Dynamic-iteration tranches granted beyond the base budget (#529)
+    pub iteration_tranches: u32,
     /// Final g-cost (actual cost to reach goal)
     pub final_g: i32,
-    /// Maximum f-score seen in open set (indicates search spread)
-    pub max_f_score: i32,
     /// Size of open set at termination
     pub open_set_size: u32,
     /// Size of closed set (unique cells visited)
     pub closed_set_size: u32,
     /// Number of via transitions in path
     pub via_count: u32,
+}
+
+/// C1 (issue #387): one search core, several sinks. The grid and pose A*
+/// cores are generic over this trait; each variant's side-band behavior
+/// (stats counting, blocked-frontier tracking, or nothing) is a sink, and
+/// monomorphization compiles the no-op hooks out entirely. This replaces the
+/// four hand-forked copies of the search loop (route_multi vs
+/// route_with_frontier, route_pose vs route_pose_with_frontier, plus the
+/// drifted visual_router fork -- B1 in #386).
+pub trait SearchSink {
+    /// A node was pushed to the open set (including the initial sources).
+    #[inline]
+    fn on_push(&mut self) {}
+    /// A popped node was expanded (not a duplicate skip).
+    #[inline]
+    fn on_expand(&mut self) {}
+    /// A popped node was skipped because it was already closed.
+    #[inline]
+    fn on_duplicate_skip(&mut self) {}
+    /// A relax improved an already-visited node's g.
+    #[inline]
+    fn on_revisit(&mut self) {}
+    /// Expansion into (gx, gy, layer) was vetoed by an obstacle.
+    #[inline]
+    fn on_blocked(&mut self, _gx: i32, _gy: i32, _layer: u8) {}
+}
+
+/// Sink that ignores everything (route_pose, and any caller that wants the
+/// bare search result).
+pub struct NullSink;
+impl SearchSink for NullSink {}
+
+/// Sink that records blocked cells for the failure frontier
+/// (route_with_frontier / route_pose_with_frontier rip-up analysis).
+pub struct FrontierSink {
+    pub tracker: BlockedCellTracker,
+}
+
+impl FrontierSink {
+    pub fn new() -> Self {
+        Self { tracker: BlockedCellTracker::new() }
+    }
+}
+
+impl SearchSink for FrontierSink {
+    #[inline]
+    fn on_blocked(&mut self, gx: i32, gy: i32, layer: u8) {
+        self.tracker.track(gx, gy, layer);
+    }
+}
+
+/// Sink that accumulates RouteStats (route_multi).
+#[derive(Default)]
+pub struct StatsSink {
+    pub stats: RouteStats,
+}
+
+impl SearchSink for StatsSink {
+    #[inline]
+    fn on_push(&mut self) {
+        self.stats.cells_pushed += 1;
+    }
+    #[inline]
+    fn on_expand(&mut self) {
+        self.stats.cells_expanded += 1;
+    }
+    #[inline]
+    fn on_duplicate_skip(&mut self) {
+        self.stats.duplicate_skips += 1;
+    }
+    #[inline]
+    fn on_revisit(&mut self) {
+        self.stats.cells_revisited += 1;
+    }
 }
