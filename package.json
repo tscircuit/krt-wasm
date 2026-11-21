@@ -1,6 +1,6 @@
 {
   "name": "@tscircuit/krt-wasm",
-  "version": "0.1.9",
+  "version": "0.1.10",
   "repository": {
     "type": "git",
     "url": "https://github.com/tscircuit/krt-wasm"
