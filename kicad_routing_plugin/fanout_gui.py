@@ -6,6 +6,7 @@ Provides wx-based panels for BGA and QFN fanout configuration.
 
 import os
 import sys
+import threading
 import wx
 
 # Add parent directory to path
@@ -13,8 +14,38 @@ PLUGIN_DIR = os.path.dirname(os.path.abspath(__file__))
 ROOT_DIR = os.path.dirname(PLUGIN_DIR)
 if ROOT_DIR not in sys.path:
     sys.path.insert(0, ROOT_DIR)
+# #522 layout: the engine modules live in py_router/ under the repo root.
+# The exists() guard keeps a FLAT installed layout (PCM zip) working too.
+_ENGINE_DIR = os.path.join(ROOT_DIR, 'py_router')
+if os.path.isdir(_ENGINE_DIR) and _ENGINE_DIR not in sys.path:
+    sys.path.insert(0, _ENGINE_DIR)
+# py_placer/ holds the placement package (placement.groups / .fanout_clearance
+# are imported from here) and py_tools/ the instruments. Same exists() guard so
+# a FLAT installed layout (PCM zip) keeps working.
+for _sib in ('py_placer', 'py_tools'):
+    _d = os.path.join(ROOT_DIR, _sib)
+    if os.path.isdir(_d) and _d not in sys.path:
+        sys.path.append(_d)
 
 import routing_defaults as defaults
+from kicad_parser import mm_to_iu
+
+#: #742: `bga_fanout.constants.DEFAULT_VIA_SIZE`, the value
+#: `place_fanout_clearance.py --default-via-size` defaults to and
+#: `repair_fanout_clearance`'s signature repeats. NOT
+#: `routing_defaults.VIA_SIZE` -- a fallback SIZE for an unreadable via is a
+#: different quantity from the via geometry this tab places.
+#:
+#: COPIED, not imported, and measured: `from bga_fanout.constants import ...`
+#: costs ~1 s and 62 new top-level modules at dialog load -- numpy, the Rust
+#: `grid_router`, `obstacle_map`, `kicad_writer` -- because that package's
+#: `__init__` is the whole fanout engine. swig_gui and planes_gui import this
+#: module at import time, so every routing dialog would pay it for one float.
+#: This file's own idiom is the lazy `import bga_fanout` further down.
+#: `tests/test_772_ai_plan_cap_params.py` pins the two spellings equal, which
+#: is where a drift detector belongs -- in a test, not in the plugin's
+#: start-up path.
+CAP_DEFAULT_VIA_SIZE = 0.3
 
 
 def _get_net_classes_from_board():
@@ -82,6 +113,122 @@ def _get_net_classes_from_board():
         return {}, ['Default']
 
 
+def live_net_clearances(pcb_data):
+    """{net_id: class clearance} for every net of ``pcb_data`` in a NON-Default
+    class of the LIVE board -- the twin of list_nets.net_clearance_map_by_id,
+    which reads the file. Both fanouts price their escape at these (#1529):
+    mid-plan the file's project is the original, and the live board carries
+    whatever an earlier step wrote back."""
+    from .swig_gui import _get_netclass_parameters
+    net_to_class, class_names = _get_net_classes_from_board()
+    clr = {}
+    for cname in class_names:
+        if cname == 'Default':
+            continue
+        params = _get_netclass_parameters(cname) or {}
+        if isinstance(params.get('clearance'), (int, float)):
+            clr[cname] = float(params['clearance'])
+    out = {}
+    for nid, net in pcb_data.nets.items():
+        cname = net_to_class.get(net.name, 'Default')
+        if cname in clr:
+            out[nid] = clr[cname]
+    return out
+
+
+#: #1067: how `_optimize_decoupling_caps` says it refused to run, which
+#: `run_cap_optimization` reads to skip the post-pass a run would owe.
+CAP_NOT_RUN = "Cap optimization NOT run"
+#: How it says the pass raised -- where place_fanout_clearance.py would exit
+#: non-zero and write no board. Neither summary is a produced result.
+CAP_FAILED = "Cap optimization skipped (error"
+
+
+def cap_optimization_summary(result):
+    """The one-line summary for a repair_fanout_clearance result (#130/#746).
+
+    A module-level function rather than a method body so it can be driven with
+    a plain dict: it needs no board, no dialog and no wx, and before #746 the
+    only way to reach it was a live pcbnew board, so nothing tested it and the
+    wording below went wrong unnoticed.
+
+    Reads every key with `.get` -- the engine's two early returns carry neither
+    'via_moves'/'new_segments' nor 'via_resolved'/'regrazed'.
+
+    #746: `resolved` is graded at the END of the pass, so it spans BOTH
+    mechanisms -- a cap the descent walked clear and a cap only the via-nudge
+    could free. `via_resolved` says which, so this line does too instead of
+    leaving the operator to infer it from the engine's stdout. `regrazed`
+    names the caps that were clean before the nudge and are grazing after it
+    -- the pass broke them, whether or not it had fixed them first. Silence
+    there is the normal case.
+    """
+    moved = len(result.get('placements') or [])
+    nudged = len(result.get('via_moves') or [])
+    unresolved = result.get('unresolved') or []
+    via_resolved = result.get('via_resolved') or []
+    regrazed = result.get('regrazed') or []
+    summary = f"Decoupling caps optimized: {moved} moved"
+    if nudged:
+        summary += f"; {nudged} via(s) nudged with reconnect (#313)"
+    if via_resolved:
+        summary += f"; {len(via_resolved)} cap(s) freed by that nudge"
+    # #1686: unresolved because a via landed below the board's hole-to-hole
+    # floor to free them, not because they graze.
+    below = result.get('below_hole_floor') or []
+    _below_parts = {b.get('part') for b in below}
+    unresolved = [r for r in unresolved if r not in _below_parts]
+    if unresolved:
+        # The verdict has ALWAYS been via + track + pad (the engine's
+        # graze_penalty is via #130 + track #278 + pad #275). This line said
+        # "could not clear a foreign via", naming one of the three: wrong
+        # before #736 and more visibly wrong after it -- not because the
+        # track channel was new (it has been in graze_penalty since the module
+        # landed) but because #736 made the pass's OWN connector tracks
+        # reachable in this verdict for the first time. Worded to match the
+        # engine's own seed disclosure.
+        summary += (f"; {len(unresolved)} still grazing foreign copper "
+                    f"(via/track/pad) "
+                    f"(manual: {', '.join(sorted(unresolved))})")
+    if regrazed:
+        summary += (f"; {len(regrazed)} re-grazed by this pass's own "
+                    f"connector copper: {', '.join(sorted(regrazed))}")
+    # #1563: of the unresolved, the ones still SHORTED (copper in contact).
+    shorted = result.get('shorted') or []
+    if shorted:
+        summary += (f"; {len(shorted)} SHORTED to foreign copper (no pose "
+                    f"apart from it): {', '.join(sorted(shorted))}")
+    # #1681: a mover moved so a stuck part could take a clear pose.
+    room = result.get('made_room') or {}
+    if room:
+        summary += (f"; {len(room)} moved to make room: "
+                    + ', '.join(f"{o} for {r}" for r, o in sorted(room.items())))
+    if below:
+        summary += (f"; {len(below)} via(s) below the board's min_hole_to_hole "
+                    f"to free a part, KiCad fails the pair: "
+                    f"{', '.join(sorted(_below_parts))}")
+    # #1067: only when the step carried an intent (the key is absent else).
+    decap = result.get('decap') or {}
+    decap_broken = sorted(decap.get('broken') or {})
+    if decap_broken:
+        summary += (f"; {len(decap_broken)} broke a decap limit to clear "
+                    f"foreign copper (no clear pose kept it): "
+                    f"{', '.join(decap_broken)}")
+    _cmp = decap.get('compared') or {}
+    if _cmp.get('kept') == 'ungated':
+        _w = (_cmp.get('ungated') or {}).get('worse') or []
+        summary += (f"; the pass WITHOUT the decap gate was kept (it made "
+                    f"{len(_w)} decap claim(s) worse, against "
+                    f"{(_cmp.get('gated') or {}).get('claims_worse')} with "
+                    f"the gate)" + (f": {', '.join(_w)}" if _w else ''))
+    decap_added = (decap.get('grade') or {}).get('added') or []
+    if decap_added:
+        summary += (f"; {len(decap_added)} NEW decap error(s) (intent): "
+                    + ', '.join(f"{a.get('rule')} {a.get('ref')}"
+                                for a in decap_added))
+    return summary
+
+
 class NetSelectionPanel(wx.Panel):
     """Reusable net selection panel with filtering."""
 
@@ -129,6 +276,12 @@ class NetSelectionPanel(wx.Panel):
         self._diff_pairs = {}  # base_name -> (p_net_id, n_net_id) when in diff mode
         self._on_selection_changed = None  # Callback when selection changes
         self._on_tabbed_view_changed = None  # Callback when tabbed view is created/destroyed
+        # Optional: keep electrically-short diff-pair nets visible even when
+        # "Hide differential" is on, so they can be routed single-ended. Set by
+        # the main dialog to wire the Differential tab's "Hide short routes".
+        self._short_nets_provider = None      # () -> set of net_ids
+        self._hide_short_enabled_fn = None    # () -> bool
+        self._short_nets = set()              # net_ids kept visible under hide_diff
 
         # Net class separation
         self._separate_by_netclass = False
@@ -242,10 +395,12 @@ class NetSelectionPanel(wx.Panel):
             return
 
         # Count pads per component
+        # Pins, not paste windows (#1148): the CLI auto-pick counts the same.
+        from kicad_parser import non_aperture_pads
         component_pad_counts = {}
         for footprint in self.pcb_data.footprints.values():
             ref = footprint.reference
-            pad_count = len(footprint.pads)
+            pad_count = len(non_aperture_pads(footprint))
             if pad_count >= self._min_pads_for_dropdown:
                 component_pad_counts[ref] = pad_count
 
@@ -374,18 +529,20 @@ class NetSelectionPanel(wx.Panel):
         if sync_from_visible:
             self._sync_checked_state_from_view()
 
-        # Build set of nets connected to the filtered component
+        # Build set of nets connected to the filtered component. Shared with the
+        # CLI via net_queries (#537) so the same reference cannot select
+        # different nets here than it does in route.py. 'substring' keeps this
+        # box's long-standing behaviour -- a bare "U1" still narrows to U1, U10,
+        # U100 as you type -- while a token carrying * ? or [ is now honoured as
+        # a glob instead of being searched for literally.
         component_nets = set()
         component_net_ids = set()
         if component_filter:
-            for net_id, pads in self.pcb_data.pads_by_net.items():
-                for pad in pads:
-                    if pad.component_ref and component_filter.lower() in pad.component_ref.lower():
-                        net_info = self.pcb_data.nets.get(net_id)
-                        if net_info and net_info.name:
-                            component_nets.add(net_info.name)
-                            component_net_ids.add(net_id)
-                        break
+            from net_queries import nets_for_components
+            _sel = nets_for_components(self.pcb_data, [component_filter],
+                                       match='substring')
+            component_nets = set(_sel.net_names)
+            component_net_ids = set(_sel.net_ids)
 
         # Filter by text and component
         filtered_nets = []
@@ -410,11 +567,29 @@ class NetSelectionPanel(wx.Panel):
         if self._auto_hide_differential and not self._differential_mode:
             hide_diff = True
 
+        # Electrically-short pairs are deferred to single-ended routing, so when
+        # "Hide short routes" is on they stay visible here even under hide_diff.
+        self._short_nets = set()
+        if (hide_diff and not self._differential_mode
+                and self._hide_short_enabled_fn and self._short_nets_provider
+                and self._hide_short_enabled_fn()):
+            try:
+                self._short_nets = self._short_nets_provider() or set()
+            except Exception:
+                self._short_nets = set()
+
         # Populate either single list or tabbed lists
         if self._separate_by_netclass and self._tabbed_net_lists:
             self._populate_tabbed_lists(filtered_nets, hide_checked, hide_diff)
         else:
             self._populate_single_list(filtered_nets, hide_checked, hide_diff)
+
+    def set_short_net_filter(self, short_nets_provider, hide_short_enabled_fn):
+        """Wire the Differential tab's 'Hide short routes': short (deferred) pair
+        nets are kept visible under 'Hide differential' so they route single-ended.
+        short_nets_provider() -> set of net_ids; hide_short_enabled_fn() -> bool."""
+        self._short_nets_provider = short_nets_provider
+        self._hide_short_enabled_fn = hide_short_enabled_fn
 
     def _populate_single_list(self, filtered_nets, hide_checked, hide_diff):
         """Populate the single CheckListBox."""
@@ -424,9 +599,11 @@ class NetSelectionPanel(wx.Panel):
             if hide_checked and self._check_fn and not self._suspend_check:
                 if self._check_fn(net_id):
                     continue
-            # Check if should be hidden (differential)
+            # Check if should be hidden (differential) - but keep short pairs,
+            # which are routed single-ended
             if hide_diff and self._is_differential_net(name):
-                continue
+                if net_id not in self._short_nets:
+                    continue
             idx = self.net_list.Append(name)
             # Restore checked state
             if name in self._checked_nets:
@@ -446,9 +623,11 @@ class NetSelectionPanel(wx.Panel):
             if hide_checked and self._check_fn and not self._suspend_check:
                 if self._check_fn(net_id):
                     continue
-            # Check if should be hidden (differential)
+            # Check if should be hidden (differential) - but keep short pairs,
+            # which are routed single-ended
             if hide_diff and self._is_differential_net(name):
-                continue
+                if net_id not in self._short_nets:
+                    continue
             class_name = self._net_to_class.get(name, 'Default')
             if class_name in nets_by_class:
                 nets_by_class[class_name].append((name, net_id))
@@ -513,11 +692,38 @@ class NetSelectionPanel(wx.Panel):
             self._notify_selection_changed()
 
     def get_selected_nets(self):
-        """Get list of selected net names."""
+        """Get selected net names, in a DETERMINISTIC (sorted) order.
+
+        `_checked_nets` is a set, and `list(set_of_str)` follows Python's
+        per-process randomized string hashing -- so this returned a different
+        ORDER on every launch. The router routes nets in the order it is given,
+        so that made the whole GUI non-deterministic: three runs of the same
+        plan on the same board produced 3425, 3433 and 3431 segments (measured
+        on eth_tap step 11; with PYTHONHASHSEED=0 pinned, two runs were
+        bit-identical). It also made the GUI disagree with the CLI, which
+        passes `expand_net_patterns`' SORTED list -- the same 295 nets in a
+        different order.
+
+        Sorted matches the CLI exactly, so both fronts route in one order.
+        """
         # Sync from the current view
         self._sync_checked_state_from_view()
         # Return all checked nets
-        return list(self._checked_nets)
+        return sorted(self._checked_nets)
+
+    def set_selected_nets(self, net_names):
+        """Pre-check the given net names (only those present in this panel).
+
+        Replaces the current checked state with the intersection of net_names
+        and the nets known to this panel, then refreshes the view.
+
+        Args:
+            net_names: Iterable of net name strings to check.
+        """
+        available = {name for name, _ in self.all_nets}
+        self._checked_nets = {name for name in net_names if name in available}
+        self.refresh(sync_from_visible=False)
+        self._notify_selection_changed()
 
     def refresh(self, sync_from_visible=True):
         """Refresh the net list.
@@ -690,8 +896,68 @@ class NetSelectionPanel(wx.Panel):
         return text.split(' (')[0]
 
 
-class BGAOptionsPanel(wx.Panel):
-    """BGA fanout options panel (parameters not in Basic tab)."""
+class BGAOptionsPanel(wx.ScrolledWindow):
+    """BGA fanout options panel (parameters not in Basic tab).
+
+    A vertical ScrolledWindow: the panel has more sections (escape, options,
+    cap placement) than fit a short dialog, and without scrolling the lower
+    controls were simply unreachable.
+    """
+
+    # wx.Choice index -> engine escape_method value (order matches the dropdown)
+    ESCAPE_METHODS = ('auto', 'channel', 'underpad', 'dogbone')
+
+    #: The "Cap Placement (advanced)" knobs: control attribute -> the value
+    #: the control is CREATED with -- which is ALSO
+    #: place_fanout_clearance.py's argparse default for the same flag and
+    #: repair_fanout_clearance's signature default for the same kwarg
+    #: (--capture-radius / --near-margin / --step / --max-displacement /
+    #: --max-displacement-cap / --displacement-growth /
+    #: --board-edge-clearance / --max-passes / --cap-prefix / --no-rotate).
+    #:
+    #: ONE table, three readers (#772):
+    #:   swig_gui.reset_params_to_defaults      CLAUDE.md's "add it to
+    #:       reset_params_to_defaults ... or the param leaks between
+    #:       steps". EIGHT of these ten had never been in it -- only
+    #:       optimize_caps, cap_allow_rotation and cap_max_passes were.
+    #:   swig_gui.reset_cap_params_to_defaults  the SCOPED reset the plan
+    #:       executor runs before a cap step that names any of them (the
+    #:       per-step reset is skipped for optimize_caps by design).
+    #:   ai_plan._next_step                     reads the NAMES, to decide
+    #:       whether the step named a cap knob at all.
+    #:
+    #: Hand-written next to the _cap_spin calls rather than derived from
+    #: them, so tests/gui_parity/test_772_cap_params_reach_engine.py can
+    #: assert on a FRESHLY CONSTRUCTED panel that every name exists and
+    #: every default matches -- and, separately, that each equals the
+    #: engine signature default. Drift is caught by the gate, not hoped
+    #: away.
+    CAP_PARAM_DEFAULTS = (
+        ('cap_capture_radius', 2.0),
+        ('cap_near_margin', 1.0),
+        ('cap_step', 0.2),
+        ('cap_max_displacement', 2.0),
+        ('cap_max_displacement_cap', 3.0),
+        ('cap_displacement_growth', 1.5),
+        # 0.0 == UNSET, not a margin of zero: get_config maps it to None,
+        # and the engine's resolve_cap_edge_clearance applies the same
+        # non-positive-is-unset rule to an EXPLICIT CLI value, so both
+        # fronts land on the same resolved margin.
+        ('cap_board_edge_clearance', 0.0),
+        ('cap_max_passes', 30),
+        ('cap_prefix', 'C,R,FB'),
+        # #742. bga_fanout.constants.DEFAULT_VIA_SIZE, which is what
+        # place_fanout_clearance.py --default-via-size defaults to. NOT the
+        # Basic tab's via_size (0.5 out of the box) -- see the control.
+        ('cap_default_via_size', CAP_DEFAULT_VIA_SIZE),
+        # #1067: '' == no intent, which is what an omitted --intent means;
+        # the engine signature default is None, and get_config maps one to
+        # the other.
+        ('cap_intent_path', ''),
+        ('cap_allow_rotation', True),
+        # --beneath-only: move only the passives beneath a BGA, only where they stay beneath it
+        ('cap_beneath_only', False),
+    )
 
     def __init__(self, parent, on_differential_changed=None):
         """
@@ -701,7 +967,8 @@ class BGAOptionsPanel(wx.Panel):
             parent: Parent window
             on_differential_changed: Callback(bool) when differential checkbox changes
         """
-        super().__init__(parent)
+        super().__init__(parent, style=wx.VSCROLL)
+        self.SetScrollRate(0, 10)
         self._on_differential_changed_callback = on_differential_changed
         self._create_ui()
 
@@ -734,9 +1001,42 @@ class BGAOptionsPanel(wx.Panel):
 
         self.differential_check = wx.CheckBox(self, label="Differential pairs")
         self.differential_check.SetValue(False)
-        self.differential_check.SetToolTip("Route as differential pairs (uses Pair Gap from Differential tab)")
+        self.differential_check.SetToolTip(
+            "Pick the pairs to fan out from the list, routed as coupled pairs "
+            "at the Coupled pair gap below")
         self.differential_check.Bind(wx.EVT_CHECKBOX, self._on_differential_changed)
         mode_sizer.Add(self.differential_check, 0, wx.ALL, 5)
+
+        # bga_fanout's --diff-pairs / --diff-pair-gap. With the box above
+        # unticked the tab fans out the selected nets and couples the pairs
+        # these patterns name, in the same run -- what `bga_fanout --nets ...
+        # --diff-pairs '*CK*' '*DQS*'` does. Empty = no coupling.
+        pair_grid = wx.FlexGridSizer(cols=2, hgap=10, vgap=5)
+        pair_grid.AddGrowableCol(1)
+        pair_grid.Add(wx.StaticText(self, label="Coupled pairs:"), 0,
+                      wx.ALIGN_CENTER_VERTICAL)
+        self.diff_pair_patterns_ctrl = wx.TextCtrl(self, value="")
+        self.diff_pair_patterns_ctrl.SetToolTip(
+            "Net patterns of the differential pairs to fan out as coupled "
+            "pairs, space separated (e.g. *CK* *DQS*) -- bga_fanout's "
+            "--diff-pairs. Empty = no coupling. Used when 'Differential "
+            "pairs' is unticked.")
+        pair_grid.Add(self.diff_pair_patterns_ctrl, 0, wx.EXPAND)
+        # Its OWN control, never the Differential tab's diff_pair_gap (#493:
+        # that one resolves to the net-class gap). Range as the diff tab's,
+        # four digits because recorded gaps are imperial (0.1143, 0.2032).
+        r = defaults.PARAM_RANGES['diff_pair_gap']
+        pair_grid.Add(wx.StaticText(self, label="Coupled pair gap (mm):"), 0,
+                      wx.ALIGN_CENTER_VERTICAL)
+        self.bga_diff_pair_gap = wx.SpinCtrlDouble(
+            self, min=r['min'], max=r['max'],
+            initial=defaults.BGA_DIFF_PAIR_GAP, inc=0.001)
+        self.bga_diff_pair_gap.SetDigits(4)
+        self.bga_diff_pair_gap.SetToolTip(
+            "Gap between the P and N escapes of a coupled pair (mm) -- "
+            "bga_fanout's --diff-pair-gap")
+        pair_grid.Add(self.bga_diff_pair_gap, 0, wx.EXPAND)
+        mode_sizer.Add(pair_grid, 0, wx.EXPAND | wx.ALL, 5)
 
         main_sizer.Add(mode_sizer, 0, wx.EXPAND | wx.BOTTOM, 5)
 
@@ -770,12 +1070,245 @@ class BGAOptionsPanel(wx.Panel):
         options_sizer.Add(self.check_previous, 0, wx.ALL, 5)
 
         self.no_inner_top = wx.CheckBox(self, label="No inner pads on top layer")
-        self.no_inner_top.SetToolTip("Prevent inner pads from using F.Cu")
+        self.no_inner_top.SetToolTip("Prevent inner pads from using F.Cu. Automatic "
+                                     "when the gap between balls cannot hold the "
+                                     "track at clearance (#1518)")
         options_sizer.Add(self.no_inner_top, 0, wx.LEFT | wx.BOTTOM, 5)
+
+        esc_method_row = wx.BoxSizer(wx.HORIZONTAL)
+        esc_method_row.Add(wx.StaticText(self, label="Escape method:"), 0,
+                           wx.ALIGN_CENTER_VERTICAL | wx.RIGHT, 8)
+        self.escape_method_choice = wx.Choice(
+            self, choices=["Auto (channel, under-pad retry)",
+                           "Channel",
+                           "Under-pad (dense BGA)",
+                           "Dog-bone (gap vias)"])
+        self.escape_method_choice.SetSelection(0)
+        self.escape_method_choice.SetToolTip(
+            "Auto (default): run the channel router and, if it drops any ball, "
+            "retry with the under-pad grid escape and keep whichever escapes "
+            "more (#288). Channel: 45-stub + channel router only. Under-pad: "
+            "each signal vias in its pad and routes under the pad field on "
+            "inner layers - escapes fully-populated arrays the channel router "
+            "can't (#122); use a small via/track for dense pitch (e.g. via "
+            "0.35, track 0.12). Dog-bone: under-pad with each escape via in "
+            "the diagonal inter-ball gap instead of in the pad (#128) - the "
+            "standard hand-layout escape; keeps ball-grid positions free of "
+            "barrels on inner layers and avoids via-vs-neighbour-ball grazes "
+            "on small balls.")
+        esc_method_row.Add(self.escape_method_choice, 1)
+        options_sizer.Add(esc_method_row, 0, wx.EXPAND | wx.LEFT | wx.RIGHT | wx.BOTTOM, 5)
+
+        self.plane_drop = wx.CheckBox(self, label="Drop plane-net balls to vias")
+        self.plane_drop.SetValue(True)
+        self.plane_drop.SetToolTip(
+            "After the signal escape, give every plane-net ball (a net excluded "
+            "from the fanout with >= 6 balls, or one that already owns a zone) "
+            "a via now: a dog-bone via in a free inter-ball gap, else "
+            "via-in-pad. The plane poured later picks the via up at fill, "
+            "instead of the plane step pushing a tap through the finished ball "
+            "field (#360/#424). On by default; matches the CLI --plane-drop.")
+        options_sizer.Add(self.plane_drop, 0, wx.LEFT | wx.BOTTOM, 5)
+
+        # Future-pour declaration (review parity finding 5: --plane-net-layers
+        # was CLI-only, so a manifest-converted plan silently dropped it).
+        # Named after the engine param so the plan executor's generic loop
+        # fills it; empty = None, same as the CLI omitting the flag.
+        pnl_row = wx.BoxSizer(wx.HORIZONTAL)
+        pnl_row.Add(wx.StaticText(self, label="Plane net layers:"), 0,
+                    wx.ALIGN_CENTER_VERTICAL | wx.RIGHT, 8)
+        self.plane_net_layers_ctrl = wx.TextCtrl(self, value="")
+        self.plane_net_layers_ctrl.SetToolTip(
+            "Declare the FUTURE plane plan for the plane-drop decision: for "
+            "each plane net, the layer(s) it will be poured on, "
+            "space-separated NET:LAYER[,LAYER...] specs, e.g. "
+            "'GND:In1.Cu,In4.Cu P3.3V:In2.Cu'. Empty = none declared "
+            "(matches the CLI --plane-net-layers).")
+        pnl_row.Add(self.plane_net_layers_ctrl, 1)
+        options_sizer.Add(pnl_row, 0,
+                          wx.EXPAND | wx.LEFT | wx.RIGHT | wx.BOTTOM, 5)
+
+        # #1521: bga_fanout --immovable-refs. Named after the engine param so
+        # the plan executor's generic loop fills it; empty = None.
+        hold_row = wx.BoxSizer(wx.HORIZONTAL)
+        hold_row.Add(wx.StaticText(self, label="Hold parts:"), 0,
+                     wx.ALIGN_CENTER_VERTICAL | wx.RIGHT, 8)
+        self.immovable_refs = wx.TextCtrl(self, value="")
+        self.immovable_refs.SetToolTip(
+            "References (space or comma separated, e.g. 'C12 R4' or "
+            "'C12, R4'; a part not on the board is refused) of parts the fanout "
+            "keeps its vias and escapes off, as if they were locked. By "
+            "default it may lay copper on an unlocked 2-pad C/R/FB part, "
+            "which the cap placement pass then moves; name a part that pass "
+            "could not clear and re-run the fanout, which then drops a ball "
+            "it cannot escape instead. Empty = none (matches the CLI "
+            "--immovable-refs).")
+        hold_row.Add(self.immovable_refs, 1)
+        options_sizer.Add(hold_row, 0,
+                          wx.EXPAND | wx.LEFT | wx.RIGHT | wx.BOTTOM, 5)
+
+        self.optimize_caps = wx.CheckBox(self, label="Optimize decoupling cap placement")
+        self.optimize_caps.SetValue(False)
+        self.optimize_caps.SetToolTip(
+            "After fanout, nudge decoupling caps near the BGA so their pads "
+            "clear every foreign-net fanout via (and any foreign track on the "
+            "cap's side), and pull each pad toward the nearest same-net ball so "
+            "a power/GND via dropped there later also lands on the cap (#130). "
+            "Caps move as little as possible, never overlap each other, and a "
+            "cap that can't clear is reported. Uses the Basic-tab clearance/via "
+            "settings. Off by default.")
+        options_sizer.Add(self.optimize_caps, 0, wx.LEFT | wx.BOTTOM, 5)
 
         main_sizer.Add(options_sizer, 0, wx.EXPAND)
 
+        # Decoupling-cap placement (advanced) -- knobs for the "Optimize
+        # decoupling cap placement" repair (place_fanout_clearance.py / #130).
+        # Only take effect when that checkbox is on; clearance/grid/via come
+        # from the Basic tab.
+        cap_box = wx.StaticBox(self, label="Cap Placement (advanced)")
+        cap_sizer = wx.StaticBoxSizer(cap_box, wx.VERTICAL)
+        cap_grid = wx.FlexGridSizer(cols=2, hgap=10, vgap=4)
+        cap_grid.AddGrowableCol(1)
+
+        def _cap_spin(label, initial, lo, hi, inc, digits, tip):
+            cap_grid.Add(wx.StaticText(self, label=label), 0, wx.ALIGN_CENTER_VERTICAL)
+            ctrl = wx.SpinCtrlDouble(self, min=lo, max=hi, initial=initial, inc=inc)
+            ctrl.SetDigits(digits)
+            ctrl.SetToolTip(tip)
+            cap_grid.Add(ctrl, 0, wx.EXPAND)
+            return ctrl
+
+        self.cap_capture_radius = _cap_spin(
+            "Capture radius (mm):", 2.0, 0.0, 20.0, 0.5, 2,
+            "How far from a BGA edge a cap is considered for nudging (--capture-radius)")
+        self.cap_near_margin = _cap_spin(
+            "Near margin (mm):", 1.0, 0.0, 10.0, 0.25, 2,
+            "Extra slack pulling a cap pad toward its nearest same-net ball (--near-margin)")
+        self.cap_step = _cap_spin(
+            "Search step (mm):", 0.2, 0.05, 2.0, 0.05, 2,
+            "Displacement search step (--step)")
+        self.cap_max_displacement = _cap_spin(
+            "Max displacement (mm):", 2.0, 0.0, 20.0, 0.5, 2,
+            "Initial cap of how far a cap may move (--max-displacement)")
+        self.cap_max_displacement_cap = _cap_spin(
+            "Max displacement cap (mm):", 3.0, 0.0, 40.0, 0.5, 2,
+            "Hard ceiling the per-pass growth can reach (--max-displacement-cap)")
+        self.cap_displacement_growth = _cap_spin(
+            "Displacement growth:", 1.5, 1.0, 4.0, 0.1, 2,
+            "Per-pass multiplier on the displacement budget (--displacement-growth)")
+        # #742: its OWN key, deliberately not the Basic tab's `via_size`. That
+        # value is three quantities at once on this tab -- the diameter of the
+        # vias fanout PLACES, this fallback, and the via floor
+        # update_live_drc_floors writes back -- and a plan param named
+        # `via_size` would additionally tick the Basic-tab override
+        # (ai_plan._GEOMETRY_OVERRIDE_CHECKS), leaking a floor into every later
+        # step. Same reasoning as --board-edge-clearance in #772.
+        self.cap_default_via_size = _cap_spin(
+            "Default via size (mm):", CAP_DEFAULT_VIA_SIZE, 0.05, 2.0, 0.05, 2,
+            "Fallback via outer diameter for vias whose size can't be read; "
+            "it sets the keep-out radius the cap nudge treats them at "
+            "(--default-via-size)")
+        # #733 follow-up: the cap repair's OWN board-edge margin. It lives HERE,
+        # with the other cap knobs, and NOT on the Basic tab's shared "Min Edge
+        # Clearance" control -- that one is the SIGNAL copper-to-edge keep-out,
+        # a different quantity that happens to share the CLI flag SPELLING
+        # (route.py --board-edge-clearance vs place_fanout_clearance.py
+        # --board-edge-clearance, two independent tools). Driving both from one
+        # control meant ticking the shared override for signal routing at a
+        # normal 0.20-0.25 silently dropped the cap margin from 0.55 to that
+        # value, which is the direction #733 exists to close. The CLI can set
+        # the two independently; so can this panel.
+        self.cap_board_edge_clearance = _cap_spin(
+            "Board edge margin (mm):", 0.0, 0.0, 10.0, 0.05, 2,
+            "Hard clearance from the board edge for MOVED CAPS "
+            "(--board-edge-clearance of place_fanout_clearance.py). "
+            "0 = let the engine resolve it: the board's own "
+            "min_copper_edge_clearance when it asks for MORE than 0.55mm, "
+            "else 0.55mm. This is NOT the Basic tab's Min Edge Clearance, "
+            "which is the signal copper-to-edge keep-out.")
+
+        cap_grid.Add(wx.StaticText(self, label="Max passes:"), 0, wx.ALIGN_CENTER_VERTICAL)
+        self.cap_max_passes = wx.SpinCtrl(self, min=1, max=200, initial=30)
+        self.cap_max_passes.SetToolTip("Maximum refinement passes (--max-passes)")
+        cap_grid.Add(self.cap_max_passes, 0, wx.EXPAND)
+
+        cap_grid.Add(wx.StaticText(self, label="Movable prefix(es):"), 0, wx.ALIGN_CENTER_VERTICAL)
+        self.cap_prefix = wx.TextCtrl(self, value="C,R,FB")
+        self.cap_prefix.SetToolTip("Comma-separated reference prefix(es) for movable "
+                                   "passives near a BGA (--cap-prefix; default "
+                                   "C,R,FB = caps, resistors and ferrite beads; "
+                                   "RN-style arrays auto-excluded "
+                                   "by the 2-copper-pad test)")
+        cap_grid.Add(self.cap_prefix, 0, wx.EXPAND)
+
+        # #1067: place_fanout_clearance.py --intent. Named after the plan
+        # param so ai_plan reaches it, and a TextCtrl because the plan
+        # executor sets a value with SetValue(str).
+        cap_grid.Add(wx.StaticText(self, label="Floorplan intent:"), 0,
+                     wx.ALIGN_CENTER_VERTICAL)
+        intent_sizer = wx.BoxSizer(wx.HORIZONTAL)
+        self.cap_intent_path = wx.TextCtrl(self, value="")
+        self.cap_intent_path.SetMinSize((60, -1))
+        self.cap_intent_path.SetToolTip(
+            "Optional floorplan intent JSON (--intent). Its decap limits "
+            "(decaps.max_distance_mm, decaps.max_pin_distance_mm, graded at "
+            "error) are held while caps move; a cap whose every clear pose "
+            "breaks one clears the foreign copper anyway and the summary "
+            "names it. Its declared rotations are held too: a cap declared "
+            "at one angle is never turned away from it, one with "
+            "rotation_candidates turns only within them (#1122); a held "
+            "cap can leave a graze the free pass would clear, and the "
+            "summary names it. A relative path is read from "
+            "the board's folder. Empty = no intent, and a cap can be moved "
+            "past a decap limit, or turned, silently.")
+        intent_sizer.Add(self.cap_intent_path, 1, wx.EXPAND | wx.RIGHT, 4)
+        self.cap_intent_browse = wx.Button(self, label="…",
+                                           style=wx.BU_EXACTFIT)
+        self.cap_intent_browse.SetToolTip("Browse for a floorplan intent JSON")
+        self.cap_intent_browse.Bind(wx.EVT_BUTTON, self._on_browse_cap_intent)
+        intent_sizer.Add(self.cap_intent_browse, 0)
+        cap_grid.Add(intent_sizer, 0, wx.EXPAND)
+
+        cap_sizer.Add(cap_grid, 0, wx.EXPAND | wx.ALL, 5)
+
+        self.cap_allow_rotation = wx.CheckBox(self, label="Allow cap rotation")
+        self.cap_allow_rotation.SetValue(True)
+        self.cap_allow_rotation.SetToolTip("Allow 90-degree cap rotation to fit (off = --no-rotate)")
+        cap_sizer.Add(self.cap_allow_rotation, 0, wx.LEFT | wx.BOTTOM, 5)
+        self.cap_beneath_only = wx.CheckBox(self, label="Keep caps beneath the BGA")
+        self.cap_beneath_only.SetValue(False)
+        self.cap_beneath_only.SetToolTip(
+            "Move only the passives beneath a BGA's package, and only to poses that keep them "
+            "beneath it; a part beside the package, in the channel the escapes run out into, "
+            "stays where it is (--beneath-only)")
+        cap_sizer.Add(self.cap_beneath_only, 0, wx.LEFT | wx.BOTTOM, 5)
+
+        main_sizer.Add(cap_sizer, 0, wx.EXPAND | wx.TOP, 5)
+
         self.SetSizer(main_sizer)
+
+    def _on_browse_cap_intent(self, event):
+        """Pick the floorplan intent the cap pass holds its decaps to."""
+        with wx.FileDialog(self, "Choose a floorplan intent",
+                           wildcard="Intent JSON (*.json)|*.json|"
+                                    "All files (*.*)|*.*",
+                           style=wx.FD_OPEN | wx.FD_FILE_MUST_EXIST) as dlg:
+            if dlg.ShowModal() == wx.ID_OK:
+                self.cap_intent_path.SetValue(dlg.GetPath())
+
+    def get_escape_method(self) -> str:
+        """The engine escape_method value for the current dropdown selection."""
+        sel = self.escape_method_choice.GetSelection()
+        return self.ESCAPE_METHODS[sel] if 0 <= sel < len(self.ESCAPE_METHODS) else 'auto'
+
+    def set_escape_method(self, value):
+        """Set the dropdown from an engine value ('auto'/'channel'/'underpad').
+
+        Unknown values are ignored (dropdown keeps its current selection).
+        """
+        v = str(value).strip().lower()
+        if v in self.ESCAPE_METHODS:
+            self.escape_method_choice.SetSelection(self.ESCAPE_METHODS.index(v))
 
     def _on_differential_changed(self, event):
         """Handle differential checkbox change."""
@@ -790,34 +1323,81 @@ class BGAOptionsPanel(wx.Panel):
         return {
             'exit_margin': self.exit_margin.GetValue(),
             'differential': is_differential,
-            'diff_pair_patterns': ['*'] if is_differential else [],  # Auto-detect all diff pairs when enabled
+            # Ticked: every auto-detected pair (the pairs come from the list).
+            # Unticked: the Coupled pairs patterns, [] -> None when empty.
+            'diff_pair_patterns': (['*'] if is_differential else
+                                   self.diff_pair_patterns_ctrl.GetValue().split()),
+            'diff_pair_gap': self.bga_diff_pair_gap.GetValue(),
             'primary_escape': 'horizontal' if self.escape_direction.GetSelection() == 0 else 'vertical',
             'force_escape_direction': self.force_escape.GetValue(),
             'rebalance_escape': self.rebalance_escape.GetValue(),
             'check_for_previous': self.check_previous.GetValue(),
             'no_inner_top_layer': self.no_inner_top.GetValue(),
+            # Dropdown: auto (default, channel + under-pad retry, #288) /
+            # channel / underpad - same choices and default as the CLI.
+            'escape_method': self.get_escape_method(),
+            # #424 plane-ball drops; checkbox bool -> engine 'auto'/'off'.
+            'plane_drop': self.plane_drop.GetValue(),
+            # Future-pour declaration: raw NET:LAYER[,LAYER...] spec strings
+            # (space separated), parsed at the call site like the CLI main.
+            'plane_net_layers': self.plane_net_layers_ctrl.GetValue().split()
+                                or None,
+            # #1521: parts held immovable, [] -> None when empty.
+            # #1562: commas separate too, as the CLI reads them (the engine
+            # checks every ref is on the board).
+            'immovable_refs': self.immovable_refs.GetValue().replace(
+                ',', ' ').split() or None,
+            'optimize_caps': self.optimize_caps.GetValue(),
+            # Decoupling-cap placement (advanced) knobs (#130)
+            'cap_capture_radius': self.cap_capture_radius.GetValue(),
+            'cap_near_margin': self.cap_near_margin.GetValue(),
+            'cap_step': self.cap_step.GetValue(),
+            'cap_max_displacement': self.cap_max_displacement.GetValue(),
+            'cap_max_displacement_cap': self.cap_max_displacement_cap.GetValue(),
+            'cap_displacement_growth': self.cap_displacement_growth.GetValue(),
+            # 0 in the spin control is UNSET, not a margin of zero -- None lets
+            # the shared engine resolve it, exactly as an omitted CLI flag does.
+            'cap_board_edge_clearance': (
+                self.cap_board_edge_clearance.GetValue()
+                if self.cap_board_edge_clearance.GetValue() > 1e-9 else None),
+            'cap_max_passes': self.cap_max_passes.GetValue(),
+            'cap_default_via_size': self.cap_default_via_size.GetValue(),
+            'cap_prefix': self.cap_prefix.GetValue().strip() or 'C,R,FB',
+            # #1067: '' = no intent (the engine's None).
+            'cap_intent_path': self.cap_intent_path.GetValue().strip(),
+            'cap_allow_rotation': self.cap_allow_rotation.GetValue(),
+            'cap_beneath_only': self.cap_beneath_only.GetValue(),
         }
 
 
-class QFNOptionsPanel(wx.Panel):
+class QFNOptionsPanel(wx.ScrolledWindow):
     """QFN fanout options panel (parameters not in Basic tab)."""
 
-    def __init__(self, parent):
+    #: Item 0 of the escape-layer choice: qfn_fanout.py with no --layer.
+    MOUNTED_LAYER = "Mounted layer (default)"
+
+    def __init__(self, parent, copper_layers=None):
         """
         Create QFN options panel.
 
         Args:
             parent: Parent window
+            copper_layers: The board's copper layer names, offered as escape
+                layers after the mounted-layer default (F.Cu/B.Cu if None).
         """
-        super().__init__(parent)
+        super().__init__(parent, style=wx.VSCROLL)
+        self.SetScrollRate(0, 10)
+        self._copper_layers = list(copper_layers or ['F.Cu', 'B.Cu'])
         self._create_ui()
 
     def _create_ui(self):
         """Create the panel UI."""
         main_sizer = wx.BoxSizer(wx.VERTICAL)
 
-        # Info text - QFN uses component's layer automatically
-        info_text = wx.StaticText(self, label="QFN fanout routes on the component's layer.\nTrack width comes from Basic tab.")
+        # Info text - QFN uses the component's layer unless told otherwise
+        info_text = wx.StaticText(
+            self, label="QFN fanout routes on the component's mounted layer "
+                        "unless another escape layer is chosen.")
         info_text.Wrap(350)
         main_sizer.Add(info_text, 0, wx.ALL, 10)
 
@@ -827,6 +1407,64 @@ class QFNOptionsPanel(wx.Panel):
 
         grid = wx.FlexGridSizer(cols=2, hgap=10, vgap=5)
         grid.AddGrowableCol(1)
+
+        # qfn_fanout.py --layer. Item 0 is its default (the part's mounted
+        # layer); a plan step's `qfn_layer: "B.Cu"` selects that item by
+        # label. Any layer but the mounted one floats the stubs off the SMD
+        # pads (#96), which the run warns about, as the CLI does.
+        grid.Add(wx.StaticText(self, label="Escape layer:"), 0,
+                 wx.ALIGN_CENTER_VERTICAL)
+        self.qfn_layer = wx.Choice(
+            self, choices=[self.MOUNTED_LAYER] + self._copper_layers)
+        self.qfn_layer.SetSelection(0)
+        self.qfn_layer.SetToolTip(
+            "Layer for the escape stubs (CLI qfn_fanout --layer). Default: "
+            "the layer the part is mounted on. Another layer leaves the stubs "
+            "off the part's SMD pads unless that is intended.")
+        grid.Add(self.qfn_layer, 0, wx.EXPAND)
+
+        # #381 D7: QFN-specific track width & clearance, defaulting to the CLI's
+        # QFN-tuned 0.1/0.1 (qfn_fanout.py --width/--clearance) instead of
+        # inheriting the Basic-tab 0.3/0.25. Fine-pitch QFN/QFP fanouts fail at
+        # 0.3 where they succeed at 0.1. Own controls so QFN doesn't inherit the
+        # BGA/route width and a plan can still set them (ai_plan routes a QFN
+        # fanout step's width/clearance here).
+        rw = defaults.PARAM_RANGES['track_width']
+        grid.Add(wx.StaticText(self, label="Track width (mm):"), 0, wx.ALIGN_CENTER_VERTICAL)
+        self.qfn_track_width = wx.SpinCtrlDouble(self, min=rw['min'], max=rw['max'],
+                                                 initial=defaults.QFN_TRACK_WIDTH, inc=rw['inc'])
+        self.qfn_track_width.SetDigits(rw['digits'])
+        self.qfn_track_width.SetToolTip("QFN fanout track width (CLI qfn_fanout --width, default 0.1)")
+        grid.Add(self.qfn_track_width, 0, wx.EXPAND)
+
+        # #1328: a "checkbox + spinctrl" override row like the Basic tab's
+        # floors. Unchecked (the default) = the board's Default net-class
+        # clearance, qfn_fanout.py's omitted --clearance, resolved by the same
+        # qfn_fanout.resolve_qfn_clearance and capped by the Basic tab's
+        # Clearance ceiling; checked = the typed value (--clearance).
+        rc = defaults.PARAM_RANGES['clearance']
+        grid.Add(wx.StaticText(self, label="Clearance (mm):"), 0, wx.ALIGN_CENTER_VERTICAL)
+        clr_sizer = wx.BoxSizer(wx.HORIZONTAL)
+        self.qfn_clearance_check = wx.CheckBox(self, label="")
+        self.qfn_clearance_check.SetValue(False)
+        self.qfn_clearance_check.SetToolTip(
+            "Override the escape clearance (unchecked = use the board's Default "
+            "net-class clearance, as qfn_fanout.py does without --clearance).")
+        self.qfn_clearance_check.Bind(
+            wx.EVT_CHECKBOX,
+            lambda evt: self.qfn_clearance.Enable(self.qfn_clearance_check.GetValue()))
+        self.qfn_clearance = wx.SpinCtrlDouble(self, min=rc['min'], max=rc['max'],
+                                               initial=defaults.QFN_CLEARANCE, inc=rc['inc'])
+        self.qfn_clearance.SetDigits(rc['digits'])
+        self.qfn_clearance.SetToolTip(
+            "QFN fanout clearance (CLI qfn_fanout --clearance). Used only when "
+            "the box is checked; otherwise the board's Default net-class "
+            "clearance. A pad that cannot escape at it escalates lower when "
+            "the Basic tab's Escalation allows (#1328).")
+        self.qfn_clearance.Enable(False)
+        clr_sizer.Add(self.qfn_clearance_check, 0, wx.ALIGN_CENTER_VERTICAL | wx.RIGHT, 5)
+        clr_sizer.Add(self.qfn_clearance, 1, wx.EXPAND)
+        grid.Add(clr_sizer, 0, wx.EXPAND)
 
         # Extension parameter
         r = defaults.PARAM_RANGES['qfn_extension']
@@ -840,12 +1478,45 @@ class QFNOptionsPanel(wx.Panel):
         param_sizer.Add(grid, 0, wx.EXPAND | wx.ALL, 5)
         main_sizer.Add(param_sizer, 0, wx.EXPAND)
 
+        self.underpad_escape = wx.CheckBox(self, label="Under-pad escape (via-drop)")
+        self.underpad_escape.SetToolTip(
+            "Drop a through-via just past each pad and escape on an inner/back "
+            "layer instead of the surface 45-degree fan (#164). For crowded "
+            "fine-pitch edges where the surface fan has no room (e.g. a diff pair "
+            "boxed in by a neighbour pair and a foreign track). Via size/drill use "
+            "the Basic-tab via settings.")
+        main_sizer.Add(self.underpad_escape, 0, wx.ALL, 8)
+
+        self.allow_via_in_pad = wx.CheckBox(self, label="Allow via-in-pad (stagger inward)")
+        self.allow_via_in_pad.SetToolTip(
+            "Under-pad escape only: let the escape via overlap its OWN pad "
+            "(via-in-pad), so a leg boxed in on the outward side (a neighbour "
+            "pad/track a pitch away) staggers inward toward the chip instead of "
+            "being dropped (#161). It also enables an INWARD search along the "
+            "escape axis that steps by the inter-net stagger, so on a fine-pitch "
+            "part its later rungs land past the pad edge on the chip side, and "
+            "four extra stagger configurations (#846). A via that does overlap "
+            "its pad is clamped to the pad edge (#202) and needs IPC-4761 Type "
+            "VII. The via still must clear other-net pads, vias and tracks.")
+        main_sizer.Add(self.allow_via_in_pad, 0, wx.LEFT | wx.RIGHT | wx.BOTTOM, 8)
+
         self.SetSizer(main_sizer)
 
     def get_config(self):
         """Get the configuration values (QFN-specific only, shared params come from Basic tab)."""
         return {
+            # #381 D7: QFN-tuned width/clearance (own controls) override the
+            # Basic-tab shared values in _run_qfn_fanout. #1328: clearance None
+            # = the box unchecked = the board's Default class (resolved there).
+            'track_width': self.qfn_track_width.GetValue(),
+            'clearance': (self.qfn_clearance.GetValue()
+                          if self.qfn_clearance_check.GetValue() else None),
             'extension': self.extension.GetValue(),
+            'escape_method': 'underpad' if self.underpad_escape.GetValue() else 'stub',
+            'allow_via_in_pad': self.allow_via_in_pad.GetValue(),
+            # None = the part's mounted layer, qfn_fanout.py's omitted --layer.
+            'layer': (self.qfn_layer.GetStringSelection()
+                      if self.qfn_layer.GetSelection() > 0 else None),
         }
 
 
@@ -854,7 +1525,8 @@ class FanoutTab(wx.Panel):
 
     def __init__(self, parent, pcb_data, board_filename,
                  get_shared_params=None, on_fanout_complete=None,
-                 get_connectivity_check=None):
+                 get_connectivity_check=None, sync_pcb_data_callback=None,
+                 append_log=None):
         """
         Create the fanout tab.
 
@@ -873,6 +1545,24 @@ class FanoutTab(wx.Panel):
         self.get_shared_params = get_shared_params
         self.on_fanout_complete = on_fanout_complete
         self.get_connectivity_check = get_connectivity_check
+        # Keeps the dialog's in-memory pcb_data in step with the board after a
+        # fanout applies copper (see _apply_fanout_results).
+        self.sync_pcb_data_callback = sync_pcb_data_callback
+        # Dialog log sink: the fanout engines narrate through print(), and
+        # without this tee that narration reached the terminal but never the
+        # log tab (the route/diff/planes workers already redirected).
+        self.append_log = append_log
+
+        # #621 cancel state. `_cancel_requested` is the flag the plan executor
+        # sets through PlanExecutor.stop() (ai_plan._action_owner already maps
+        # both "fanout" and "optimize_caps" to this tab), and the one the
+        # Cancel button sets directly. `_running` gates the button's dual role
+        # and keeps the event pump from re-entering a run.
+        self._cancel_requested = False
+        self._running = False
+        self._fanout_thread = None
+        self._operation_result = None
+        self._operation_error = None
 
         self._create_ui()
 
@@ -922,7 +1612,8 @@ class FanoutTab(wx.Panel):
 
         # Options panels (stacked, show/hide based on type)
         self.bga_options = BGAOptionsPanel(self, on_differential_changed=self._on_bga_differential_changed)
-        self.qfn_options = QFNOptionsPanel(self)
+        self.qfn_options = QFNOptionsPanel(
+            self, copper_layers=self.pcb_data.board_info.copper_layers)
 
         right_sizer.Add(self.bga_options, 1, wx.EXPAND | wx.BOTTOM, 5)
         right_sizer.Add(self.qfn_options, 1, wx.EXPAND | wx.BOTTOM, 5)
@@ -946,6 +1637,12 @@ class FanoutTab(wx.Panel):
         self.fanout_btn.Bind(wx.EVT_BUTTON, self._on_fanout)
         btn_sizer.Add(self.fanout_btn, 1, wx.RIGHT, 5)
 
+        self.close_btn = wx.Button(self, label="Close")
+        self.close_btn.SetToolTip("Close dialog (or cancel the fanout if one "
+                                  "is running)")
+        self.close_btn.Bind(wx.EVT_BUTTON, self._on_cancel_or_close)
+        btn_sizer.Add(self.close_btn, 1)
+
         right_sizer.Add(btn_sizer, 0, wx.EXPAND)
 
         main_sizer.Add(right_sizer, 1, wx.EXPAND | wx.ALL, 5)
@@ -954,6 +1651,209 @@ class FanoutTab(wx.Panel):
 
         # Initial state
         self._on_type_changed(None)
+
+    def _on_close(self, event):
+        """Close the parent dialog (matches the other tabs' Close button)."""
+        self.GetTopLevelParent().EndModal(wx.ID_CANCEL)
+
+    def _on_cancel_or_close(self, event):
+        """Cancel a running fanout, else close -- the planes tab's idiom.
+
+        #621: the fanout engines now take the same cooperative `cancel_check`
+        as batch_route / create_plane, and the escape runs on a worker thread,
+        so this button has both something to set and a UI thread free to
+        deliver the click.
+        """
+        if self._running:
+            self._cancel_requested = True
+            self.status_text.SetLabel("Cancelling...")
+        else:
+            self.GetTopLevelParent().EndModal(wx.ID_CANCEL)
+
+    def _begin_run(self, label):
+        """Enter the running state: disable Fanout, arm Cancel, clear the flag.
+
+        `fanout_btn` being disabled is ALSO the plan executor's busy signal
+        (ai_plan.py's `_poll_until_idle` watches `fanout_btn.IsEnabled()`), so
+        it must go down before the worker starts and only come back up in
+        `_end_run`, after the results are applied. Re-enabling it any earlier
+        lets the executor start the next step mid-apply -- the hazard the
+        planes tab documents at the same place.
+        """
+        self._running = True
+        self._cancel_requested = False
+        self._operation_result = None
+        self._operation_error = None
+        # One fanout is one independent operation, as on the CLI (a fresh
+        # process): the floor its writeback records is the clearance it ran at
+        # lowered only by what IT escalated to (#1328), never by an earlier
+        # tab's run. The routing, diff and planes tabs reset the same way.
+        import clearance_ledger
+        clearance_ledger.reset()
+        self.fanout_btn.Disable()
+        self.close_btn.SetLabel("Cancel")
+        self.status_text.SetLabel(label)
+        self.progress_bar.Pulse()
+        wx.Yield()
+
+    def _end_run(self):
+        """Leave the running state, whatever the outcome."""
+        self._running = False
+        self._fanout_thread = None
+        self.fanout_btn.Enable()
+        self.close_btn.SetLabel("Close")
+        self.progress_bar.SetValue(0)
+
+    def _fanout_worker(self, kind, footprint, kwargs):
+        """Run the escape engine OFF the UI thread (#621).
+
+        Everything wx-shaped is resolved by the caller before this starts: the
+        worker touches only the engine, `self.pcb_data` (read-only for the
+        duration) and the result slots. It deliberately does NOT apply anything
+        to the board -- pcbnew mutation happens in `_on_operation_complete`, on
+        the UI thread.
+        """
+        from .gui_utils import redirect_prints_to_log
+        # The tee lives INSIDE the worker: `_run_*_fanout` returns as soon as
+        # the thread starts, so a redirect installed on the UI thread would be
+        # restored while the engine was still printing (and sys.stdout is
+        # process-global). Same placement as the planes tab's worker.
+        # `append_log` marshals with wx.CallAfter, so this is thread-safe.
+        try:
+            with redirect_prints_to_log(self.append_log):
+                if kind == 'bga':
+                    import bga_fanout
+                    tracks, vias, vias_to_remove, failed = \
+                        bga_fanout.generate_bga_fanout(
+                            footprint, self.pcb_data, **kwargs)
+                    skipped = list(bga_fanout.LAST_CANCEL_SKIPPED)
+                    misses = list(bga_fanout.LAST_FILTER_MISSES)
+                    interior = []
+                    power_stubs = []
+                    setup_vias = list(bga_fanout.LAST_BOARD_SETUP_VIAS)
+                    hole_rules = list(bga_fanout.LAST_HOLE_RULES)       # #1853
+                    underpad_pads = {}
+                    stub_pads = {}
+                else:
+                    import qfn_fanout
+                    tracks, vias, failed = qfn_fanout.generate_qfn_fanout(
+                        footprint, self.pcb_data, **kwargs)
+                    vias_to_remove = None
+                    skipped = list(qfn_fanout.LAST_CANCEL_SKIPPED)
+                    misses = list(qfn_fanout.LAST_FILTER_MISSES)
+                    interior = list(qfn_fanout.LAST_SKIPPED_INTERIOR)
+                    power_stubs = list(qfn_fanout.LAST_POWER_STUBS_AT_WIDTH)
+                    setup_vias = list(qfn_fanout.LAST_BOARD_SETUP_VIAS)
+                    hole_rules = list(qfn_fanout.LAST_HOLE_RULES)       # #1853
+                    # #1804: the via-drop's pads, as the CLI's JSON_SUMMARY
+                    underpad_pads = qfn_fanout.underpad_pad_counts(
+                        footprint.reference)
+                    # #1834: the surface fan's pads, the same ledger
+                    stub_pads = qfn_fanout.stub_pad_counts(footprint.reference)
+                # #857: the Design rules line bga_fanout.py / qfn_fanout.py
+                # print (the exit code is the CLI's alone).
+                from fab_tiers import finish_design_rules
+                finish_design_rules(None, 0)
+                self._operation_result = {
+                    'tracks': tracks, 'vias': vias, 'failed': failed,
+                    'vias_to_remove': vias_to_remove, 'skipped': skipped,
+                    'filter_misses': misses, 'skipped_interior': interior,
+                    'power_stubs_at_width': power_stubs,
+                    'board_setup_vias': setup_vias, 'hole_rules': hole_rules,
+                    'underpad_pads': underpad_pads, 'stub_pads': stub_pads}
+        except Exception as exc:                                # noqa: BLE001
+            import traceback
+            traceback.print_exc()
+            self._operation_error = exc
+
+    def _poll_operation(self, apply_kw, kind):
+        """Poll for worker completion, mirroring the planes tab's loop."""
+        if self._fanout_thread is not None and self._fanout_thread.is_alive():
+            if self._cancel_requested:
+                self.status_text.SetLabel("Cancelling...")
+            wx.CallLater(100, self._poll_operation, apply_kw, kind)
+        else:
+            self._on_operation_complete(apply_kw, kind)
+
+    def _on_operation_complete(self, apply_kw, kind):
+        """Apply (or report) the worker's result on the UI thread."""
+        try:
+            if self._operation_error is not None:
+                wx.MessageBox(
+                    f"{kind.upper()} fanout failed:\n\n{self._operation_error}",
+                    "Fanout Error", wx.OK | wx.ICON_ERROR)
+                return
+            res = self._operation_result or {}
+            # #621: a cancelled run discards, like the planes tab. The engine
+            # hands back a coherent partial, but half a fanout applied to the
+            # live board is not what pressing Cancel asks for.
+            if self._cancel_requested:
+                self._report_cancelled(
+                    res.get('skipped') or [],
+                    kind='ball' if kind == 'bga' else 'pad net')
+                return
+            # The APPLY phase narrates too -- gui_utils.redirect_prints_to_log
+            # exists because every tab's apply ran after its worker restored
+            # stdout, so its output reached the terminal but never the log tab.
+            from .gui_utils import redirect_prints_to_log
+            with redirect_prints_to_log(self.append_log):
+                self._apply_fanout_results(
+                    res.get('tracks') or [], res.get('vias') or [],
+                    failed_nets=res.get('failed'),
+                    vias_to_remove=res.get('vias_to_remove'),
+                    filter_misses=res.get('filter_misses'),
+                    skipped_interior=res.get('skipped_interior'),
+                    power_stubs_at_width=res.get('power_stubs_at_width'),
+                    board_setup_vias=res.get('board_setup_vias'),
+                    hole_rules=res.get('hole_rules'),
+                    underpad_pads=res.get('underpad_pads'),
+                    stub_pads=res.get('stub_pads'),
+                    **apply_kw)
+            # The plan executor's "this step produced its result" (gui_utils);
+            # the error and cancel returns above produce none.
+            from .gui_utils import mark_plan_step_produced
+            mark_plan_step_produced(self)
+        finally:
+            self._end_run()
+
+    def _make_cancel_check(self):
+        """The engines' zero-arg cooperative cancel predicate (#621).
+
+        The fanout runs SYNCHRONOUSLY on the UI thread (unlike the planes tab,
+        The engine runs on a WORKER thread (`_fanout_worker`), so this is a
+        plain flag read -- the UI thread stays free to deliver the Cancel
+        click, exactly as on the planes tab. It reads a bool written by another
+        thread, which needs no lock: a torn read is impossible for a bool, and
+        the worst case is noticing the cancel one loop head later.
+        """
+        return lambda: self._cancel_requested
+
+    def _report_cancelled(self, skipped, kind='ball'):
+        """Tell the user what a cancelled run did and did NOT measure (#621).
+
+        The untried nets are deliberately NOT presented as escape failures: an
+        unfinished search measured nothing about them, and reading them as
+        failures is what sends someone into a pointless tighter-clearance
+        retry. Nothing is applied to the board -- same policy as the planes
+        tab, whose cancelled runs also discard.
+        """
+        self.status_text.SetLabel("Cancelled")
+        names = sorted(skipped or ())
+        msg = ["Fanout cancelled. Nothing was applied to the board.", ""]
+        if names:
+            shown = ', '.join(names[:20]) + (' ...' if len(names) > 20 else '')
+            msg.append(f"{len(names)} {kind}(s) were never attempted:")
+            msg.append("")
+            msg.append(shown)
+            msg.append("")
+            msg.append("These are NOT escape failures -- the search never ran "
+                       "on them, so they say nothing about clearance. Re-run "
+                       "without cancelling before changing any setting on "
+                       "this evidence.")
+        else:
+            msg.append("The cancel landed before any result was concluded.")
+        wx.MessageBox("\n".join(msg), "Fanout Cancelled",
+                      wx.OK | wx.ICON_INFORMATION)
 
     def _on_type_changed(self, event):
         """Handle fanout type change."""
@@ -973,6 +1873,19 @@ class FanoutTab(wx.Panel):
     def _on_bga_differential_changed(self, is_differential):
         """Handle BGA differential checkbox change - switch net panel mode."""
         self.net_panel.set_differential_mode(is_differential)
+
+    def _fanout_status(self, message):
+        """Status update for a fanout phase.
+
+        Engine-thread progress reaches the UI through gui_utils.ui_thread_status,
+        which marshals off-thread callers with wx.CallAfter and repaints
+        narrowly (no Gauge.Pulse) -- see its docstring for why that matters
+        inside a KiCad action plugin. Guarded: reporting must never break the
+        fanout.
+        """
+        from .gui_utils import ui_thread_status
+        ui_thread_status(getattr(self, 'status_text', None),
+                         getattr(self, 'progress_bar', None), message)
 
     def _on_fanout(self, event):
         """Handle fanout button click."""
@@ -1035,18 +1948,39 @@ class FanoutTab(wx.Panel):
 
     def _run_bga_fanout(self, footprint, net_patterns, config):
         """Run BGA fanout."""
-        self.fanout_btn.Disable()
-        self.status_text.SetLabel("Running BGA fanout...")
-        self.progress_bar.Pulse()
-        wx.Yield()
+        self._begin_run("Running BGA fanout...")
 
         # Get shared parameters from Basic tab (includes layers)
         shared = self.get_shared_params() if self.get_shared_params else {}
+        from fab_tiers import set_fab_tier_from_config
+        set_fab_tier_from_config(shared)
         track_width = shared.get('track_width', defaults.BGA_TRACK_WIDTH)
         clearance = shared.get('clearance', defaults.BGA_CLEARANCE)
         via_size = shared.get('via_size', defaults.BGA_VIA_SIZE)
         via_drill = shared.get('via_drill', defaults.BGA_VIA_DRILL)
+        # #1842: under a micro via span, a via nobody asked for is the Default
+        # class's MICRO via (the CLI's `via_span.resolve_cli`)
+        from via_span import micro_via_for_span, laser_drilled
+        _micro1842 = (micro_via_for_span(self.pcb_data, shared.get('via_span'),
+                                         shared.get('via_span_type'), self.board_filename)
+                      if shared.get('via_from_class') else None)
+        if _micro1842:
+            via_size, via_drill = _micro1842
+        elif shared.get('via_from_class'):
+            # #1676: a via nobody asked for starts at the board's .kicad_dru rules
+            from design_rules import run_via_for_rules
+            via_size, via_drill = run_via_for_rules(None, self.pcb_data, via_size, via_drill)
         layers = shared.get('layers', defaults.DEFAULT_LAYERS)
+        # #861: say where the width came from. A user who typed 3 mil and got
+        # 0.2 mm escapes had the Track Width override box unticked, so the
+        # tab used the board's Default net class (KiCad's stock 0.2 mm).
+        self.append_log(
+            f"Track width {track_width:.4f} mm "
+            + ("from the board's Default net class (Basic tab: tick the Track "
+               "Width box to use the typed value)"
+               if shared.get('track_width_from_class') else
+               "from the Basic tab's Track Width override (fab-floored)")
+            + f"; clearance {clearance:.4f} mm, via {via_size:.4f}/{via_drill:.4f} mm")
 
         if not layers:
             wx.MessageBox(
@@ -1054,91 +1988,338 @@ class FanoutTab(wx.Panel):
                 "No Layers Selected",
                 wx.OK | wx.ICON_WARNING
             )
-            self.fanout_btn.Enable()
-            self.progress_bar.SetValue(0)
+            self._end_run()
             return
 
-        try:
-            from bga_fanout import generate_bga_fanout
+        # Everything wx-shaped is read HERE, on the UI thread; the worker
+        # gets a plain kwargs dict (#621).
+        engine_kw = dict(
+            cancel_check=self._make_cancel_check(),
+            net_filter=net_patterns,
+            diff_pair_patterns=config['diff_pair_patterns'] or None,
+            layers=layers,
+            track_width=track_width,
+            clearance=clearance,
+            # This tab's own Coupled pair gap (bga_diff_pair_gap, default
+            # BGA_DIFF_PAIR_GAP -- bga_fanout's --diff-pair-gap), and still
+            # NEVER shared['diff_pair_gap'] (#493). It used to be the constant
+            # itself; the history of why it is not the diff tab's value:
+            # Two bugs in one line: the fallback named the signal-routing
+            # constant (DIFF_PAIR_GAP 0.101) instead of the fanout one
+            # (BGA_DIFF_PAIR_GAP 0.1) -- every neighbouring param here
+            # correctly uses its BGA_* default -- and the shared lookup
+            # leaked the DIFFERENTIAL tab's _effective_diff_pair_gap() into
+            # fanout, which resolves to the board's Default net-class gap
+            # when its override box is unchecked. On eth_tap that handed the
+            # escape router 0.125 where the CLI's bga_fanout uses 0.1, and
+            # the ball field escaped down different channels (BOOT0 at
+            # x=123.275 vs 122.625, FPGA_I on F.Cu vs In1.Cu) -- which then
+            # cascaded through the whole chain. Same leak class as the
+            # no_bga_zone/max_iterations bleed from the route tab into the
+            # plane step. bga_fanout.py's --diff-pair-gap likewise defaults
+            # to BGA_DIFF_PAIR_GAP and does not consult the net class, so
+            # this is the value the recorded chains were routed at.
+            diff_pair_gap=config.get('diff_pair_gap', defaults.BGA_DIFF_PAIR_GAP),
+            exit_margin=config['exit_margin'],
+            primary_escape=config['primary_escape'],
+            force_escape_direction=config['force_escape_direction'],
+            rebalance_escape=config['rebalance_escape'],
+            via_size=via_size,
+            via_drill=via_drill,
+            # #581: the Basic tab's via-in-pad policy (> 0: under-pad escapes
+            # run dog-bone). bga_fanout's --same-net-pad-clearance; lost from
+            # this dict when #621 moved the call onto the worker thread.
+            same_net_pad_clearance=shared.get('same_net_pad_clearance', -1.0),
+            # #1842: the route tab's Via Span
+            via_span=shared.get('via_span'), via_span_type=shared.get('via_span_type'),
+            check_for_previous=config['check_for_previous'],
+            no_inner_top_layer=config['no_inner_top_layer'],
+            escape_method=config.get('escape_method', 'auto'),
+            # #424 plane-ball drops -- checkbox bool -> engine token, same
+            # default (on/'auto') as the CLI's --plane-drop.
+            plane_drop=('auto' if config.get('plane_drop', True) else 'off'),
+            immovable_refs=config.get('immovable_refs'),        # #1521
+            # Same NET:LAYER[,...] spec parse as bga_fanout's main()
+            # (review parity finding 5: this kwarg was CLI-only).
+            plane_net_layers=(
+                {spec.split(':', 1)[0]: spec.split(':', 1)[1].split(',')
+                 for spec in config['plane_net_layers']
+                 if ':' in spec}
+                if config.get('plane_net_layers') else None),
+            grid_step=shared.get('grid_step', defaults.GRID_STEP),
+            # Shared Basic-tab per-layer costs (issue #288), same values the
+            # route/diff tabs use; None when the control is empty/invalid.
+            layer_costs=shared.get('layer_costs') or None,
+            # #1529: the live board's net classes, capped at the Clearance
+            # ceiling (bga_fanout.py reads the file's, under --clearance-ceiling).
+            net_clearances=live_net_clearances(self.pcb_data),
+            clearance_ceiling=shared.get('clearance_ceiling'),
+            # Per-ball progress into the status line. Safe from the worker:
+            # ui_thread_status marshals off-thread callers with CallAfter.
+            # Only the counted x/N lines reach the status feed -- the
+            # uncounted phase chatter (gridding, staging, ...) is log-only.
+            progress_callback=(lambda c, t, m:
+                               self._fanout_status(f"{m} ({c}/{t})")
+                               if t else None),
+        )
+        apply_kw = dict(
+            fanout_config={
+                'track_width': track_width, 'clearance': clearance,
+                'via_size': via_size, 'via_drill': via_drill,
+                'exit_margin': config.get('exit_margin'),
+                'grid_step': shared.get('grid_step', defaults.GRID_STEP),
+                # Advanced cap-placement knobs (#130) so the inline checkbox
+                # path honours them too, not just defaults.
+                **{k: v for k, v in config.items() if k.startswith('cap_')},
+                # #780: ...and the #768 netclass CEILING, which is NOT a
+                # cap_* key and so is not swept up by the line above.
+                # _optimize_decoupling_caps reads `clearance_ceiling` off
+                # THIS dict, and the standalone path
+                # (run_cap_optimization) has always supplied it from
+                # `shared` -- this one did not, so the INLINE cap pass ran
+                # #768's OMITTED branch whatever the operator typed and
+                # ticked. Measured on the real headless dialog before this
+                # existed: Min Clearance override CHECKED at 0.2 ->
+                # get_shared_params carried clearance_ceiling=0.2 and the
+                # engine still received netclass_ceiling=None.
+                #
+                # `clamp_netclasses` rides along for parity with the
+                # standalone dict, which has carried it since #768.
+                # NOTHING ON THIS TAB READS IT -- grepped: the signal,
+                # differential and planes tabs each consume their own copy
+                # as `clamp_nondefault_netclasses`, and this tab has no
+                # such writeback (#782). It is carried rather than dropped
+                # because it is precisely the argument that writeback will
+                # need, and because the two values coming from different
+                # places is how they came apart here in the first place --
+                # but it is inert today, and an earlier draft of this
+                # comment implied otherwise.
+                # #530: the PLACEMENT ceiling -- place_fanout_clearance.py's
+                # --clearance is a ceiling by contract (#768), so this tab
+                # follows the Min Clearance override alone.
+                'clamp_netclasses': shared.get('placement_clamp_netclasses',
+                                               shared.get('clamp_netclasses', False)),
+                'clearance_ceiling': shared.get('placement_clearance_ceiling',
+                                                shared.get('clearance_ceiling')),
+                # #1529: the ROUTING Clearance ceiling the classes are written
+                # back at (kept without one), as bga_fanout.py's
+                # --clearance-ceiling -- not the placement ceiling above.
+                'class_ceiling': shared.get('clearance_ceiling'),
+                # Shared "Add teardrops" checkbox (#489 section 9).
+                'add_teardrops': shared.get('add_teardrops', False),
+                # #693: shared "Fix DRC settings after routing" checkbox --
+                # the apply path gates its live-floor writeback on this.
+                'fix_drc_settings': shared.get('fix_drc_settings', True),
+                # #581: recorded at the step boundary, as bga_fanout records it.
+                'same_net_pad_clearance': shared.get('same_net_pad_clearance', -1.0),
+                # #1842: a micro span's via is no statement about the board's
+                # via or hole minimums (bga_fanout's main: `_micro_span`)
+                'micro_span': laser_drilled(
+                    self.pcb_data.board_info.copper_layers,
+                    shared.get('via_span'), shared.get('via_span_type')),
+            },
+            optimize_caps=config.get('optimize_caps', False),
+        )
 
-            tracks, vias_to_add, vias_to_remove = generate_bga_fanout(
-                footprint,
-                self.pcb_data,
-                net_filter=net_patterns,
-                diff_pair_patterns=config['diff_pair_patterns'] or None,
-                layers=layers,
-                track_width=track_width,
-                clearance=clearance,
-                diff_pair_gap=shared.get('diff_pair_gap', defaults.DIFF_PAIR_GAP),
-                exit_margin=config['exit_margin'],
-                primary_escape=config['primary_escape'],
-                force_escape_direction=config['force_escape_direction'],
-                rebalance_escape=config['rebalance_escape'],
-                via_size=via_size,
-                via_drill=via_drill,
-                check_for_previous=config['check_for_previous'],
-                no_inner_top_layer=config['no_inner_top_layer'],
-            )
-
-            self._apply_fanout_results(tracks, vias_to_add)
-
-        except Exception as e:
-            import traceback
-            traceback.print_exc()
-            wx.MessageBox(
-                f"BGA fanout failed:\n\n{e}",
-                "Fanout Error",
-                wx.OK | wx.ICON_ERROR
-            )
-        finally:
-            self.fanout_btn.Enable()
-            self.progress_bar.SetValue(0)
+        self._fanout_thread = threading.Thread(
+            target=self._fanout_worker, args=('bga', footprint, engine_kw),
+            daemon=True)
+        self._fanout_thread.start()
+        self._poll_operation(apply_kw, 'bga')
 
     def _run_qfn_fanout(self, footprint, net_patterns, config):
         """Run QFN fanout."""
-        self.fanout_btn.Disable()
-        self.status_text.SetLabel("Running QFN fanout...")
-        self.progress_bar.Pulse()
-        wx.Yield()
+        self._begin_run("Running QFN fanout...")
 
         # Get shared parameters from Basic tab
         shared = self.get_shared_params() if self.get_shared_params else {}
-        track_width = shared.get('track_width', defaults.QFN_TRACK_WIDTH)
+        from fab_tiers import set_fab_tier_from_config
+        # #381 D7: QFN width/clearance come from the QFN panel's own controls,
+        # NOT the Basic-tab 0.3/0.25 that BGA/route use. `config` is the QFN
+        # options config.
+        track_width = config.get('track_width', defaults.QFN_TRACK_WIDTH)
+        # #1328: the panel's clearance override, else the board's Default
+        # class, capped by the Basic tab's Clearance ceiling -- the resolver
+        # qfn_fanout.py's main uses for --clearance / --clearance-ceiling.
+        from qfn_fanout import resolve_qfn_clearance
+        clearance, _clr_lines = resolve_qfn_clearance(
+            config.get('clearance'), shared.get('default_class_clearance'),
+            shared.get('clearance_ceiling'))
+        for _l in _clr_lines:
+            print(f"QFN fanout: {_l}")
+            if self.append_log:
+                self.append_log(f"QFN fanout: {_l}")
+        # #530: the escalation policy's stale-minimum rule must see THIS run's
+        # width and clearance -- the QFN panel's, not the Basic tab's -- or a
+        # stock 0.2 mm board minimum pins 0.1 mm escape stubs up to 0.2
+        # (haasoscope: stubs the fanout on main draws at 0.1). Same request the
+        # CLI's qfn_fanout.py --width feeds set_policy_from_args.
+        set_fab_tier_from_config(dict(shared, track_width=track_width,
+                                      clearance=clearance))
 
         # Get extension from config (QFN-specific parameter)
         extension = config.get('extension', defaults.QFN_EXTENSION)
+        # Under-pad (via-drop) escape uses the Basic-tab via settings (#164)
+        escape_method = config.get('escape_method', 'stub')
+        allow_via_in_pad = config.get('allow_via_in_pad', False)
+        via_size = shared.get('via_size', defaults.BGA_VIA_SIZE)
+        via_drill = shared.get('via_drill', defaults.BGA_VIA_DRILL)
+        # #1842: under a micro via span, a via nobody asked for is the Default
+        # class's MICRO via (the CLI's `via_span.resolve_cli`)
+        from via_span import micro_via_for_span, laser_drilled
+        _micro1842 = (micro_via_for_span(self.pcb_data, shared.get('via_span'),
+                                         shared.get('via_span_type'), self.board_filename)
+                      if shared.get('via_from_class') else None)
+        if _micro1842:
+            via_size, via_drill = _micro1842
+        elif shared.get('via_from_class'):
+            # #1676: a via nobody asked for starts at the board's .kicad_dru rules
+            from design_rules import run_via_for_rules
+            via_size, via_drill = run_via_for_rules(None, self.pcb_data, via_size, via_drill)
 
-        try:
-            from qfn_fanout import generate_qfn_fanout
+        # The panel's escape layer: None = the part's mounted layer (F.Cu for
+        # top, B.Cu for bottom), as qfn_fanout.py resolves an omitted --layer,
+        # through the same function, which also phrases the #96 warning when
+        # the chosen layer is not the mounted one.
+        from qfn_fanout import resolve_escape_layer
+        escape_layer, layer_note, layer_warns = resolve_escape_layer(
+            footprint, config.get('layer'))
+        if layer_warns:
+            print(layer_note)
+            if self.append_log:
+                self.append_log(layer_note.strip())
 
-            # Use the component's layer (F.Cu for top, B.Cu for bottom)
-            component_layer = footprint.layer if hasattr(footprint, 'layer') else 'F.Cu'
+        engine_kw = dict(
+            cancel_check=self._make_cancel_check(),
+            net_filter=net_patterns,
+            layer=escape_layer,
+            track_width=track_width,
+            extension=extension,
+            clearance=clearance,
+            grid_step=shared.get('grid_step', defaults.GRID_STEP),
+            escape_method=escape_method,
+            via_size=via_size,
+            via_drill=via_drill,
+            allow_via_in_pad=allow_via_in_pad,
+            board_edge_clearance=shared.get('board_edge_clearance', 0.0),
+            # #581: the Basic tab's via-in-pad policy, as the BGA path.
+            same_net_pad_clearance=shared.get('same_net_pad_clearance', -1.0),
+            # #1842: the route tab's Via Span
+            via_span=shared.get('via_span'), via_span_type=shared.get('via_span_type'),
+            # #1318: the route tab's power nets (qfn_fanout.py --power-nets).
+            power_nets=shared.get('power_nets'),
+            power_nets_widths=shared.get('power_nets_widths'),
+            # #1529: the live board's net classes, capped at the Clearance
+            # ceiling (qfn_fanout.py reads the file's, under --clearance-ceiling).
+            net_clearances=live_net_clearances(self.pcb_data),
+            clearance_ceiling=shared.get('clearance_ceiling'),
+            # #1795: the via override unticked -- the class via may step
+            # down the underpad ladder (qfn_fanout.py with no --via-size).
+            via_from_class=bool(shared.get('via_from_class')),
+            # See the BGA path: safe from the worker via ui_thread_status.
+            # Only the counted x/N lines reach the status feed -- the
+            # uncounted phase chatter (gridding, staging, ...) is log-only.
+            progress_callback=(lambda c, t, m:
+                               self._fanout_status(f"{m} ({c}/{t})")
+                               if t else None),
+        )
+        apply_kw = dict(
+            fanout_config={
+                'track_width': track_width,
+                'extension': extension,
+                # The floors qfn_fanout's main writes back are this run's
+                # clearance and (when it drew a via) its via size and drill
+                # (fix_kicad_drc_settings.fanout_fix_kwargs). Without them here
+                # the tab wrote no clearance at all where the CLI writes it.
+                'clearance': clearance,
+                'via_size': via_size,
+                'via_drill': via_drill,
+                # #1529: the classes are written back as the escape priced
+                # them -- kept, or capped at this ceiling when it is set.
+                'clearance_ceiling': shared.get('clearance_ceiling'),
+                'class_ceiling': shared.get('clearance_ceiling'),
+                # Shared "Add teardrops" checkbox (#489 section 9).
+                'add_teardrops': shared.get('add_teardrops', False),
+                # #693: shared "Fix DRC settings after routing" checkbox --
+                # the apply path gates its live-floor writeback on this.
+                'fix_drc_settings': shared.get('fix_drc_settings', True),
+                # #581: recorded at the step boundary, as qfn_fanout records it.
+                'same_net_pad_clearance': shared.get('same_net_pad_clearance', -1.0),
+                # #1842: a micro span's via is no statement about the board's
+                # via or hole minimums (qfn_fanout's main: `_micro_span`)
+                'micro_span': laser_drilled(
+                    self.pcb_data.board_info.copper_layers,
+                    shared.get('via_span'), shared.get('via_span_type')),
+                # the part, for the completion message's failure split
+                'footprint_ref': footprint.reference,
+            },
+            fanout_kind='qfn',
+        )
 
-            tracks, vias = generate_qfn_fanout(
-                footprint,
-                self.pcb_data,
-                net_filter=net_patterns,
-                layer=component_layer,
-                track_width=track_width,
-                extension=extension,
-            )
+        self._fanout_thread = threading.Thread(
+            target=self._fanout_worker, args=('qfn', footprint, engine_kw),
+            daemon=True)
+        self._fanout_thread.start()
+        self._poll_operation(apply_kw, 'qfn')
 
-            self._apply_fanout_results(tracks, vias)
+    def _held_hole_clearance(self, board, tracks, vias, clearance):
+        """#1568: :func:`gui_utils.held_hole_clearance_live` for this tab's
+        fanout copper (track and via dicts)."""
+        from .gui_utils import held_hole_clearance_dicts
+        return held_hole_clearance_dicts(self.pcb_data, board, tracks, vias,
+                                         clearance)
 
-        except Exception as e:
-            import traceback
-            traceback.print_exc()
-            wx.MessageBox(
-                f"QFN fanout failed:\n\n{e}",
-                "Fanout Error",
-                wx.OK | wx.ICON_ERROR
-            )
-        finally:
-            self.fanout_btn.Enable()
-            self.progress_bar.SetValue(0)
+    def _apply_fanout_results(self, tracks, vias, failed_nets=None,
+                              fanout_config=None, fanout_kind='bga',
+                              optimize_caps=False, vias_to_remove=None,
+                              filter_misses=None, skipped_interior=None,
+                              power_stubs_at_width=None, board_setup_vias=None,
+                              underpad_pads=None, stub_pads=None, hole_rules=None):
+        """Apply fanout results to the pcbnew board.
 
-    def _apply_fanout_results(self, tracks, vias):
-        """Apply fanout results to the pcbnew board."""
+        Args:
+            tracks: list of track dicts to add
+            vias: list of via dicts to add
+            failed_nets: optional list of net names that couldn't be fanned
+                out (BGA) or whose stub endpoints landed too close to
+                another net's (QFN) - used to build a suggestion block in
+                the completion dialog.
+            fanout_config: optional dict of the parameters used so
+                suggestions can reference the user's actual values.
+            fanout_kind: 'bga' or 'qfn' - selects which suggestion helper
+                to use when displaying parameter advice.
+            vias_to_remove: optional list of via dicts (x, y, net_id) that
+                manage_vias decided are superseded (a route moved to the
+                top layer no longer needs its via). The CLI writer strips
+                them from the file; the GUI must delete them from the live
+                board too (#508 finding 17 -- they were silently discarded).
+            filter_misses: the engine's LAST_FILTER_MISSES (#1641) -- each
+                selected net that had no pad to fan out on this part, and why
+                (a single-pad net, a net with no pad on the part, ...); listed in the
+                completion message, as the CLI lists them in `unmatched`.
+            skipped_interior: the QFN engine's LAST_SKIPPED_INTERIOR (#1717)
+                -- every selected interior pad the stub run's via-drop could
+                not place, listed as the CLI lists them in `skipped_interior`.
+            power_stubs_at_width: the QFN engine's LAST_POWER_STUBS_AT_WIDTH
+                (#1743) -- each escape stub drawn at the track width on a net
+                that reads as power or ground, listed as the CLI lists them
+                in `power_stubs_at_width`, with what widens them.
+            board_setup_vias: the engine's LAST_BOARD_SETUP_VIAS (#1775) --
+                the vias laid below the board's own Board Setup via minimums
+                with "Fix DRC settings" off, listed as the CLI lists them in
+                `board_setup_vias`.
+            hole_rules: the engine's LAST_HOLE_RULES (#1853) -- the
+                .kicad_dru hole_clearance rules the fan-out's copper still
+                breaks (an escape kept below its rule as the last rung),
+                listed as the CLI lists them in `design_rules.hole_rules`.
+            underpad_pads: the QFN engine's per-pad via-drop ledger
+                (`qfn_fanout.underpad_pad_counts`, #1804) -- the pads skipped
+                because each already had its via, and the dropped pads by
+                name, as the CLI's JSON_SUMMARY carries them.
+            stub_pads: the QFN engine's per-pad surface-fan ledger
+                (`qfn_fanout.stub_pad_counts`, #1834) -- the pads skipped
+                because each already had its surface escape.
+        """
         import pcbnew
         from .swig_gui import _build_layer_mappings
 
@@ -1146,6 +2327,8 @@ class FanoutTab(wx.Panel):
         if board is None:
             wx.MessageBox("Board is no longer open", "Error", wx.OK | wx.ICON_ERROR)
             return
+
+        self._fanout_status("Applying fanout copper to the board...")
 
         # Get layer mappings
         name_to_id, _ = _build_layer_mappings()
@@ -1156,18 +2339,36 @@ class FanoutTab(wx.Panel):
         tracks_added = 0
         vias_added = 0
 
+        # Remove superseded existing vias BEFORE the adds (#508 finding 17).
+        if vias_to_remove:
+            _rm_keys = {(round(v['x'], 3), round(v['y'], 3), v.get('net_id'))
+                        for v in vias_to_remove}
+            _n_rm = 0
+            for item in list(board.GetTracks()):
+                if item.Type() != pcbnew.PCB_VIA_T:
+                    continue
+                k = (round(pcbnew.ToMM(item.GetPosition().x), 3),
+                     round(pcbnew.ToMM(item.GetPosition().y), 3),
+                     item.GetNetCode())
+                if k in _rm_keys:
+                    board.RemoveNative(item)
+                    _n_rm += 1
+            if _n_rm:
+                print(f"Removed {_n_rm} superseded fanout via(s) "
+                      f"(top-layer routes, #508)")
+
         # Add tracks
         for track_dict in tracks:
             track = pcbnew.PCB_TRACK(board)
             track.SetStart(pcbnew.VECTOR2I(
-                pcbnew.FromMM(track_dict['start'][0]),
-                pcbnew.FromMM(track_dict['start'][1])
+                mm_to_iu(track_dict['start'][0]),
+                mm_to_iu(track_dict['start'][1])
             ))
             track.SetEnd(pcbnew.VECTOR2I(
-                pcbnew.FromMM(track_dict['end'][0]),
-                pcbnew.FromMM(track_dict['end'][1])
+                mm_to_iu(track_dict['end'][0]),
+                mm_to_iu(track_dict['end'][1])
             ))
-            track.SetWidth(pcbnew.FromMM(track_dict['width']))
+            track.SetWidth(mm_to_iu(track_dict['width']))
             track.SetLayer(get_layer_id(track_dict['layer']))
             track.SetNetCode(track_dict['net_id'])
             board.Add(track)
@@ -1177,22 +2378,162 @@ class FanoutTab(wx.Panel):
         for via_dict in vias:
             via = pcbnew.PCB_VIA(board)
             via.SetPosition(pcbnew.VECTOR2I(
-                pcbnew.FromMM(via_dict['x']),
-                pcbnew.FromMM(via_dict['y'])
+                mm_to_iu(via_dict['x']),
+                mm_to_iu(via_dict['y'])
             ))
-            via.SetWidth(pcbnew.FromMM(via_dict['size']))
-            via.SetDrill(pcbnew.FromMM(via_dict['drill']))
+            via.SetWidth(mm_to_iu(via_dict['size']))
+            via.SetDrill(mm_to_iu(via_dict['drill']))
             via.SetNetCode(via_dict['net_id'])
             if 'layers' in via_dict and len(via_dict['layers']) >= 2:
-                via.SetLayerPair(
-                    get_layer_id(via_dict['layers'][0]),
-                    get_layer_id(via_dict['layers'][1])
-                )
+                from .gui_utils import set_via_layers
+                set_via_layers(via, get_layer_id(via_dict['layers'][0]),
+                               get_layer_id(via_dict['layers'][1]),
+                               via_dict.get('via_type'))
+            # Keep a re-placed via's own tenting/plugging/filling (#489 §8).
+            from .gui_utils import apply_via_protection
+            apply_via_protection(via, via_dict.get('tenting_attrs'))
             board.Add(via)
             vias_added += 1
 
-        # Build connectivity to register new items properly
-        board.BuildConnectivity()
+        # Refill zones, THEN rebuild connectivity (refill_all_zones does both,
+        # in that order). A bare BuildConnectivity here flipped fanout via
+        # netcodes to the stale pours' nets (mez_rx: 42 of 131 vias came back
+        # V3P3/V1P8/GND) -- see refill_all_zones's docstring.
+        self._fanout_status("Refilling zones and rebuilding connectivity...")
+        from .gui_utils import refill_all_zones
+        refill_all_zones(board)
+
+        # Teardrops, if the shared "Add teardrops" checkbox is on (#489 §9). The
+        # CLI writer applies them to the output file; the GUI applies copper into
+        # pcbnew, so it has to set them on the board itself.
+        if (fanout_config or {}).get('add_teardrops'):
+            from .gui_utils import apply_teardrops_to_board
+            apply_teardrops_to_board(board)
+
+        # Optionally tidy decoupling caps around the fresh fanout vias (#130)
+        cap_summary = None
+        if optimize_caps and fanout_kind == 'bga':
+            cap_summary = self._optimize_decoupling_caps(
+                board, pcbnew, fanout_config or {})
+            refill_all_zones(board)   # never bare BuildConnectivity: net flips
+
+        # Sync the dialog's in-memory pcb_data from the board.
+        #
+        # The fanout tab was the ONLY tab that never did this: it added tracks
+        # and vias to the live board but left pcb_data untouched, so every later
+        # step routed against a board model missing all the fanout copper. The
+        # CLI never sees this because it is file-to-file -- each step re-parses
+        # the previous step's output and therefore sees everything.
+        #
+        # Measured on eth_tap: each fanout step's BOARD matched the CLI
+        # bit-exactly, yet by step 11 the GUI laid 3514 segments / 366 vias
+        # against the CLI's 3428 / 334 -- more copper, because the router saw
+        # fewer obstacles. A 2-step chain (route_diff -> route, pcb_data built
+        # fresh) was bit-identical, which is what localized it to the carry
+        # rather than to the router.
+        self._fanout_status("Syncing board data...")
+        if self.sync_pcb_data_callback:
+            self.sync_pcb_data_callback()
+
+        # Per-step live DRC floors (GUI twin of bga_fanout's per-step
+        # fix_project_for_output). The fanout tab had NO counterpart at all, so
+        # a plan whose first steps are fanouts left the Default class at stock
+        # values while the CLI had already tightened it: on eth_tap the CLI was
+        # at clearance 0.09 / via 0.25-0.15 after step 1, the GUI still at
+        # 0.125 / 0.5-0.25 after step 9. Later steps resolve their geometry
+        # from that class, so the fronts diverge from there.
+        _fcfg = fanout_config or {}
+        # The floors bga_fanout's / qfn_fanout's main writes, from the ONE
+        # decision both fronts read (fix_kicad_drc_settings.fanout_fix_kwargs):
+        # #1195 -- a QFN run with no copper writes none, one with no via leaves
+        # the via and hole floors alone -- and the routed clearance (which also
+        # sets the copper-to-hole floor), the classes (kept, or capped at the
+        # routing Clearance ceiling, #1529), no
+        # hole-to-hole and no edge setting beyond the fab pin. This tab used to
+        # write its own set: hole-to-hole and edge from the config, never the
+        # copper-to-hole floor, classes only under the ceiling.
+        import clearance_ledger as _cl
+        from fix_kicad_drc_settings import fanout_fix_kwargs
+        _fclr = _fcfg.get('clearance')
+        _fix_kw = fanout_fix_kwargs(
+            fanout_kind, tracks, vias,
+            clearance=_cl.effective(_fclr) if _fclr is not None else None,
+            track_width=_fcfg.get('track_width'),
+            # #1842: under a micro span the via floors are left alone, as
+            # bga_fanout's / qfn_fanout's mains pass None there: the step's
+            # via is the class's MICRO via, held by the micro via rule
+            # (live_micro_via_rule_dicts below), not the through-via floors.
+            via_size=None if _fcfg.get('micro_span') else _fcfg.get('via_size'),
+            via_drill=None if _fcfg.get('micro_span') else _fcfg.get('via_drill'),
+            # #1529: the classes kept, or capped at the routing ceiling
+            clearance_ceiling=_fcfg.get('class_ceiling'))
+        if _fix_kw is not None:
+            # #1568: the copper-to-hole floor this step HELD, lowered only to
+            # what its own copper needs -- the CLI fanouts' step_hole_clearance
+            _fix_kw['hole_clearance'] = self._held_hole_clearance(
+                board, tracks, vias, _fix_kw['clearance'])
+        # #693: gated on the shared "Fix DRC settings after routing" checkbox.
+        # This tab is the one whose shared params did not even CARRY the flag,
+        # so the gate and the flag were added together -- see the
+        # get_shared_params() that feeds FanoutTab in swig_gui.
+        if _fcfg.get('fix_drc_settings', True) and _fix_kw is not None:
+            try:
+                from fix_kicad_drc_settings import apply_fix_to_board
+                from .gui_utils import (board_minima_from_live,
+                                        update_live_drc_floors,
+                                        live_micro_via_rule_dicts)
+                # #1842: the micro vias' own rule, as fix_project_for_output writes it
+                live_micro_via_rule_dicts(self.pcb_data, board, tracks, vias,
+                                          _fix_kw['clearance'])
+                apply_fix_to_board(board, minima=board_minima_from_live(board),
+                                   **_fix_kw)
+                # The step's last live writer: the protected / pour-served
+                # records (#521, #678), the cap pass's class clamp below and
+                # the FAB FLOOR disclosure. Its floors are already written.
+                _nd_changes = update_live_drc_floors(
+                    board,
+                    same_net_pad_clearance=_fcfg.get('same_net_pad_clearance'),
+                    # #782: the writeback half of #768's GIVEN branch. This tab
+                    # priced every class at min(class, ceiling) and then lowered
+                    # NONE of them, so a Wide-class pair priced at 0.2 was graded
+                    # by KiCad at the still-0.4 class -- violations on copper the
+                    # pass considered legal. The CEILING is the value to clamp to
+                    # (see the helper's docstring for why not `clearance`), and
+                    # it is None exactly when the Min-Clearance override is
+                    # unticked, which is #768's OMITTED branch: classes preserved.
+                    #
+                    # Gated on `clearance_ceiling` ALONE, not on the
+                    # `clamp_netclasses` bool beside it in this dict. They are the
+                    # same switch read twice (swig_gui sets both off
+                    # self.clearance_check), and two values from two places coming
+                    # apart is exactly how #780 happened. `_optimize_decoupling_caps`
+                    # already gates its pricing on this one value; the writeback
+                    # must gate on the same one or the halves can disagree again.
+                    #
+                    # And only when that pass RAN: it is the writeback of the
+                    # cap pass (place_fanout_clearance.py's, #768), not of the
+                    # fanout. bga_fanout.py keeps the classes without a
+                    # --clearance-ceiling since #1529 (class_ceiling above), so
+                    # a fanout with no cap pass, or one the pass refused, lowered
+                    # every wider class here and not on the CLI.
+                    nondefault_clamp_mm=(
+                        _fcfg.get('clearance_ceiling')
+                        if cap_summary is not None
+                        and not cap_summary.startswith(CAP_NOT_RUN) else None))
+                # Disclosed, because it CHANGES THE BOARD'S DECLARED SPEC and
+                # an operator reading the log must see that. Printed only when
+                # something actually moved: no ceiling -> empty list -> silence,
+                # so an ordinary fanout gains no new output from this fix.
+                for _line in (_nd_changes or []):
+                    print(f"  {_line}")
+            except Exception as _e:
+                print(f"(live DRC floor update skipped: {_e})")
+        elif not _fcfg.get('fix_drc_settings', True):
+            # The tool records (pour-served balls, protected nets) are not DRC
+            # floors: an unchecked box must not void them (#1415).
+            from .gui_utils import persist_live_tool_records
+            persist_live_tool_records(
+                board, _fcfg.get('same_net_pad_clearance'))
 
         # Refresh the view
         pcbnew.Refresh()
@@ -1206,10 +2547,514 @@ class FanoutTab(wx.Panel):
         msg += f"Added to board:\n"
         msg += f"  {tracks_added} tracks\n"
         msg += f"  {vias_added} vias\n"
+        if cap_summary:
+            msg += "\n" + cap_summary + "\n"
+        if filter_misses:
+            from bga_fanout import filter_miss_lines
+            msg += self._net_list("Selected nets with no pad to fan out",
+                                  [l.strip() for l in
+                                   filter_miss_lines(filter_misses, flag='')])
+        if (underpad_pads or {}).get('pads_already_served'):
+            msg += (f"\nPads that already had a via escape, skipped: "
+                    f"{underpad_pads['pads_already_served']}\n")
+        if (stub_pads or {}).get('pads_already_served'):
+            msg += (f"\nPads that already had their surface escape, skipped: "
+                    f"{stub_pads['pads_already_served']}\n")
+        if (underpad_pads or {}).get('dropped_pads') and not skipped_interior:
+            # (a stub run's via-drop drops only interior pads, listed below)
+            msg += self._net_list("Pads dropped by the via-drop (no clear via "
+                                  "offset)", underpad_pads['dropped_pads'])
+        if skipped_interior:
+            msg += self._net_list(
+                "Selected interior pads given no copper (no clear via-drop "
+                "site)", skipped_interior)
+        if power_stubs_at_width:
+            from qfn_fanout import power_stubs_lines
+            msg += self._net_list(
+                f"Power/ground stubs drawn at the track width "
+                f"({power_stubs_at_width[0]['width']:g} mm)",
+                [f"{r['pad']} {r['net']} ({r['escape']}, {r['why']})"
+                 for r in power_stubs_at_width])
+            msg += "".join(f"{line.strip()}\n"
+                           for line in power_stubs_lines(power_stubs_at_width)[1:])
+        if board_setup_vias:
+            from design_rules import annular_grade_lines, via_size_grade_lines
+            msg += self._net_list(
+                "Vias below the board's Board Setup minimums (Fix DRC settings "
+                "is off; Escalation 'board' sizes the via to them)",
+                annular_grade_lines([r for r in board_setup_vias if 'smallest_ring' in r])
+                + via_size_grade_lines([r for r in board_setup_vias
+                                        if 'smallest_ring' not in r]))
+        if hole_rules:
+            from check_drc import hole_rule_grade_lines
+            msg += self._net_list(
+                "Escapes kept below a hole_clearance rule (the rule could not be "
+                "held; check_drc names each row)", hole_rule_grade_lines(hole_rules))
+        if failed_nets:
+            if fanout_kind == 'qfn':
+                unescaped, flagged = self._qfn_failure_split(failed_nets, tracks,
+                                                             vias, fanout_config or {})
+                msg += self._net_list("Failed nets, a pad left with no copper", unescaped)
+                msg += self._net_list("Nets whose stubs are too close to neighbours",
+                                      flagged)
+            else:
+                msg += self._net_list("Failed nets", failed_nets)
+            try:
+                from routing_diagnostics import (
+                    suggest_bga_fanout_adjustments,
+                    suggest_qfn_fanout_adjustments,
+                    format_suggestions_for_dialog)
+                suggest_fn = (suggest_qfn_fanout_adjustments
+                              if fanout_kind == 'qfn'
+                              else suggest_bga_fanout_adjustments)
+                # Estimate "total" - we don't know the input count here, just
+                # use failed + tracks_added as a rough denominator.
+                rough_total = max(len(failed_nets) + tracks_added, len(failed_nets))
+                suggestions = suggest_fn(
+                    failed=len(failed_nets), total=rough_total,
+                    config=fanout_config or {})
+                block = format_suggestions_for_dialog(suggestions)
+                if block:
+                    msg += "\n" + block + "\n"
+            except Exception as e:
+                print(f"Warning: failed to build fanout suggestions: {e}")
         msg += "\nUse Edit -> Undo to revert changes."
 
-        wx.MessageBox(msg, "Fanout Complete", wx.OK | wx.ICON_INFORMATION)
+        if getattr(getattr(self, 'GetTopLevelParent', lambda: self)(), '_suppress_completion_popups', False):
+            print(msg)  # unattended plan run: no per-step OK dialog
+        else:
+            wx.MessageBox(msg, "Fanout Complete", wx.OK | wx.ICON_INFORMATION)
 
         # Callback
         if self.on_fanout_complete:
             self.on_fanout_complete()
+
+    @staticmethod
+    def _net_list(title, names):
+        """A completion message's list of nets: its title and count, eight
+        names, and how many more; '' for none."""
+        if not names:
+            return ""
+        out = f"\n{title} ({len(names)}):\n" + "".join(f"  - {n}\n" for n in names[:8])
+        if len(names) > 8:
+            out += f"  ... and {len(names) - 8} more (see Log tab)\n"
+        return out
+
+    def _qfn_failure_split(self, failed_nets, tracks, vias, fanout_config):
+        """(unescaped, flagged): the QFN engine's failed list split as
+        qfn_fanout's main splits it (`bga_fanout.unserved_nets`). A net is a
+        failure only while one of its pads has no copper; the rest escaped,
+        with stubs ending too close to a neighbour's. Without the part, every
+        name stays a failure."""
+        ref = fanout_config.get('footprint_ref')
+        fp = (self.pcb_data.footprints.get(ref)
+              if ref and getattr(self, 'pcb_data', None) is not None else None)
+        if fp is None:
+            return list(failed_nets), []
+        from bga_fanout import unserved_nets
+        unescaped = unserved_nets(fp, self.pcb_data, sorted(set(failed_nets)), tracks,
+                                  vias, fanout_config.get('track_width') or 0.0)
+        return unescaped, sorted(set(failed_nets) - set(unescaped))
+
+    def _optimize_decoupling_caps(self, board, pcbnew, fanout_config):
+        """Run the fanout-clearance cap repair on the live board (#130).
+
+        Rebuilds PCBData from the just-fanned board (so the new vias are
+        present), runs the shared engine, and applies the resulting footprint
+        moves directly to pcbnew. Courtyards/locked refs come from the saved
+        file (position-independent, unchanged by fanout). Returns a one-line
+        summary for the completion dialog, or None on no-op/error.
+        """
+        try:
+            from kicad_parser import build_pcb_data_from_board
+            from placement.fanout_clearance import repair_fanout_clearance
+            from .swig_gui import _build_layer_mappings
+
+            self.status_text.SetLabel("Optimizing decoupling cap placement...")
+            wx.Yield()
+
+            pcb_data = build_pcb_data_from_board(board)
+            # #962: which vias are under solder BEFORE any cap moves (the
+            # CLI twin is in place_fanout_clearance.main).
+            from fab_notes import via_snapshot as _via_snapshot962
+            _input_vias962 = _via_snapshot962(pcb_data.vias, pcb_data)
+            # #966: routing retains a declared zero then fab-floors it, but
+            # placement treats that declaration as unset (fallback 0.25).
+            # Preserve omission so the cap engine resolves its own contract;
+            # a resolved routing floor must not become a placement override.
+            # Checked overrides keep the existing fab-floored value.
+            placement_override = fanout_config.get(
+                'placement_clearance_ceiling', fanout_config.get('clearance_ceiling'))
+            # #1067: the CLI's --intent. A path that does not load stops the
+            # cap pass before the engine runs, as the CLI exits 2 -- never a
+            # silent run without the gate the step asked for.
+            _cap_intent = None
+            _ip = (fanout_config.get('cap_intent_path') or '').strip()
+            if _ip:
+                if not os.path.isabs(_ip) and self.board_filename:
+                    _ip = os.path.join(os.path.dirname(self.board_filename),
+                                       _ip)
+                from placement import floorplan as _fp1067
+                try:
+                    _cap_intent = _fp1067.load_intent(_ip)
+                    _fp1067.tether_gate_spec(_cap_intent)
+                    # #1122: two blocks declaring one part at different
+                    # angles is an IntentError (a ValueError): refused here,
+                    # before anything moves, as the CLI exits 2.
+                    from placement import fanout_clearance as _fc1122
+                    _fc1122.declared_cap_rotations(_cap_intent, pcb_data)
+                except (OSError, ValueError, TypeError) as exc:
+                    return (f"{CAP_NOT_RUN}: cannot load intent "
+                            f"{_ip}: {exc}")
+            result = repair_fanout_clearance(
+                pcb_data,
+                pcb_file=self.board_filename,
+                clearance=(fanout_config.get('clearance', defaults.BGA_CLEARANCE)
+                           if placement_override is not None else None),
+                # #768: the --clearance ceiling. The CLI switches it on the
+                # PRESENCE of the flag; a dialog has no "absent", so the switch
+                # is the control that already MEANS "I am overriding the board's
+                # clearance": the Basic tab's Min Clearance override, exported
+                # as `clamp_netclasses` (swig_gui.py, `self.clearance_check`)
+                # and consumed as `clamp_nondefault_netclasses` by every other
+                # step. ai_plan.py:1279-1282 spells the same equivalence.
+                #
+                # It is NOT `fix_drc_settings`, which an earlier cut of this
+                # change used, on the premise that a checked box means the
+                # classes get clamped. Measured, that premise is false:
+                # `update_live_drc_floors` writes `m_MinClearance` and the
+                # DEFAULT class only, carries no `clamp_nondefault_netclasses`,
+                # and this tab never calls `apply_targets_to_board`. Gated
+                # there, the GUI priced every pair at the ceiling and clamped no
+                # class at all -- pricing on the GIVEN branch and writing back
+                # on the OMITTED one, which is #768 pointing the other way.
+                #
+                # AND HALF OF THAT SURVIVES THE CORRECT GATE (#782), stated
+                # here because the paragraph above reads as though choosing
+                # the right switch fixed it. It fixed WHICH runs are priced
+                # at the ceiling; it did not add the writeback. With the
+                # override ticked this tab still prices non-Default classes
+                # at min(class, ceiling) and lowers none of them --
+                # update_live_drc_floors writes the DEFAULT class only, and
+                # this tab never calls fix_project_for_output the way the
+                # signal, differential and planes tabs do. A plan run is
+                # covered by ai_plan's end-of-run writeback; both
+                # INTERACTIVE paths are not. On a single-class board -- most
+                # boards -- there is nothing to clamp and no difference.
+                #
+                # Default False, not True: an absent key means the operator
+                # never ticked the override, and the safe reading of that is
+                # "honour the board", which is what an omitted CLI flag means.
+                netclass_ceiling=fanout_config.get('placement_clearance_ceiling',
+                                                   fanout_config.get('clearance_ceiling')),
+                grid_step=fanout_config.get('grid_step', defaults.GRID_STEP),
+                # #733: the plugin used to pass NOTHING here, so it silently took
+                # the signature default whatever the board or the operator said,
+                # while the cap mover insets by max(clearance, this). None = the
+                # engine resolves it, which is what an omitted CLI flag does too.
+                board_edge_clearance=fanout_config.get('cap_board_edge_clearance'),
+                # #742: the CLI's --default-via-size, on its own key. This used
+                # to read `via_size`, which on this tab is the diameter of the
+                # vias fanout PLACES and the via floor written back to the
+                # project -- a different quantity that happened to reach the
+                # same engine parameter, so a recorded run replayed here with a
+                # different keep-out radius and therefore different copper.
+                default_via_size=fanout_config.get('cap_default_via_size',
+                                                   CAP_DEFAULT_VIA_SIZE),
+                # Advanced cap-placement knobs from the BGA fanout tab (#130)
+                capture_radius=fanout_config.get('cap_capture_radius', 2.0),
+                near_margin=fanout_config.get('cap_near_margin', 1.0),
+                step=fanout_config.get('cap_step', 0.2),
+                max_displacement=fanout_config.get('cap_max_displacement', 2.0),
+                max_displacement_cap=fanout_config.get('cap_max_displacement_cap', 3.0),
+                displacement_growth=fanout_config.get('cap_displacement_growth', 1.5),
+                max_passes=int(fanout_config.get('cap_max_passes', 30)),
+                # 'C,R,FB' -- the CLI's default, the engine signature's, and
+                # this tab's control value. It read 'C,R' (#742): unreachable,
+                # since both call paths populate the key, but a leaner config
+                # would have silently stopped moving ferrite beads.
+                cap_prefix=fanout_config.get('cap_prefix', 'C,R,FB'),
+                allow_rotations=fanout_config.get('cap_allow_rotation', True),
+                beneath_only=bool(fanout_config.get('cap_beneath_only', False)),
+                intent=_cap_intent,
+                # Runs ON the UI thread; _fanout_status forces the repaint so
+                # the label moves per cap visit instead of freezing (#130).
+                # x/N lines only (see the fanout call sites).
+                progress_callback=(lambda c, t, m:
+                                   self._fanout_status(f"{m} ({c}/{t})")
+                                   if t else None),
+            )
+
+            # #726: a placement names a PCBData key, which for a duplicated
+            # reference is `TP4~2`; FindFootprintByReference cannot see it.
+            from .gui_utils import live_footprints_by_key
+            _live_caps = live_footprints_by_key(board)
+            # #829: skip a cap that draws the board's own outline. The engine's
+            # own cap gate already excludes it, so this should never trigger --
+            # but this loop applies poses to the live board directly, without
+            # `write_placed_output`, so it is the CLI's raise-on-refusal
+            # backstop that is missing on this front and this is where it goes.
+            # It PRINTS, because the summary below is built from the engine's
+            # `result['placements']` rather than from what was applied, so a
+            # silent skip would be reported as a move.
+            _outline_skipped = []
+            for p in result.get('placements', []):
+                fp = (_live_caps.get(p['reference'])
+                      or board.FindFootprintByReference(p['reference']))
+                if fp is None:
+                    continue
+                _pd = (pcb_data.footprints.get(p['reference'])
+                       if pcb_data is not None else None)
+                if getattr(_pd, 'owns_board_outline', False):
+                    _outline_skipped.append(p['reference'])
+                    continue
+                fp.SetOrientationDegrees(p['new_rotation'])
+                fp.SetPosition(pcbnew.VECTOR2I(
+                    mm_to_iu(p['new_x']), mm_to_iu(p['new_y'])))
+            if _outline_skipped:
+                print(f"  NOT MOVED (#829): {', '.join(_outline_skipped)} -- "
+                      f"draws the board outline; moving it would resize the "
+                      f"board. The summary below counts the engine's proposal, "
+                      f"not what was applied.")
+
+            # Via-nudge with reconnect (#313): the shared engine also moves a
+            # boxed-in cap's offending fanout via off the pad and adds connector
+            # segment(s) back to the stub start. The CLI applies these via
+            # write_placed_output; on the live board we must mirror it (else the
+            # via stays put and the graze the summary claims to have fixed
+            # persists). GUI parity for the via-nudge block in
+            # placement/writer.py (`# Via-nudge rewrites (#313)` to the
+            # splice) -- named by its marker comment rather than by line
+            # numbers, which this file has now got wrong twice.
+            name_to_id, _ = _build_layer_mappings()
+
+            def _layer_id(layer_name):
+                return name_to_id.get(layer_name, pcbnew.F_Cu)
+
+            via_moves = result.get('via_moves', []) or []
+            for old_x, old_y, vd in via_moves:
+                # remove the via at its OLD position, matching NET too (parity
+                # with placement/writer._remove_vias_at_positions net_ids, #313):
+                # a position-only match could delete a DIFFERENT net's via sitting
+                # within 1um of the moved via's old spot.
+                # This is the via NUDGE: the old via is deleted and an identical
+                # one re-added a fraction of a mm away. Carry its protection spec
+                # across or the nudge silently re-tents it (#489 §8).
+                #
+                # #741: the ENGINE now populates this key, so on this path it
+                # is always present -- and legitimately {} for a via that
+                # inherits the board's `(setup (tenting ...))`, which
+                # apply_via_protection correctly leaves alone.
+                #
+                # Note the guard below is `if not moved_attrs`: TRUTHINESS,
+                # not presence, so it fires for that inheriting via too. It
+                # cannot mis-stamp -- apply_via_protection returns early on an
+                # empty spec either way -- but it is NOT the regression
+                # detector for either half of #741: it re-derives its answer
+                # from the same track via the same call that built pcb_data,
+                # so it would MASK an engine revert.
+                # tests/test_741_via_nudge_tenting.py asserts on the engine
+                # dict for exactly that reason.
+                #
+                # And on KiCad 10.0.0 the re-read is inert for EVERY via, not
+                # just an inheriting one: pcbnew's SWIG wrapper does not export
+                # TENTING_MODE_TENTED and friends (measured -- the setters
+                # exist, the constants do not, and the getters hand back an
+                # opaque SwigPyObject), so _pcbnew_via_protection_attrs raises
+                # internally and returns {}. That is pre-existing #489
+                # behaviour and NOT this fix's doing, but it means the GUI half
+                # of the round trip does not currently carry a spec at all.
+                # #751.
+                moved_attrs = vd.get('tenting_attrs')
+                # The moved via's type: the dict's, else the live via's own.
+                moved_type = vd.get('via_type')
+                for track in list(board.GetTracks()):
+                    if track.GetClass() != 'PCB_VIA':
+                        continue
+                    if track.GetNetCode() != vd['net_id']:
+                        continue
+                    pos = track.GetPosition()
+                    if (abs(pcbnew.ToMM(pos.x) - old_x) < 1e-3 and
+                            abs(pcbnew.ToMM(pos.y) - old_y) < 1e-3):
+                        if not moved_attrs:
+                            try:
+                                # #751: the resolver, not the raw live-object
+                                # reader. On a pcbnew whose SWIG wrapper omits
+                                # the protection enums the latter answers {}
+                                # for EVERY via, so this re-read was inert on
+                                # the shipping KiCad 10 rather than only on an
+                                # inheriting via.
+                                from kicad_parser import (
+                                    pcbnew_via_protection_attrs,
+                                    via_protection_attrs_from_board_file)
+                                moved_attrs = pcbnew_via_protection_attrs(
+                                    track,
+                                    via_protection_attrs_from_board_file(board))
+                            except Exception:
+                                moved_attrs = None
+                        if moved_type is None:
+                            from kicad_parser import pcbnew_via_type
+                            moved_type = pcbnew_via_type(track)
+                        board.RemoveNative(track)
+                        break
+                nv = pcbnew.PCB_VIA(board)
+                nv.SetPosition(pcbnew.VECTOR2I(
+                    mm_to_iu(vd['x']), mm_to_iu(vd['y'])))
+                nv.SetWidth(mm_to_iu(vd['size']))
+                nv.SetDrill(mm_to_iu(vd['drill']))
+                nv.SetNetCode(vd['net_id'])
+                if len(vd.get('layers', [])) >= 2:
+                    from .gui_utils import set_via_layers
+                    set_via_layers(nv, _layer_id(vd['layers'][0]),
+                                   _layer_id(vd['layers'][1]), moved_type)
+                from .gui_utils import apply_via_protection
+                apply_via_protection(nv, moved_attrs)
+                board.Add(nv)
+
+            for nsd in (result.get('new_segments', []) or []):
+                nt = pcbnew.PCB_TRACK(board)
+                nt.SetStart(pcbnew.VECTOR2I(
+                    mm_to_iu(nsd['start'][0]), mm_to_iu(nsd['start'][1])))
+                nt.SetEnd(pcbnew.VECTOR2I(
+                    mm_to_iu(nsd['end'][0]), mm_to_iu(nsd['end'][1])))
+                nt.SetWidth(mm_to_iu(nsd['width']))
+                nt.SetLayer(_layer_id(nsd['layer']))
+                nt.SetNetCode(nsd['net_id'])
+                board.Add(nt)
+
+            # #962: a via the moves put under a pad or paste opening declares
+            # Type VII, as place_fanout_clearance.main does for the file. Decided
+            # on the board AS MOVED, and applied to the live via at that spot.
+            try:
+                from fab_notes import (via_protection_stamps,
+                                       print_via_protection_record)
+                from .gui_utils import apply_via_protection
+                _post962 = build_pcb_data_from_board(board)
+                _st962, _rec962 = via_protection_stamps(
+                    _post962.vias, _input_vias962, _post962)
+                _live962 = [t for t in board.GetTracks()
+                            if t.GetClass() == 'PCB_VIA']
+                for _v962, _spec962 in _st962:
+                    for _t962 in _live962:
+                        _p962 = _t962.GetPosition()
+                        if (_t962.GetNetCode() == _v962.net_id
+                                and abs(pcbnew.ToMM(_p962.x) - _v962.x) < 1e-3
+                                and abs(pcbnew.ToMM(_p962.y) - _v962.y) < 1e-3):
+                            apply_via_protection(_t962, _spec962)
+                            break
+                print_via_protection_record(_rec962, "cap optimization")
+            except Exception as _e962:
+                print(f"  Via protection after the cap moves: skipped ({_e962})")
+
+            if via_moves:
+                # Re-placed vias sit under the (now stale) pours; a bare
+                # BuildConnectivity would flip their netcodes to the zones'.
+                from .gui_utils import refill_all_zones
+                refill_all_zones(board)
+
+            return cap_optimization_summary(result)
+        except Exception as e:
+            import traceback
+            traceback.print_exc()
+            return f"{CAP_FAILED}: {e})"
+
+    def run_cap_optimization(self, log=None):
+        """Standalone decoupling-cap optimization on the live board (#130).
+
+        Entry point for the AI-plan executor's "optimize_caps" step (and
+        any caller that wants the repair without running a fanout). Reads the
+        clearance/grid/via from the Basic tab and the advanced cap knobs from
+        the BGA options panel, runs the shared engine, and applies the moves.
+        Synchronous, no modal dialog. Returns a one-line summary or None.
+        """
+        import pcbnew
+        board = pcbnew.GetBoard()
+        if board is None:
+            return None
+        shared = self.get_shared_params() if self.get_shared_params else {}
+        cfg = dict(self.bga_options.get_config())  # advanced cap_* knobs
+        cfg.update({
+            'clearance': shared.get('clearance', defaults.BGA_CLEARANCE),
+            'grid_step': shared.get('grid_step', defaults.GRID_STEP),
+            # `via_size` used to be here, and it was here for exactly one
+            # reason: _optimize_decoupling_caps read it as the engine's
+            # `default_via_size`. That was #742's bug -- the Basic tab's via
+            # GEOMETRY standing in for the unreadable-via FALLBACK -- and the
+            # cap pass now takes `cap_default_via_size` from get_config()
+            # above. Nothing on this path reads `via_size` any more, so a row
+            # that looks load-bearing under the comment below would be dead.
+            # #768: this path builds its config from a HANDFUL of shared keys,
+            # so anything the engine call reads off `fanout_config` and that is
+            # not listed here silently takes its `.get` default. That is how the
+            # first cut of the ceiling gate came to be INERT on the standalone
+            # and plan-executor path while looking correct on the inline one --
+            # the same shape as the #693 finding the parity ledger records.
+            # #530: placement ceiling semantics (see the BGA dict above).
+            'clamp_netclasses': shared.get('placement_clamp_netclasses',
+                                           shared.get('clamp_netclasses', False)),
+            'clearance_ceiling': shared.get('placement_clearance_ceiling',
+                                            shared.get('clearance_ceiling')),
+            'fix_drc_settings': shared.get('fix_drc_settings', True),
+        })
+        from .gui_utils import redirect_prints_to_log, refill_all_zones
+        with redirect_prints_to_log(self.append_log):
+            summary = self._optimize_decoupling_caps(board, pcbnew, cfg)
+            # #782: the STANDALONE button is the second interactive path into
+            # the cap pass, and it wrote no DRC settings at all. It prices at the
+            # ceiling exactly like the inline path (both read `clearance_ceiling`
+            # off their cfg), so it owes the same class writeback -- otherwise
+            # which button the operator pressed decides whether the board ships
+            # a class the run honoured.
+            #
+            # The NON-Default clamp only, deliberately, and not the whole
+            # `update_live_drc_floors`: this button places parts and draws
+            # connectors, it lays no escape copper, and the inline path's floor
+            # update exists because the FANOUT wrote tracks and vias. Widening
+            # this to the Default class and the size minima is a real change to
+            # what the button does and belongs to whoever wants it, not to #782.
+            # The Default class is untouched here, so a ceiling BELOW it stays a
+            # pricing decision rather than silently retightening the board.
+            # #1067: a step that REFUSED to run (an intent that does not load)
+            # owes no writeback and no refill -- as the CLI's exit 2 writes
+            # nothing.
+            _refused = bool(summary) and summary.startswith(CAP_NOT_RUN)
+            # #1578: gated on "Fix DRC settings after routing" (#693), as
+            # place_fanout_clearance.py's writeback is on its
+            # --no-fix-drc-settings: unticked, the classes stay as declared.
+            if cfg.get('clearance_ceiling') is not None and not _refused \
+                    and cfg.get('fix_drc_settings', True):
+                try:
+                    from fix_kicad_drc_settings import (
+                        clamp_nondefault_netclasses_on_board)
+                    _nd = clamp_nondefault_netclasses_on_board(
+                        board,
+                        {'min_clearance': float(cfg['clearance_ceiling'])})
+                    if _nd:
+                        # The only SetModified on this tab, and it earns the
+                        # asymmetry: a net-class edit is a design-SETTINGS
+                        # change, and this path can move nothing else at all
+                        # (zero caps is a legitimate outcome), so without it a
+                        # run whose only effect was the clamp would let the
+                        # operator close without being offered the save. The
+                        # inline path needs no equivalent -- it has just added
+                        # fanout tracks and vias, which mark the board itself.
+                        if hasattr(board, 'SetModified'):
+                            board.SetModified()
+                        print("Non-Default net classes clamped to the "
+                              f"{float(cfg['clearance_ceiling']):g}mm ceiling: "
+                              + ", ".join(_nd))
+                except Exception as _nde:                      # noqa: BLE001
+                    print(f"(non-Default net-class clamp skipped: {_nde})")
+            if not _refused:
+                refill_all_zones(board)   # never bare BuildConnectivity: net flips
+            # The plan executor's "this step produced its result" (gui_utils):
+            # a refusal or a raised pass is the CLI's exit without a board.
+            if summary and not _refused and not summary.startswith(CAP_FAILED):
+                from .gui_utils import mark_plan_step_produced
+                mark_plan_step_produced(self)
+        pcbnew.Refresh()
+        if summary:
+            self.status_text.SetLabel(summary)
+            if log:
+                log(summary)
+        return summary

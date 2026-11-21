@@ -1,0 +1,725 @@
+"""A connector's DRAWN body against a declared compass board edge (#961).
+
+`rule_edge_connector` used to grade a declared `overhang_mm` band on
+`rect_outside_amount(part.rect)`. That is a CLEARANCE SHORTFALL at the gate's
+margin -- `margin - gap` inside the board, `overhang + margin` outside -- so a
+part 0.15 mm inside the edge read 0.10 at margin 0.25 and satisfied a band
+while `check_drc --check-pad-edge` failed the same geometry. Measured on
+esp_prog's USB1 translated 1.45 mm west: the drawn body overhangs 1.45 mm and
+the rule read 0.10 or 0.40 depending on the margin.
+
+This module measures the quantity the band is about. The mating face is the
+support line of the drawn envelope in the declared outward direction; the
+signed position is positive outside the board, `overhang = max(0, signed)` and
+`setback = max(0, -signed)`. It is a 2-D drawing contract, not a 3-D mating
+simulation, and it takes no margin at all.
+
+WHAT COUNTS AS A BODY. A closed convex polygonal envelope on the footprint's
+own Fab layer -- or its own SilkS layer when it draws nothing on Fab, or
+when its Fab drawing is a marking by `body.fab_cannot_be_body` (#1243); any
+other unusable Fab drawing does NOT fall back to SilkS -- drawn with `fp_line`, sharp-cornered
+`fp_rect` and straight-sided `fp_poly`. Internal markings drawn with those
+primitives are allowed, but every side of the convex hull must actually be
+drawn. ANY other primitive on that layer makes the whole body UNMEASURED --
+`fp_arc`, `fp_circle` (a pin-1 dot included, unless the guard above reads
+the SilkS instead), `fp_curve`, a rounded
+`fp_rect`, an `fp_poly` carrying an arc -- as do open outlines, concave
+envelopes and a part that draws no body. Text, pads and courtyards are never
+body geometry. Vertices are transformed before taking extrema, so any
+rotation of the supported primitives is exact.
+
+WHAT COUNTS AS A BOUNDARY. A rectangular Edge.Cuts outline with no other cuts;
+or, on any other outline the parser rings, the declared edge where it is
+straight under the part (#1585, `ConnectorGeometry.boundary_under`): one
+Edge.Cuts run on that side of the bounds covering the body along it (and on
+any other side the body crosses), the body's part inside the bounds wholly on
+the board. So a hole elsewhere on the board does not change what "flush"
+means. Anything else is unmeasured rather than approximated by the bounding
+box.
+
+UNMEASURED IS A BASIS, NOT A VERDICT. `band_amount` hands every caller its
+own courtyard reading back, named `legacy_occupancy@margin=<m>`, when the body
+cannot be measured. Nothing here refuses a pose, withholds a board or records
+an abstention; a board this module cannot read is graded on its courtyard,
+and says which currency it was graded in. Since #1301 the grade (and the
+grouped edge seat) take that reading at ZERO margin (`courtyard_overhang`):
+at the gate's margin (`max(clearance, edge clearance)`), which a routing
+step's DRC writeback moves, one pose graded differently placed and routed.
+"""
+from __future__ import annotations
+
+import hashlib
+import math
+import os
+import re
+from collections import OrderedDict
+
+from kicad_parser import find_matching_paren
+from .parser import _footprint_blocks
+
+EPS = 1e-6
+EDGES = ('west', 'east', 'north', 'south')
+
+#: Parsed board FILES, keyed by path AND content digest, so a board rewritten
+#: in place between two reads is never answered from the old text. Body
+#: envelopes are footprint-LOCAL, so a pose change never invalidates one.
+_SOURCES: 'OrderedDict[tuple, _BoardSource]' = OrderedDict()
+_SOURCES_LIMIT = 16
+
+
+def _point(text, name):
+    m = re.search(r'\(' + name + r'\s+([-+\d.eE]+)\s+([-+\d.eE]+)\)', text)
+    if not m:
+        raise ValueError('missing ' + name)
+    p = tuple(float(v) for v in m.groups())
+    if not all(math.isfinite(v) for v in p):
+        raise ValueError('nonfinite body coordinate')
+    return p
+
+
+def _cross(a, b, c):
+    return (b[0] - a[0]) * (c[1] - a[1]) - (b[1] - a[1]) * (c[0] - a[0])
+
+
+def _envelope(segments):
+    """The convex hull of the drawn segments, refused unless every hull side
+    is covered by drawn segments (a closed convex outline)."""
+    points = sorted(set(p for s in segments for p in s))
+    if len(points) < 3:
+        raise ValueError('body has no closed polygonal envelope')
+
+    def half(seq):
+        out = []
+        for p in seq:
+            while len(out) > 1 and _cross(out[-2], out[-1], p) <= 0:
+                out.pop()
+            out.append(p)
+        return out
+
+    hull = half(points)[:-1] + half(points[::-1])[:-1]
+    if len(hull) < 3:
+        raise ValueError('degenerate body drawing')
+    for a, b in zip(hull, hull[1:] + hull[:1]):
+        length = math.dist(a, b)
+        runs = []
+        for c, d in segments:
+            if (abs(_cross(a, b, c)) / length > EPS
+                    or abs(_cross(a, b, d)) / length > EPS):
+                continue
+            runs.append(sorted(((p[0] - a[0]) * (b[0] - a[0]) / length
+                                + (p[1] - a[1]) * (b[1] - a[1]) / length)
+                               for p in (c, d)))
+        end = 0.0
+        for lo, hi in sorted(runs):
+            if lo > end + EPS:
+                break
+            end = max(end, hi)
+        if end < length - EPS:
+            raise ValueError('open or concave body envelope '
+                             '(a convex hull side is not drawn)')
+    return hull
+
+
+def _parse_body(block, side, fab_is_marking=False):
+    """`(hull, layer, reason)` for one footprint block on side 'F' or 'B'.
+
+    A saved B-side footprint already stores mirrored local coordinates, so
+    the side only selects WHICH layer is the part's own. `fab_is_marking`
+    (#1243): the caller found the Fab drawing to be a marking by
+    `body.fab_cannot_be_body`, so the SilkS layer is read instead."""
+    if block is None:
+        return None, None, 'footprint block not found in the board file'
+    layers = {}
+    for m in re.finditer(r'\(fp_(\w+)\b', block):
+        kind = m.group(1)
+        if kind in ('text', 'text_box'):
+            continue
+        item = block[m.start():find_matching_paren(block, m.start())]
+        lm = re.search(r'\(layer\s+"?([FB]\.(?:Fab|SilkS))"?\)', item)
+        if lm:
+            layers.setdefault(lm.group(1), []).append((kind, item))
+    layer = next((side + suffix for suffix in ('.Fab', '.SilkS')
+                  if side + suffix in layers), None)
+    if fab_is_marking and layer == side + '.Fab':
+        layer = side + '.SilkS'
+        if layer not in layers:
+            return None, side + '.Fab', ('the Fab drawing is a marking, not '
+                                         'a body, and no SilkS is drawn')
+    if layer is None:
+        return None, None, 'no body drawing on the footprint face'
+    try:
+        segments = []
+        for kind, item in layers[layer]:
+            if kind == 'line':
+                segments.append((_point(item, 'start'), _point(item, 'end')))
+            elif kind == 'rect':
+                rm = re.search(r'\(radius\s+([-+\d.eE]+)\)', item)
+                if rm and float(rm.group(1)) > EPS:
+                    # KiCad 10 rounded rectangle: its sharp corners would
+                    # overstate the extent at any non-orthogonal rotation.
+                    raise ValueError('rounded fp_rect corners are not measured')
+                a, b = _point(item, 'start'), _point(item, 'end')
+                pts = [a, (b[0], a[1]), b, (a[0], b[1])]
+                segments.extend(zip(pts, pts[1:] + pts[:1]))
+            elif kind == 'poly':
+                if re.search(r'\(arc\b', item):
+                    # An arc inside `pts` bulges past its chord; the chord
+                    # polygon would understate the body.
+                    raise ValueError('fp_poly with an arc segment is not '
+                                     'measured')
+                pts = [_point(x.group(), 'xy') for x in re.finditer(
+                    r'\(xy\s+[-+\d.eE]+\s+[-+\d.eE]+\)', item)]
+                segments.extend(zip(pts, pts[1:] + pts[:1]))
+            else:
+                raise ValueError('unsupported body primitive: fp_' + kind)
+        return _envelope(segments), layer, ''
+    except ValueError as exc:
+        return None, layer, str(exc)
+
+
+class _BoardSource:
+    """What one board FILE says independently of any pose: its footprint
+    blocks, and whether its Edge.Cuts is a plain rectangle."""
+
+    def __init__(self, text, bounds, reason=''):
+        self.blocks = {}
+        self.envelopes = {}
+        self.boundary_reason = reason
+        if text is None:
+            return
+        from kicad_parser import _collect_edge_cuts_segments
+        from .legality import _segments_cover_rectangle
+        try:
+            rectangular = bool(bounds) and _segments_cover_rectangle(
+                _collect_edge_cuts_segments(text), bounds)
+        except ValueError as exc:
+            rectangular = False
+            reason = 'board outline unreadable: ' + str(exc)
+        if not rectangular:
+            self.boundary_reason = reason or (
+                'unsupported boundary: requires a rectangular Edge.Cuts '
+                'outline without cutouts, curves or extra cuts')
+        self.blocks = dict(_footprint_blocks(text))
+
+    def envelope(self, ref, side, fab_is_marking=False):
+        key = (ref, side, fab_is_marking)
+        if key not in self.envelopes:
+            self.envelopes[key] = _parse_body(self.blocks.get(ref), side,
+                                              fab_is_marking)
+        return self.envelopes[key]
+
+
+def _source(path, bounds):
+    if not path:
+        return _BoardSource(None, bounds,
+                            'no board file to read the drawn body from')
+    try:
+        with open(path, 'rb') as stream:
+            raw = stream.read()
+    except OSError as exc:
+        return _BoardSource(None, bounds,
+                            'body/boundary source unreadable: ' + str(exc))
+    key = (os.path.normcase(os.path.abspath(path)),
+           hashlib.blake2b(raw, digest_size=16).digest(),
+           tuple(bounds) if bounds else None)
+    hit = _SOURCES.get(key)
+    if hit is None:
+        try:
+            text = raw.decode('utf-8')
+        except UnicodeDecodeError as exc:
+            hit = _BoardSource(None, bounds,
+                               'body/boundary source unreadable: ' + str(exc))
+        else:
+            hit = _BoardSource(text, bounds)
+        _SOURCES[key] = hit
+        while len(_SOURCES) > _SOURCES_LIMIT:
+            _SOURCES.popitem(last=False)
+    else:
+        _SOURCES.move_to_end(key)
+    return hit
+
+
+class ConnectorGeometry:
+    """Drawn-body measurements for the footprints of one parsed board."""
+
+    def __init__(self, pcb_data, path):
+        self.pcb = pcb_data
+        self.path = path
+        self.bounds = getattr(pcb_data.board_info, 'board_bounds', None)
+        self.source = _source(path, self.bounds)
+        self.boundary_reason = self.source.boundary_reason
+        self._encloses = {}
+        self._pad_boxes = {}
+        self._bodies = None
+        self._zero_gate = None
+        self._runs = {}
+
+    def zero_gate(self):
+        """The board outline at ZERO margin, built once: the gate the band's
+        courtyard reading is taken on (`courtyard_overhang`, #1301)."""
+        if self._zero_gate is None:
+            from .legality import BoardOutlineGate
+            self._zero_gate = BoardOutlineGate(self.pcb.board_info, 0.0)
+        return self._zero_gate
+
+    def _fab_is_marking(self, ref):
+        """Is the part's Fab drawing a marking, not a body (#1243)?
+
+        The decision is the body model's own (`BodyGeometry.fab_rejected`,
+        i.e. `body.fab_cannot_be_body` against its pad bbox), so this reader
+        and the facing grade, which reads the silk body when the guard
+        fires, agree on the same part. Built once, on first need."""
+        if self._bodies is None:
+            from .body import board_bodies
+            self._bodies = (board_bodies(self.pcb, self.path)
+                            if self.path else {})
+        geom = self._bodies.get(ref)
+        return bool(geom is not None and geom.fab_rejected)
+
+    def _encloses_own_pads(self, ref, fp, points):
+        """Does the envelope enclose the centroid of the part's own pads?
+
+        A closed convex drawing is not necessarily a body: a Fab layer that
+        carries only a pin-1 triangle is closed and convex, and reading it as
+        the body reported a part whose courtyard crossed the edge as flush
+        (round-2 review's probe). The committed shape is in
+        `test_a_marker_is_not_a_body`: a 0.6 mm triangle beside pin 1, which
+        says nothing about where the part's two pads (1.0 mm and 5.0 mm from
+        that edge) actually are. Measured over the 22 tracked boards: 1079 envelopes are
+        measurable, 1078 of them on parts with pads, and every one of those
+        encloses its pads' centroid -- so this refuses markers without
+        refusing a body on the corpus. A padless part is not checked.
+        Pose-independent (local frame), so it is decided once per part."""
+        hit = self._encloses.get(ref)
+        if hit is None:
+            # Copper pads; else the non-aperture ones (an NPTH-only part).
+            # A paste/mask aperture is neither (#1143).
+            from kicad_parser import non_aperture_pads
+            from paste_apertures import pad_has_copper
+            pads = ([p for p in (fp.pads or ()) if pad_has_copper(p)]
+                    or non_aperture_pads(fp))
+            if not pads:
+                hit = True
+            else:
+                dx = sum(p.global_x for p in pads) / len(pads) - fp.x
+                dy = sum(p.global_y for p in pads) / len(pads) - fp.y
+                rot = math.radians(fp.rotation or 0.0)
+                c, s = math.cos(rot), math.sin(rot)
+                local = (c * dx - s * dy, s * dx + c * dy)
+                hit = all(_cross(a, b, local) >= -EPS
+                          for a, b in zip(points, points[1:] + points[:1]))
+            self._encloses[ref] = hit
+        return hit
+
+    def rect(self, ref, pose=None):
+        """`(board_rect, layer, reason)` of the drawn envelope at `pose`
+        (`(x, y, rotation)`; the parsed footprint's own pose when None)."""
+        fp = self.pcb.footprints.get(ref)
+        if fp is None:
+            return None, None, 'part not on this board'
+        from .legality import footprint_side
+        points, layer, reason = self.source.envelope(ref, footprint_side(fp))
+        side = footprint_side(fp)
+        if layer == side + '.Fab' and self._fab_is_marking(ref):
+            points, layer, reason = self.source.envelope(ref, side, True)
+        if points is None:
+            return None, layer, reason
+        if not self._encloses_own_pads(ref, fp, points):
+            return None, layer, ('the drawn envelope does not enclose the '
+                                 'centroid of its own pads: a marker, not a '
+                                 'body outline')
+        x, y, rot = pose if pose is not None else (fp.x, fp.y,
+                                                    fp.rotation or 0.0)
+        c, s = math.cos(math.radians(rot)), math.sin(math.radians(rot))
+        pts = [(x + c * a + s * b, y - s * a + c * b) for a, b in points]
+        return (min(p[0] for p in pts), min(p[1] for p in pts),
+                max(p[0] for p in pts), max(p[1] for p in pts)), layer, ''
+
+    def _edge_runs(self, edge):
+        """The straight Edge.Cuts runs on `edge`'s side of the bounds,
+        merged (`edge_runs` on the zero-margin gate), built once per edge."""
+        if edge not in self._runs:
+            self._runs[edge] = edge_runs(self.zero_gate(), self.bounds, edge)
+        return self._runs[edge]
+
+    def boundary_under(self, rect, edge):
+        """'' when the outline under the body `rect` is the declared edge's
+        straight line -- the board-wide rectangle, or (#1585) on any other
+        outline the parser rings: one straight Edge.Cuts run on `edge`'s side
+        covering the body along that edge (and on each other side the body
+        crosses), with the body's part inside the bounds wholly on the board
+        (no notch, cut-out or rounded corner under it). Else the reason.
+
+        Per part, not per board, as `floorplan.edge_span` is per edge: one
+        M3 hole drawn on Edge.Cuts mid-board made every body on the board
+        unmeasured, and the band and the seat then read every connector on
+        its courtyard (tigard J1, body flush on the rectangle, was seated
+        with its body 0.50 mm inside)."""
+        if not self.boundary_reason:
+            return ''
+        if not self.source.blocks or not self.bounds or edge not in EDGES:
+            return self.boundary_reason
+        gate = self.zero_gate()
+        region = _board_region(gate) if gate.active else None
+        if region is None:
+            return self.boundary_reason
+        b = self.bounds
+        outside = dict(zip(EDGES, (b[0] - rect[0], rect[2] - b[2],
+                                   b[1] - rect[1], rect[3] - b[3])))
+        for e in EDGES:
+            if e != edge and outside[e] <= EPS:
+                continue
+            ax = 0 if e in ('north', 'south') else 1
+            lo, hi = max(rect[ax], b[ax]), min(rect[ax + 2], b[ax + 2])
+            if not any(r0 - _RUN_TOL_MM <= lo and hi <= r1 + _RUN_TOL_MM
+                       for r0, r1 in self._edge_runs(e)):
+                return (f'the {e} edge is not one straight Edge.Cuts run under '
+                        f'the body (a notch, a curve or a gap in it there)')
+        clip = (max(rect[0], b[0]), max(rect[1], b[1]),
+                min(rect[2], b[2]), min(rect[3], b[3]))
+        if clip[0] < clip[2] and clip[1] < clip[3] \
+                and not _covers(gate, region, clip):
+            return ('the outline under the body is not plain board (a '
+                    'cut-out, a notch or a rounded corner there)')
+        return ''
+
+    def measure(self, ref, edge, pose=None):
+        rect, layer, reason = self.rect(ref, pose)
+        row = {'body_measured': False, 'body_layer': layer,
+               'body_overhang_mm': None, 'body_setback_mm': None,
+               'body_signed_position_mm': None, 'units': 'mm',
+               'boundary_basis': ('rectangular Edge.Cuts centreline'
+                                  if not self.boundary_reason else
+                                  'straight Edge.Cuts run under the body'),
+               'mating_face_basis': 'drawn envelope support line toward '
+                                    'the declared edge'}
+        if not reason and edge not in EDGES:
+            reason = ('no declared mating edge; a nearest-edge guess is not '
+                      'a requirement')
+        reason = reason or self.boundary_under(rect, edge)
+        if reason:
+            row['body_unmeasured_reason'] = reason
+            return row
+        b = self.bounds
+        outside = dict(zip(EDGES, (b[0] - rect[0], rect[2] - b[2],
+                                   b[1] - rect[1], rect[3] - b[3])))
+        signed = outside[edge]
+        others = {e: max(0.0, v) for e, v in outside.items() if e != edge}
+        row.update(body_measured=True,
+                   body_overhang_mm=max(0.0, signed),
+                   body_setback_mm=max(0.0, -signed),
+                   body_signed_position_mm=signed,
+                   body_bounds_mm=list(rect),
+                   other_body_edge_overhang_mm=others,
+                   # The overhang the band is graded on: ONE signed distance
+                   # past the DECLARED edge along its normal (#1403). It was
+                   # summed over every side the body crosses, so a corner
+                   # part read 3x (a rounded outline) or another edge's
+                   # overhang read as the mating edge's; the other edges'
+                   # overhang is `other_body_edge_overhang_mm`, graded on its
+                   # own (`edge_connector_other_edge`).
+                   body_outside_mm=max(0.0, signed))
+        return row
+
+
+def pad_boxes(geometry, ref):
+    """`(index, lx, ly, half_x, half_y, tilt)` per copper pad of `ref`, in
+    the footprint's LOCAL frame, so a trial pose only adds its own rotation.
+    `index` is the pad's position in `fp.pads`, which is how
+    `grade_pad_edge_clearance` names a pad, so a caller can ask about the
+    pads that grader could not model.
+
+    Pads with no copper are skipped, through `legality._pad_has_no_copper`:
+    NPTH holes, and any pad declaring no `.Cu` layer. So are castellated
+    pads, which sit on the outline by design. Pose-independent, so it is
+    built once per part.
+    """
+    boxes = geometry._pad_boxes.get(ref)
+    if boxes is None:
+        from .legality import _pad_has_no_copper
+        fp = geometry.pcb.footprints.get(ref)
+        base = (fp.rotation or 0.0) if fp is not None else 0.0
+        boxes = []
+        for index, pad in enumerate(getattr(fp, 'pads', None) or ()):
+            if _pad_has_no_copper(pad) or getattr(pad, 'castellated', False):
+                continue
+            # `rect_rotation` is the residual tilt of the rectangle that
+            # `size_x`/`size_y` describe, stored NEGATED with respect to the
+            # pose transform (a pad at 30 degrees parses as -30). Carry it in
+            # the pose convention, and relative to the footprint, so a trial
+            # rotation is a plain addition. Measured against the edge grader
+            # on written boards: keeping the parsed sign put a pad at 30 deg
+            # at 7 deg when the part turned 37, over-stating its extent.
+            tilt = -(pad.rect_rotation or 0.0)
+            if tilt == 0.0:
+                # The broad phase bakes near-cardinal angles into size_x/y;
+                # recover the rest, as `grade_pad_edge_clearance` does.
+                tilt = ((getattr(pad, 'rotation', 0.0) or 0.0) + 45) % 90 - 45
+            boxes.append((index, pad.local_x, pad.local_y, pad.size_x / 2.0,
+                          pad.size_y / 2.0, tilt - base))
+        geometry._pad_boxes[ref] = boxes
+    return boxes
+
+
+def pad_copper_outside(geometry, gate, ref, pose, only=None):
+    """How far `ref`'s pad copper leaves `gate`'s outline at `pose`, 0.0 when
+    none of it does.
+
+    The bounding box of the rotated pad rectangle, so it never UNDER-states a
+    rounded, oval or roundrect pad (their copper is inside that box). Pass a
+    zero-margin gate for containment; a margin gate would be asking the
+    edge-clearance question, which belongs to `check_drc`.
+
+    `only`, a set of pad indices, narrows it to those pads -- how a caller
+    that has exact extrema for the rest asks about just the pads no exact
+    reading covers.
+    """
+    x, y, rot = pose
+    c, s = math.cos(math.radians(rot)), math.sin(math.radians(rot))
+    worst = 0.0
+    for index, lx, ly, hx, hy, tilt in pad_boxes(geometry, ref):
+        if only is not None and index not in only:
+            continue
+        angle = math.radians(tilt + rot)
+        ca, sa = abs(math.cos(angle)), abs(math.sin(angle))
+        ex, ey = hx * ca + hy * sa, hx * sa + hy * ca
+        px, py = x + c * lx + s * ly, y - s * lx + c * ly
+        worst = max(worst, gate.rect_outside_amount(
+            (px - ex, py - ey, px + ex, py + ey)))
+    return worst
+
+
+def pad_copper_depth(geometry, ref, pose, only=None):
+    """How far `ref`'s pad copper reaches past the OUTLINE at `pose`, as a
+    distance: the farthest point of each pad's rotated box from the board
+    region (`_depth_beyond`), 0.0 when it is all on the board (#1585).
+
+    The reading for pads whose edge-clearance finding came from the sampled
+    (non-rectangular) path, which carries no gap: since the body is measured
+    on such outlines where the edge is straight under it, the band no longer
+    reads the courtyard that used to carry that copper. A box, so it never
+    under-states a round pad. Falls back to `pad_copper_outside` when the
+    region cannot be built."""
+    gate = geometry.zero_gate()
+    region = _board_region(gate) if gate.active else None
+    if region is None:
+        return pad_copper_outside(geometry, gate, ref, pose, only=only)
+    x, y, rot = pose
+    c, s = math.cos(math.radians(rot)), math.sin(math.radians(rot))
+    worst = 0.0
+    for index, lx, ly, hx, hy, tilt in pad_boxes(geometry, ref):
+        if only is not None and index not in only:
+            continue
+        angle = math.radians(tilt + rot)
+        ca, sa = abs(math.cos(angle)), abs(math.sin(angle))
+        ex, ey = hx * ca + hy * sa, hx * sa + hy * ca
+        px, py = x + c * lx + s * ly, y - s * lx + c * ly
+        worst = max(worst, _depth_beyond(region, (px - ex, py - ey, px + ex, py + ey)))
+    return worst
+
+
+def geometry_for(holder, pcb_data, pcb_file):
+    """One `ConnectorGeometry` per holder (a grade context or a search state),
+    built on first use -- no board without an edge connector pays for it."""
+    geometry = getattr(holder, '_connector_geometry', None)
+    if geometry is None or geometry.pcb is not pcb_data:
+        geometry = ConnectorGeometry(pcb_data, pcb_file)
+        holder._connector_geometry = geometry
+    return geometry
+
+
+def courtyard_overhang(geometry, rect, skip_rings=None):
+    """How far the courtyard `rect` lies past the outline, read at ZERO
+    margin: the occupancy reading (`rect_outside_amount`) with the edge
+    margin taken out. A RANKING quantity, summed over every side the rect
+    crosses and, on a non-rectangular outline, over each off-board corner --
+    so it is NOT "an overhang of x reads x": a courtyard 0.84 mm past one
+    edge of a rounded outline reads 2.5. The band a connector is graded on
+    is `courtyard_overhang_past` (#1403). `skip_rings` is the caller's own
+    (the part's milled rings, as the oob census skips them)."""
+    return float(geometry.zero_gate().rect_outside_amount(
+        rect, skip_rings=skip_rings))
+
+
+def _board_region(gate):
+    """The board as one shapely region (outer rings minus cutouts), built once
+    per gate; None when it cannot be built."""
+    region = getattr(gate, '_region_1403', False)
+    if region is False:
+        try:
+            from shapely.geometry import Polygon
+            from shapely.ops import unary_union
+            outers = (gate.outer if gate.outer and not isinstance(gate.outer[0], tuple)
+                      else [gate.outer])
+            region = unary_union([Polygon(o).buffer(0) for o in outers if len(o) >= 3])
+            if gate.cutouts:
+                region = region.difference(unary_union(
+                    [Polygon(c).buffer(0) for c in gate.cutouts if len(c) >= 3]))
+        except Exception:                                    # noqa: BLE001
+            region = None
+        gate._region_1403 = region
+    return region
+
+
+#: Two Edge.Cuts segments this close (mm) to a bounds side are ON it, and a
+#: run reaching this close to a body's end covers it (`floorplan.edge_span`'s
+#: tolerance).
+_RUN_TOL_MM = 0.01
+
+
+def edge_runs(gate, bounds, edge, tol=_RUN_TOL_MM):
+    """The straight Edge.Cuts runs lying on `edge`'s side of `bounds`, as
+    merged `[lo, hi]` spans along it: `gate`'s ring segments within `tol` of
+    that side, end to end within `tol` merged. [] when the gate has no rings
+    or none lies there. One reading for `floorplan.edge_span` (which wants one
+    span) and the body measurement (which wants the run under a part)."""
+    if edge not in EDGES or not bounds or not getattr(gate, 'rings', None):
+        return []
+    ax = 0 if edge in ('north', 'south') else 1
+    perp = 1 - ax
+    target = {'north': bounds[1], 'south': bounds[3],
+              'west': bounds[0], 'east': bounds[2]}[edge]
+    runs = []
+    for seg in gate.edges():
+        a, b = (seg[0], seg[1]), (seg[2], seg[3])
+        if abs(a[perp] - target) > tol or abs(b[perp] - target) > tol:
+            continue
+        lo, hi = sorted((a[ax], b[ax]))
+        if hi - lo > 1e-9:
+            runs.append([lo, hi])
+    runs.sort()
+    merged = []
+    for lo, hi in runs:
+        if merged and lo <= merged[-1][1] + tol:
+            merged[-1][1] = max(merged[-1][1], hi)
+        else:
+            merged.append([lo, hi])
+    return merged
+
+
+def _covers(gate, region, rect):
+    """Does the board `region` cover `rect`, to a micrometre? The region is
+    grown that much once per gate, so a body flush on an edge drawn at the
+    same coordinates is covered."""
+    grown = getattr(gate, '_region_1585', None)
+    if grown is None:
+        try:
+            from shapely.prepared import prep
+            grown = prep(region.buffer(1e-3))
+        except Exception:                                    # noqa: BLE001
+            grown = False
+        gate._region_1585 = grown
+    if grown is False:
+        return False
+    from shapely.geometry import box
+    return bool(grown.covers(box(*rect)))
+
+
+def _depth_beyond(region, rect):
+    """The farthest any part of `rect` lies from `region` (0.0 when it lies
+    within it): one distance, whatever number of sides, corners or notches the
+    rect crosses. The vertices of the part outside are exact for a rect that
+    overhangs a straight edge; a rect lying in a notch has its deepest point
+    in the middle of the void, so the part outside is also sampled on a grid
+    (to the grid's resolution, <= 0.1 mm)."""
+    import shapely
+    from shapely.geometry import box
+    out = box(*rect).difference(region)
+    if out.is_empty or out.area <= 1e-12:
+        return 0.0
+    pts = []
+    for g in getattr(out, 'geoms', [out]):
+        if g.geom_type != 'Polygon':
+            continue
+        pts.extend(g.exterior.coords)
+        for ring in g.interiors:
+            pts.extend(ring.coords)
+    x0, y0, x1, y1 = out.bounds
+    nx = max(2, min(80, int((x1 - x0) / 0.1) + 2))
+    ny = max(2, min(80, int((y1 - y0) / 0.1) + 2))
+    for i in range(nx):
+        for j in range(ny):
+            pts.append((x0 + (x1 - x0) * i / (nx - 1), y0 + (y1 - y0) * j / (ny - 1)))
+    arr = shapely.points(pts)
+    inside = shapely.contains(out, arr) | shapely.touches(out, arr)
+    arr = arr[inside]
+    if len(arr) == 0:
+        return 0.0
+    return float(shapely.distance(region, arr).max())
+
+
+def courtyard_overhang_past(geometry, rect, edge, skip_rings=None):
+    """`(amount, others)` for the courtyard `rect` against the DECLARED
+    `edge` (#1403): `amount` is one distance past that edge along its normal
+    (0 when inside) and `others` the same for each other compass edge. On an
+    outline with rings (a rounded corner, a notch, a cutout) `amount` also
+    counts how far the rest of the rect -- cut off at the other edges' lines
+    -- reaches beyond the board, so a courtyard hanging off a rounded corner
+    or into a notch is not read as flush. It is never the sum of every
+    off-board corner and near side that `courtyard_overhang` ranks poses by.
+    Falls back to that summed reading when the edge or the bounds are
+    unknown."""
+    b = geometry.bounds
+    if edge not in EDGES or b is None:
+        return courtyard_overhang(geometry, rect, skip_rings), {}
+    outside = dict(zip(EDGES, (b[0] - rect[0], rect[2] - b[2],
+                               b[1] - rect[1], rect[3] - b[3])))
+    amount = max(0.0, outside[edge])
+    others = {e: max(0.0, v) for e, v in outside.items() if e != edge}
+    gate = geometry.zero_gate()
+    if gate.active:
+        region = _board_region(gate)
+        if region is not None:
+            # What the rect does past another edge's line is `others`; the
+            # rest of it is measured against the outline, so a corner that
+            # hangs off a rounded outline or into a notch counts for the
+            # declared edge, by its distance from the board.
+            clip = (rect[0] if edge == 'west' else max(rect[0], b[0]),
+                    rect[1] if edge == 'north' else max(rect[1], b[1]),
+                    rect[2] if edge == 'east' else min(rect[2], b[2]),
+                    rect[3] if edge == 'south' else min(rect[3], b[3]))
+            depth = (_depth_beyond(region, clip)
+                     if clip[0] < clip[2] and clip[1] < clip[3] else 0.0)
+            amount = max(amount, float(depth))
+        else:
+            amount = max(amount, float(courtyard_overhang(geometry, rect, skip_rings)))
+    return float(amount), others
+
+
+def edge_setback(bounds, rect, edge):
+    """How far `rect` stands inside the compass `edge` of `bounds`: its
+    outward side's distance from that side's line, 0.0 when it reaches or
+    crosses it (#1584). The one distance a seat line and the grade's
+    setback disclosure both name; None when the edge or the bounds are
+    unknown."""
+    if edge not in EDGES or not bounds or rect is None:
+        return None
+    inside = {'west': rect[0] - bounds[0], 'east': bounds[2] - rect[2],
+              'north': rect[1] - bounds[1], 'south': bounds[3] - rect[3]}[edge]
+    return max(0.0, float(inside))
+
+
+def band_amount(geometry, ref, edge, legacy_amount, margin, pose=None):
+    """`(amount, basis, row)`: the number a declared `overhang_mm` band is
+    graded on, and the currency it is in.
+
+    Drawn body measurable -> the body's overhang past the DECLARED edge at
+    zero margin (`body_outside_mm`, #1403: one signed distance along that
+    edge's normal, not a sum over the sides it crosses). Otherwise -> `legacy_amount`, the
+    caller's courtyard reading, taken at `margin`, so every call site keeps
+    its own rings and tolerance wherever the body cannot be read.
+
+    #1301: the grade (`rule_edge_connector`, `oob_exempt`) and the grouped
+    edge seat pass the courtyard at ZERO margin (`courtyard_overhang`,
+    margin 0), so both currencies are mechanical and one pose reads the same
+    before and after a routing step rewrites the board's floors. At the
+    gate's margin, `overhang + margin` outside the board, daplink's J2/J3
+    read 7.0062 placed (margin 0.55) and 6.6562 routed (margin 0.2) with
+    nothing moved, and failed a band of 7.0 after routing; at zero margin
+    both boards read 6.4562. Main's place_seed still passes its gate-margin
+    reading, as before."""
+    row = geometry.measure(ref, edge, pose)
+    if row['body_measured']:
+        return row['body_outside_mm'], 'body:' + row['body_layer'], row
+    return (float(legacy_amount),
+            f'legacy_occupancy@margin={float(margin):g}', row)

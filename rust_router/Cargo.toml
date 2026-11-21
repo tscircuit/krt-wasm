@@ -1,6 +1,6 @@
 [package]
 name = "grid_router"
-version = "0.15.0"
+version = "0.24.1"
 edition = "2021"
 
 [lib]
@@ -9,10 +9,12 @@ crate-type = ["cdylib", "rlib"]
 
 [features]
 default = ["python"]
-python = ["dep:pyo3", "dep:numpy"]
+python = ["dep:pyo3", "dep:numpy", "dep:mimalloc", "dep:cfg_eval"]
 wasm = ["dep:wasm-bindgen", "dep:serde", "dep:serde-wasm-bindgen"]
 
 [dependencies]
+cfg_eval = { version = "0.1", features = ["items"], optional = true }
+mimalloc = { version = "0.1", default-features = false, optional = true }
 pyo3 = { version = "0.23", features = ["extension-module", "abi3-py39"], optional = true }
 numpy = { version = "0.23", optional = true }  # NumPy support for PyO3
 rustc-hash = "2.1"  # Fast hash for integer keys

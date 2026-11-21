@@ -13,16 +13,69 @@ PLUGIN_DIR = os.path.dirname(os.path.abspath(__file__))
 ROOT_DIR = os.path.dirname(PLUGIN_DIR)
 if ROOT_DIR not in sys.path:
     sys.path.insert(0, ROOT_DIR)
+# #522 layout: the engine modules live in py_router/ under the repo root.
+# The exists() guard keeps a FLAT installed layout (PCM zip) working too.
+_ENGINE_DIR = os.path.join(ROOT_DIR, 'py_router')
+if os.path.isdir(_ENGINE_DIR) and _ENGINE_DIR not in sys.path:
+    sys.path.insert(0, _ENGINE_DIR)
+# py_placer/ holds the placement package (placement.groups / .fanout_clearance
+# are imported from here) and py_tools/ the instruments. Same exists() guard so
+# a FLAT installed layout (PCM zip) keeps working.
+for _sib in ('py_placer', 'py_tools'):
+    _d = os.path.join(ROOT_DIR, _sib)
+    if os.path.isdir(_d) and _d not in sys.path:
+        sys.path.append(_d)
 
 import routing_defaults as defaults
-from .gui_utils import StdoutRedirector
+from kicad_parser import mm_to_iu
+from keep_away import split_keep_away_specs
+from .gui_utils import StdoutRedirector, board_minima_from_live
+
+
+def parse_diff_pairs_result(value):
+    """Parse an /identify-diff-pairs RESULT line (issue #40).
+
+    Format: sections separated by ';', each '<kind>:<comma-separated items>'.
+      confirm: pair base names verified as differential by pin function
+      reject:  base names that name-matching paired but are NOT differential
+      custom:  P|N net-name pairs found by pin function that don't follow
+               P/N naming conventions (not yet representable in the GUI)
+    e.g. 'confirm:/CLK,/DATA;reject:/FOO;custom:/TXP|/TXN'
+
+    Returns (dict with confirm/reject/custom lists, notes).
+    """
+    parsed = {"confirm": [], "reject": [], "custom": []}
+    notes = []
+    for section in str(value).split(";"):
+        section = section.strip()
+        if not section:
+            continue
+        kind, sep, items = section.partition(":")
+        kind = kind.strip().lower()
+        if not sep or kind not in parsed:
+            notes.append(f"diff pairs: unparseable section {section!r}")
+            continue
+        for item in items.split(","):
+            item = item.strip()
+            if not item:
+                continue
+            if kind == "custom":
+                p, sep2, n = item.partition("|")
+                if sep2 and p.strip() and n.strip():
+                    parsed["custom"].append((p.strip(), n.strip()))
+                else:
+                    notes.append(f"diff pairs: unparseable custom pair {item!r}")
+            else:
+                parsed[kind].append(item)
+    return parsed, notes
 
 
 class DiffPairSelectionPanel(wx.Panel):
     """Panel for selecting differential pairs to route."""
 
     def __init__(self, parent, pcb_data, instructions=None,
-                 show_hide_checkbox=True, show_component_dropdown=True):
+                 show_hide_checkbox=True, show_component_dropdown=True,
+                 on_ask_ai=None):
         """
         Create a differential pair selection panel.
 
@@ -32,14 +85,19 @@ class DiffPairSelectionPanel(wx.Panel):
             instructions: Optional instruction text
             show_hide_checkbox: Whether to show the hide checkbox
             show_component_dropdown: Whether to show the component dropdown
+            on_ask_ai: Callback for the "Ask AI" button that verifies
+                pairs by pin function (issue #40); button hidden if None.
         """
         super().__init__(parent)
         self.pcb_data = pcb_data
+        self.on_ask_ai = on_ask_ai
         self.all_pairs = []  # List of (display_name, base_name, p_net_id, n_net_id)
         self._checked_pairs = set()
         self._check_fn = None
         self._suspend_check = False  # Temporarily disable check_fn during restore
         self._component_filter_value = ""
+        self._hide_short = False      # hide electrically-short (deferred) pairs
+        self._short_check_fn = None   # fn(p_net_id, n_net_id) -> bool
 
         self._create_ui(instructions, show_hide_checkbox, show_component_dropdown)
         self._load_diff_pairs()
@@ -101,6 +159,14 @@ class DiffPairSelectionPanel(wx.Panel):
         unselect_btn.Bind(wx.EVT_BUTTON, self._on_unselect)
         btn_sizer.Add(select_btn, 1, wx.RIGHT, 5)
         btn_sizer.Add(unselect_btn, 1)
+        if self.on_ask_ai is not None:
+            ask_btn = wx.Button(self, label="Ask AI", style=wx.BU_EXACTFIT)
+            ask_btn.SetToolTip(
+                "Run the identify-diff-pairs skill: verifies pairs by pin "
+                "function via datasheets, then checks confirmed pairs and "
+                "unchecks name-matching false positives. Takes a few minutes.")
+            ask_btn.Bind(wx.EVT_BUTTON, lambda event: self.on_ask_ai())
+            btn_sizer.Add(ask_btn, 0, wx.LEFT, 5)
         sizer.Add(btn_sizer, 0, wx.EXPAND | wx.LEFT | wx.RIGHT | wx.BOTTOM, 5)
 
         self.SetSizer(sizer)
@@ -208,6 +274,11 @@ class DiffPairSelectionPanel(wx.Panel):
             if hide_connected and self._check_fn and not self._suspend_check:
                 if self._check_fn(p_net_id) and self._check_fn(n_net_id):
                     continue
+            # Check if should be hidden (electrically short -> deferred to
+            # single-ended, so coupling it does nothing)
+            if self._hide_short and self._short_check_fn:
+                if self._short_check_fn(p_net_id, n_net_id):
+                    continue
             idx = self.pair_list.Append(display_name)
             if display_name in self._checked_pairs:
                 self.pair_list.Check(idx, True)
@@ -239,6 +310,15 @@ class DiffPairSelectionPanel(wx.Panel):
     def set_check_function(self, fn):
         """Set connectivity check function."""
         self._check_fn = fn
+
+    def set_short_check_function(self, fn):
+        """Set the short-pair test: fn(p_net_id, n_net_id) -> bool."""
+        self._short_check_fn = fn
+
+    def set_hide_short(self, enabled):
+        """Enable/disable hiding electrically-short (deferred) pairs, then refresh."""
+        self._hide_short = bool(enabled)
+        self._update_pair_list()
 
     def suspend_check(self):
         """Temporarily disable connectivity checking during settings restore."""
@@ -274,6 +354,27 @@ class DiffPairSelectionPanel(wx.Panel):
             selected.append(base_name)
         return selected
 
+    def set_selected_pairs_by_net(self, net_names):
+        """Pre-check differential pairs whose P or N net is in net_names.
+
+        Replaces the current checked state with the pairs that have either
+        their positive or negative net named in net_names, then refreshes.
+
+        Args:
+            net_names: Iterable of net name strings.
+        """
+        names = set(net_names)
+        checked = set()
+        for display_name, base_name, p_net_id, n_net_id in self.all_pairs:
+            p_net = self.pcb_data.nets.get(p_net_id)
+            n_net = self.pcb_data.nets.get(n_net_id)
+            p_name = p_net.name if p_net else None
+            n_name = n_net.name if n_net else None
+            if p_name in names or n_name in names:
+                checked.add(display_name)
+        self._checked_pairs = checked
+        self.refresh(sync_from_visible=False)
+
     def get_selected_pair_net_ids(self):
         """Get list of (base_name, p_net_id, n_net_id) for selected pairs."""
         selected_names = set(self._checked_pairs)
@@ -299,7 +400,7 @@ class DifferentialTab(wx.Panel):
     def __init__(self, parent, pcb_data, board_filename,
                  get_shared_params=None, get_connectivity_check=None,
                  get_routing_config=None, append_log=None,
-                 sync_pcb_data_callback=None):
+                 sync_pcb_data_callback=None, get_ai_params=None):
         """
         Create the differential pair routing tab.
 
@@ -312,6 +413,8 @@ class DifferentialTab(wx.Panel):
             get_routing_config: Callback to get full routing config from main dialog
             append_log: Callback to append text to log
             sync_pcb_data_callback: Callback to sync pcb_data from board after routing
+            get_ai_params: Callback returning the AI tab's
+                {'model', 'effort'} selections for headless runs
         """
         super().__init__(parent)
         self.pcb_data = pcb_data
@@ -321,14 +424,27 @@ class DifferentialTab(wx.Panel):
         self.get_routing_config = get_routing_config
         self.append_log = append_log
         self.sync_pcb_data_callback = sync_pcb_data_callback
+        self.get_ai_params = get_ai_params
         self._routing_thread = None
         self._cancel_requested = False
+        # Called when "Hide short routes" or a param affecting it changes, so the
+        # main dialog can refresh the Basic tab's single-ended net list too.
+        self.on_hide_short_changed = None
+        self._short_cache = {}  # (params_key, p_net_id, n_net_id) -> bool
 
         self._create_ui()
 
         # Set up connectivity check
         if self.get_connectivity_check:
             self.pair_panel.set_check_function(self.get_connectivity_check())
+        # Wire short-pair hiding (default on)
+        self.pair_panel.set_short_check_function(self._is_short_pair)
+        self.pair_panel.set_hide_short(self.hide_short_check.GetValue())
+        # Pair Width / Gap / Centerline Setback change the short threshold, so a
+        # change must re-evaluate which pairs are short.
+        for ctrl in (self.diff_pair_width, self.diff_pair_gap, self.centerline_setback):
+            ctrl.Bind(wx.EVT_SPINCTRLDOUBLE, self._on_short_param_changed)
+            ctrl.Bind(wx.EVT_TEXT, self._on_short_param_changed)
 
     def _create_ui(self):
         """Create the tab UI."""
@@ -342,7 +458,8 @@ class DifferentialTab(wx.Panel):
             self, self.pcb_data,
             instructions="Select differential pairs to route...",
             show_hide_checkbox=True,
-            show_component_dropdown=True
+            show_component_dropdown=True,
+            on_ask_ai=self._on_ask_ai_diff_pairs
         )
         pair_box_sizer.Add(self.pair_panel, 1, wx.EXPAND)
 
@@ -355,33 +472,75 @@ class DifferentialTab(wx.Panel):
         param_box = wx.StaticBox(self, label="Differential Pair Parameters")
         param_sizer = wx.StaticBoxSizer(param_box, wx.VERTICAL)
 
-        # Use net class definitions checkbox
-        self.use_netclass_check = wx.CheckBox(self, label="Use net class definitions")
-        self.use_netclass_check.SetValue(False)
-        self.use_netclass_check.SetToolTip("Use DP width and gap from selected net class")
-        self.use_netclass_check.Bind(wx.EVT_CHECKBOX, self._on_use_netclass_changed)
-        param_sizer.Add(self.use_netclass_check, 0, wx.ALL, 5)
-
         param_grid = wx.FlexGridSizer(cols=2, hgap=10, vgap=5)
         param_grid.AddGrowableCol(1)
 
-        # Diff pair width
+        # Diff pair width -- "override checkbox + spinctrl" row (like the Basic
+        # tab's geometry floors). Unchecked = default from the board Default
+        # net-class diff_pair_width; checking the box overrides with the typed value.
         param_grid.Add(wx.StaticText(self, label="Pair Width (mm):"), 0, wx.ALIGN_CENTER_VERTICAL)
         r = defaults.PARAM_RANGES['diff_pair_width']
+        dpw_sizer = wx.BoxSizer(wx.HORIZONTAL)
+        self.diff_pair_width_check = wx.CheckBox(self, label="")
+        self.diff_pair_width_check.SetValue(False)
+        self.diff_pair_width_check.SetToolTip(
+            "Override the pair leg width (unchecked = use the board Default "
+            "net-class differential-pair width)")
+        self.diff_pair_width_check.Bind(wx.EVT_CHECKBOX, self._on_diff_geom_override_check)
         self.diff_pair_width = wx.SpinCtrlDouble(self, min=r['min'], max=r['max'],
                                                   initial=defaults.DIFF_PAIR_WIDTH, inc=r['inc'])
         self.diff_pair_width.SetDigits(r['digits'])
         self.diff_pair_width.SetToolTip("Track width for differential pair traces")
-        param_grid.Add(self.diff_pair_width, 0, wx.EXPAND)
+        self.diff_pair_width.Enable(False)
+        dpw_sizer.Add(self.diff_pair_width_check, 0, wx.ALIGN_CENTER_VERTICAL | wx.RIGHT, 5)
+        dpw_sizer.Add(self.diff_pair_width, 1, wx.EXPAND)
+        param_grid.Add(dpw_sizer, 0, wx.EXPAND)
 
-        # Diff pair gap
+        # Diff pair gap -- same override pattern (unchecked = board Default
+        # net-class diff_pair_gap).
         param_grid.Add(wx.StaticText(self, label="Pair Gap (mm):"), 0, wx.ALIGN_CENTER_VERTICAL)
         r = defaults.PARAM_RANGES['diff_pair_gap']
+        dpg_sizer = wx.BoxSizer(wx.HORIZONTAL)
+        self.diff_pair_gap_check = wx.CheckBox(self, label="")
+        self.diff_pair_gap_check.SetValue(False)
+        self.diff_pair_gap_check.SetToolTip(
+            "Override the pair gap (unchecked = use the board Default net-class "
+            "differential-pair gap)")
+        self.diff_pair_gap_check.Bind(wx.EVT_CHECKBOX, self._on_diff_geom_override_check)
         self.diff_pair_gap = wx.SpinCtrlDouble(self, min=r['min'], max=r['max'],
                                                 initial=defaults.DIFF_PAIR_GAP, inc=r['inc'])
         self.diff_pair_gap.SetDigits(r['digits'])
         self.diff_pair_gap.SetToolTip("Gap between P and N traces")
-        param_grid.Add(self.diff_pair_gap, 0, wx.EXPAND)
+        self.diff_pair_gap.Enable(False)
+        dpg_sizer.Add(self.diff_pair_gap_check, 0, wx.ALIGN_CENTER_VERTICAL | wx.RIGHT, 5)
+        dpg_sizer.Add(self.diff_pair_gap, 1, wx.EXPAND)
+        param_grid.Add(dpg_sizer, 0, wx.EXPAND)
+
+        # Differential impedance (optional). When > 0 the per-layer trace width
+        # is computed from the board stackup using Pair Gap as spacing and
+        # overrides Pair Width -- the GUI counterpart of route_diff.py --impedance.
+        param_grid.Add(wx.StaticText(self, label="Diff Impedance (Ω):"), 0, wx.ALIGN_CENTER_VERTICAL)
+        self.diff_impedance = wx.SpinCtrlDouble(self, min=0.0, max=200.0,
+                                                initial=0.0, inc=5.0)
+        self.diff_impedance.SetDigits(0)
+        self.diff_impedance.SetToolTip(
+            "Target differential impedance in ohms (e.g. 90, 100). When > 0, the "
+            "per-layer trace width is derived from the board stackup using Pair "
+            "Gap as spacing, overriding Pair Width. 0 = off (use Pair Width).")
+        param_grid.Add(self.diff_impedance, 0, wx.EXPAND)
+
+        # #1630: declare the ohms without changing the pair geometry; named
+        # after the engine param, so a plan step reaches it
+        param_grid.Add(wx.StaticText(self, label="Declare Only:"), 0, wx.ALIGN_CENTER_VERTICAL)
+        self.impedance_declare_only = wx.CheckBox(self, label="")
+        self.impedance_declare_only.SetValue(False)
+        self.impedance_declare_only.SetToolTip(
+            "#1630: with Diff Impedance > 0, RECORD the target ohms for these nets and "
+            "change nothing else -- they route at the project's own pair width and gap, as "
+            "without Diff Impedance, and check_impedance.py grades the copper against "
+            "the ohms. For a pair class the project sized itself; a later step never "
+            "recomputes widths from the record. (CLI: --impedance-declare-only)")
+        param_grid.Add(self.impedance_declare_only, 0, wx.EXPAND)
 
         # Min turning radius
         param_grid.Add(wx.StaticText(self, label="Min Turn Radius (mm):"), 0, wx.ALIGN_CENTER_VERTICAL)
@@ -419,14 +578,33 @@ class DifferentialTab(wx.Panel):
         self.chamfer_extra.SetToolTip("Chamfer multiplier for meanders (>1 avoids P/N crossings)")
         param_grid.Add(self.chamfer_extra, 0, wx.EXPAND)
 
-        # Centerline setback
+        # Centerline setback -- the same override row as Pair Width / Gap.
+        # Unchecked = auto (route_diff.py with no --diff-pair-centerline-setback:
+        # the engine's 2x P-N distance); checked = the typed value, 0 INCLUDED
+        # -- an explicit 0 is a setback of zero to the engine, not auto, which
+        # the old "0 = auto" spin could not express.
         param_grid.Add(wx.StaticText(self, label="Centerline Setback (mm):"), 0, wx.ALIGN_CENTER_VERTICAL)
         r = defaults.PARAM_RANGES['diff_pair_centerline_setback']
+        cls_sizer = wx.BoxSizer(wx.HORIZONTAL)
+        self.centerline_setback_check = wx.CheckBox(self, label="")
+        self.centerline_setback_check.SetValue(False)
+        self.centerline_setback_check.SetToolTip(
+            "Override the centerline setback (unchecked = auto: 2x the P-N "
+            "distance, route_diff.py's default)")
+        self.centerline_setback_check.Bind(wx.EVT_CHECKBOX,
+                                           self._on_diff_geom_override_check)
         self.centerline_setback = wx.SpinCtrlDouble(self, min=r['min'], max=r['max'],
                                                      initial=defaults.DIFF_PAIR_CENTERLINE_SETBACK, inc=r['inc'])
         self.centerline_setback.SetDigits(r['digits'])
-        self.centerline_setback.SetToolTip("Distance in front of stubs to start centerline route (0 = auto: 2x P-N spacing)")
-        param_grid.Add(self.centerline_setback, 0, wx.EXPAND)
+        self.centerline_setback.SetToolTip(
+            "Distance in front of the stubs to start the centerline route "
+            "(route_diff.py --diff-pair-centerline-setback); 0 starts it at "
+            "the stubs")
+        self.centerline_setback.Enable(False)
+        cls_sizer.Add(self.centerline_setback_check, 0,
+                      wx.ALIGN_CENTER_VERTICAL | wx.RIGHT, 5)
+        cls_sizer.Add(self.centerline_setback, 1, wx.EXPAND)
+        param_grid.Add(cls_sizer, 0, wx.EXPAND)
 
         param_sizer.Add(param_grid, 0, wx.EXPAND | wx.ALL, 5)
 
@@ -436,10 +614,26 @@ class DifferentialTab(wx.Panel):
         options_box = wx.StaticBox(self, label="Options")
         options_sizer = wx.StaticBoxSizer(options_box, wx.VERTICAL)
 
-        self.fix_polarity_check = wx.CheckBox(self, label="Fix polarity swaps")
-        self.fix_polarity_check.SetValue(True)
-        self.fix_polarity_check.SetToolTip("Swap target pad net assignments if polarity swap is needed")
-        options_sizer.Add(self.fix_polarity_check, 0, wx.ALL, 5)
+        # Per-pair polarity-swap allowlist (#279): glob patterns naming the
+        # pairs allowed to resolve a P/N mismatch by swapping pad nets.
+        # '*' = all pairs (the historical behavior), empty = no swaps ever.
+        polarity_row = wx.BoxSizer(wx.HORIZONTAL)
+        polarity_row.Add(wx.StaticText(self, label="Polarity-swap allowed nets:"),
+                         0, wx.ALIGN_CENTER_VERTICAL | wx.RIGHT, 5)
+        # #381 D3: default EMPTY (deny all swaps), matching route_diff.py's
+        # --polarity-swap-nets deny-by-default (#279). The historical '*'
+        # (allow all) silently widened polarity swaps vs the CLI.
+        self.polarity_swap_nets_text = wx.TextCtrl(self, value="", size=(180, -1))
+        self.polarity_swap_nets_text.SetToolTip(
+            "Glob patterns (comma/space-separated) naming the diff pairs ALLOWED to "
+            "resolve a P/N polarity mismatch by swapping pad net assignments (board "
+            "only - schematic must be updated to match). A swap is only harmless when "
+            "an endpoint can compensate (FPGA generic I/O, polarity-tolerant SerDes) - "
+            "never allow USB/MIPI/TMDS pairs. '*' allows every pair; EMPTY disables "
+            "swaps entirely (a mismatched pair is routed with the connectors out the "
+            "opposite side, or skipped if that's not possible).")
+        polarity_row.Add(self.polarity_swap_nets_text, 1, wx.ALIGN_CENTER_VERTICAL)
+        options_sizer.Add(polarity_row, 0, wx.EXPAND | wx.ALL, 5)
 
         self.gnd_via_check = wx.CheckBox(self, label="Add GND vias")
         self.gnd_via_check.SetValue(True)
@@ -450,6 +644,41 @@ class DifferentialTab(wx.Panel):
         self.intra_match_check.SetValue(False)
         self.intra_match_check.SetToolTip("Add meanders to shorter track of each pair for P/N matching")
         options_sizer.Add(self.intra_match_check, 0, wx.LEFT | wx.RIGHT | wx.BOTTOM, 5)
+
+        # #1869: the lane a matched pair is measured on (route_diff's
+        # --diff-pair-intra-lane). Named after the engine parameter, so a
+        # plan step sets it by name.
+        lane_row = wx.BoxSizer(wx.HORIZONTAL)
+        lane_row.Add(wx.StaticText(self, label="Intra-pair lane:"), 0,
+                     wx.ALIGN_CENTER_VERTICAL | wx.RIGHT, 5)
+        self.diff_pair_intra_lane = wx.TextCtrl(self, value="", size=(180, -1))
+        self.diff_pair_intra_lane.SetToolTip(
+            "Match, record and grade each intra-matched pair on its lane -- the "
+            "copper path between two pads -- instead of total copper, so a branch "
+            "to a third pad counts as a stub (#1869). 'auto' (the two terminals "
+            "the pair step routes) or P_NET=REF.PAD:REF.PAD ..., space separated. "
+            "Needs intra-pair matching; a pair a .kicad_dru skew rule binds is "
+            "matched on total copper, as KiCad grades the rule. "
+            "Empty: total copper, as KiCad's skew DRC measures.")
+        lane_row.Add(self.diff_pair_intra_lane, 1, wx.ALIGN_CENTER_VERTICAL)
+        options_sizer.Add(lane_row, 0, wx.EXPAND | wx.LEFT | wx.RIGHT | wx.BOTTOM, 5)
+
+        self.ac_couple_check = wx.CheckBox(self, label="AC-coupled end-to-end matching")
+        self.ac_couple_check.SetValue(False)
+        self.ac_couple_check.SetToolTip("Length-match diff pairs split by series DC-blocking caps "
+                                        "end-to-end: detect the cap chain and match the whole P path "
+                                        "vs N path across the caps, not each side alone (#196)")
+        options_sizer.Add(self.ac_couple_check, 0, wx.LEFT | wx.RIGHT | wx.BOTTOM, 5)
+
+        self.hide_short_check = wx.CheckBox(self, label="Hide short routes")
+        self.hide_short_check.SetValue(True)
+        self.hide_short_check.SetToolTip(
+            "Hide electrically-short pairs that the router defers to single-ended "
+            "routing (coupling a sub-few-mm run gains nothing). They drop out of "
+            "the differential pair list here, and stay visible on the Basic tab "
+            "(so they get routed single-ended) even when 'Hide differential' is on.")
+        self.hide_short_check.Bind(wx.EVT_CHECKBOX, self._on_hide_short_changed)
+        options_sizer.Add(self.hide_short_check, 0, wx.LEFT | wx.RIGHT | wx.BOTTOM, 5)
 
         right_sizer.Add(options_sizer, 0, wx.EXPAND | wx.BOTTOM, 5)
 
@@ -467,7 +696,7 @@ class DifferentialTab(wx.Panel):
 
         # Route and Cancel buttons
         btn_sizer = wx.BoxSizer(wx.HORIZONTAL)
-        self.route_btn = wx.Button(self, label="Route")
+        self.route_btn = wx.Button(self, label="Route Pairs")
         self.route_btn.SetToolTip("Start routing selected differential pairs")
         self.route_btn.Bind(wx.EVT_BUTTON, self._on_route)
         btn_sizer.Add(self.route_btn, 1, wx.RIGHT, 5)
@@ -486,6 +715,142 @@ class DifferentialTab(wx.Panel):
 
         self.SetSizer(main_sizer)
 
+    def _short_params(self):
+        """Current (track_width, gap, centerline_setback) driving the short
+        test; the setback is None when it is auto."""
+        return (self._effective_diff_pair_width(),
+                self._effective_diff_pair_gap(),
+                self._centerline_setback_value())
+
+    def _centerline_setback_value(self):
+        """The setback the engine gets: None = auto (box unticked, the CLI's
+        omitted flag), else the typed value -- 0 included."""
+        if not self.centerline_setback_check.GetValue():
+            return None
+        return self.centerline_setback.GetValue()
+
+    def _is_short_pair(self, p_net_id, n_net_id):
+        """Whether this pair would be deferred to single-ended as electrically
+        short, given the current Pair Width / Gap / Centerline Setback and the
+        board's copper (a pair's own fanout escapes count, #1362). Cached per
+        (params, pair) and dropped when the copper changes: a sync replaces
+        the copper lists and routing in place appends to them."""
+        from diff_pair_multipoint import diff_pair_is_short
+        width, gap, setback = self._short_params()
+        segs, vias = self.pcb_data.segments, self.pcb_data.vias
+        copper = (id(segs), len(segs), id(vias), len(vias))
+        if copper != getattr(self, '_short_cache_copper', None):
+            self._short_cache.clear()
+            self._short_cache_copper = copper
+        key = ((round(width, 6), round(gap, 6),
+                None if setback is None else round(setback, 6)),
+               p_net_id, n_net_id)
+        if key not in self._short_cache:
+            try:
+                self._short_cache[key] = diff_pair_is_short(
+                    self.pcb_data, p_net_id, n_net_id, width, gap, setback)
+            except Exception:
+                self._short_cache[key] = False
+        return self._short_cache[key]
+
+    def is_hide_short_enabled(self):
+        """True when short (deferred) pairs should be hidden from diff lists and
+        kept on the single-ended list."""
+        return self.hide_short_check.GetValue()
+
+    def get_short_pair_net_ids(self):
+        """Net ids (P and N) of every pair that is currently electrically short.
+        Used by the Basic tab to keep these single-ended nets visible even when
+        'Hide differential' is on."""
+        ids = set()
+        for _display, _base, p_net_id, n_net_id in self.pair_panel.all_pairs:
+            if self._is_short_pair(p_net_id, n_net_id):
+                ids.add(p_net_id)
+                ids.add(n_net_id)
+        return ids
+
+    def _on_hide_short_changed(self, event):
+        """Toggle hiding short pairs; refresh this list and the Basic tab list."""
+        self.pair_panel.set_hide_short(self.hide_short_check.GetValue())
+        if self.on_hide_short_changed:
+            self.on_hide_short_changed()
+
+    def _on_short_param_changed(self, event):
+        """A param affecting the short threshold changed - drop the cache and
+        refresh both lists if short hiding is active."""
+        event.Skip()
+        self._short_cache.clear()
+        if self.hide_short_check.GetValue():
+            self.pair_panel.refresh()
+            if self.on_hide_short_changed:
+                self.on_hide_short_changed()
+
+    def _on_ask_ai_diff_pairs(self):
+        """Run identify-diff-pairs headless and update the pair selection
+        from its findings (issue #40)."""
+        from .ai_gui import run_skill_dialog, board_path_for_analysis
+        from .ai_backend import ANALYSIS_CONSTRAINT
+
+        board = board_path_for_analysis(self.board_filename)
+        if board is None:
+            return
+        value = run_skill_dialog(
+            self, "AI: identify differential pairs",
+            "identify-diff-pairs", os.path.abspath(board),
+            ANALYSIS_CONSTRAINT + " After the report, end "
+            "your reply with exactly one line of the form "
+            "RESULT=confirm:<pair base names verified as "
+            "differential by pin function, comma-separated, P/N suffix stripped>"
+            ";reject:<base names that name-matching paired but are NOT differential>"
+            ";custom:<P|N net-name pairs found by pin function that do not follow "
+            "P/N naming conventions>. Omit empty sections; use exact net names, "
+            "e.g. RESULT=confirm:/CLK,/DATA;custom:/TXP|/TXN",
+            intro=f"Running identify-diff-pairs on {os.path.basename(board)} ...\n"
+                  "(datasheet lookups; typically a few minutes)",
+            ai_params=self.get_ai_params() if self.get_ai_params else None)
+        if value is not None:
+            self._apply_diff_pairs_recommendation(value)
+
+    def _apply_diff_pairs_recommendation(self, value):
+        """Check confirmed pairs, uncheck rejected ones, report the rest."""
+        parsed, notes = parse_diff_pairs_result(value)
+        for note in notes:
+            if self.append_log:
+                self.append_log(f"AI: {note}\n")
+
+        display_by_base = {base: display for display, base, _p, _n
+                           in self.pair_panel.all_pairs}
+        confirmed = [b for b in parsed["confirm"] if b in display_by_base]
+        rejected = [b for b in parsed["reject"] if b in display_by_base]
+        unknown = [b for b in parsed["confirm"] + parsed["reject"]
+                   if b not in display_by_base]
+
+        for base in confirmed:
+            self.pair_panel._checked_pairs.add(display_by_base[base])
+        for base in rejected:
+            self.pair_panel._checked_pairs.discard(display_by_base[base])
+        if confirmed or rejected:
+            self.pair_panel._update_pair_list(sync_from_visible=False)
+
+        if self.append_log:
+            if confirmed:
+                self.append_log(f"AI confirmed diff pairs: {', '.join(confirmed)}\n")
+            if rejected:
+                self.append_log("AI flagged as NOT differential (unchecked): "
+                                f"{', '.join(rejected)}\n")
+            if unknown:
+                self.append_log(f"AI named pairs not in the list (ignored): "
+                                f"{', '.join(unknown)}\n")
+            if parsed["custom"]:
+                pairs_str = ", ".join(f"{p}/{n}" for p, n in parsed["custom"])
+                self.append_log(
+                    f"AI found pairs with unconventional names: {pairs_str} - "
+                    "the GUI and router pair nets by P/N naming, so these can't be "
+                    "routed as pairs yet (rename the nets, or see the explicit-pair "
+                    "support issue)\n")
+            if not any([confirmed, rejected, unknown, parsed["custom"]]):
+                self.append_log(f"AI: no usable diff-pair findings in {value!r}\n")
+
     def _on_cancel_or_close(self, event):
         """Handle cancel/close button - cancel if routing, otherwise close dialog."""
         if self._routing_thread and self._routing_thread.is_alive():
@@ -502,6 +867,14 @@ class DifferentialTab(wx.Panel):
 
     def _on_route(self, event):
         """Handle route button click."""
+        # Refresh shared pcb_data from the live board BEFORE routing so the diff
+        # router sees moved footprints/caps from a preceding optimize_caps step,
+        # not their load-time positions (#362; same fix as the signal route path).
+        if self.sync_pcb_data_callback:
+            try:
+                self.sync_pcb_data_callback()
+            except Exception as e:
+                print(f"(pre-route pcb_data sync skipped: {e})")
         selected_pair_info = self.get_selected_pair_net_ids()
         if not selected_pair_info:
             wx.MessageBox(
@@ -534,6 +907,29 @@ class DifferentialTab(wx.Panel):
 
         # Merge configs
         config = {**routing_config, **diff_config}
+
+        # #1146: refuse a malformed keep-away rule before routing starts.
+        # #1253: and one the board's design brief declares (the engine adds
+        # the brief's rules to the field's).
+        try:
+            from keep_away import parse_keep_away_rules, read_brief_keep_away
+            parse_keep_away_rules(config.get('keep_away'))
+            read_brief_keep_away(self.board_filename)
+        except ValueError as e:
+            wx.MessageBox(str(e), "Invalid Keep-away Rule", wx.OK | wx.ICON_WARNING)
+            return
+        # A Net Clearances File route_diff.py would fail to read is refused
+        # before routing, as on the Route tab.
+        from .swig_gui import net_clearances_file_error
+        _ncl_err = net_clearances_file_error(config.get('net_clearances_path'))
+        if _ncl_err:
+            wx.MessageBox(_ncl_err, "Invalid Net Clearances File",
+                          wx.OK | wx.ICON_WARNING)
+            return
+
+        # Remember the routed floors so _apply_results_to_board can make the live
+        # board's DRC constraints consistent with them (issue #160).
+        self._diff_drc_config = dict(config)
 
         # Build actual net names from selected pair net IDs
         net_names = []
@@ -568,9 +964,11 @@ class DifferentialTab(wx.Panel):
     def _update_progress(self, current, total, step_name):
         """Update progress bar and status."""
         if total > 0:
-            percent = int(100 * current / total)
-            self.progress_bar.SetValue(percent)
+            # Range first, then a clamped value (#1751): wx asserts on a
+            # position past the range.
             self.progress_bar.SetRange(100)
+            self.progress_bar.SetValue(
+                max(0, min(100, int(100 * current / total))))
             self.status_text.SetLabel(f"{step_name} ({current}/{total})")
         else:
             # Setup phase - no count, just show the step name
@@ -581,6 +979,16 @@ class DifferentialTab(wx.Panel):
         """Run differential pair routing in a background thread."""
         import sys
         import time
+        # The run's wall time, as the Route tab reports it (#1780): the
+        # engine's total_time is the net search alone.
+        t0 = time.time()
+
+        # Fresh clearance ledger so a prior op's fine-pitch clearance doesn't
+        # leak into this board's DRC floor.
+        import clearance_ledger
+        clearance_ledger.reset()
+        from fab_tiers import set_fab_tier_from_config
+        set_fab_tier_from_config(config)
 
         original_stdout = sys.stdout
         if self.append_log:
@@ -598,42 +1006,211 @@ class DifferentialTab(wx.Panel):
                 # Brief sleep releases GIL, allowing main thread to process CallAfter events
                 time.sleep(0.01)
 
+            # #439: build net_clearances from the live board so obstacles from
+            # nets in wider classes are priced at their own clearance (KiCad's
+            # cross-class max(A,B)) -- mirrors the single-ended route tab
+            # (swig_gui). Passing an explicit map STOPS the engine's internal
+            # always-cap auto-read, so honoring classes (Min Clearance override
+            # unchecked) actually reaches the router. The Clearance ceiling box
+            # (== the CLI passing --clearance-ceiling) caps each class at
+            # min(class, ceiling), #1698; unchecked routes each class in full.
+            # #755: the fallback is routing_defaults.CLEARANCE, not a bare
+            # literal -- this seeds EVERY net's priced clearance and the
+            # Min-Clearance cap below, so a 0.1 here under-prices the whole
+            # board's obstacles when the key is absent.
+            _diff_clearance = config.get('clearance', defaults.CLEARANCE)
+            net_clearances = {}
+            try:
+                from .fanout_gui import _get_net_classes_from_board
+                from .swig_gui import _get_netclass_parameters
+                all_net_to_class, all_class_names = _get_net_classes_from_board()
+                class_clearance_cache = {}
+                for cname in all_class_names:
+                    params = _get_netclass_parameters(cname)
+                    if params:
+                        class_clearance_cache[cname] = params.get('clearance', _diff_clearance)
+                    else:
+                        class_clearance_cache[cname] = _diff_clearance
+                # #530 decision 2 (mirrors list_nets.net_clearance_map_by_id):
+                # a Default-only net takes the run's clearance and gets NO entry.
+                for net in self.pcb_data.nets.values():
+                    cname = all_net_to_class.get(net.name, 'Default')
+                    if cname == 'Default':
+                        continue
+                    net_clearances[net.net_id] = class_clearance_cache.get(
+                        cname, _diff_clearance)
+                if config.get('clamp_netclasses', False):
+                    from fab_tiers import cap_net_clearances  # #1561 discloses
+                    net_clearances = cap_net_clearances(
+                        net_clearances, config['clearance_ceiling'],
+                        net_names={n.net_id: n.name for n in self.pcb_data.nets.values()},
+                        class_of=all_net_to_class)
+            except Exception as e:
+                print(f"Warning: Could not get net class clearances: {e}")
+                net_clearances = None
+            # route_diff.py --net-clearances FILE (the Advanced tab's Net
+            # Clearances File): it replaces the class-derived map, as given.
+            from .swig_gui import explicit_net_clearances
+            _explicit = explicit_net_clearances(config.get('net_clearances_path'),
+                                                self.pcb_data)
+            if _explicit is not None:
+                net_clearances = _explicit
+
             successful, failed, total_time, results_data = batch_route_diff_pairs(
                 input_file=self.board_filename,
                 output_file="",  # Not used when return_results=True
                 net_names=net_names,
+                # #581: the Basic tab's via-in-pad policy (shared params).
+                same_net_pad_clearance=config.get('same_net_pad_clearance', -1.0),
                 layers=config.get('layers', defaults.DEFAULT_LAYERS),
+                layer_costs=config.get('layer_costs') or None,  # per-layer bias (#193); None -> all 1.0
                 track_width=config.get('diff_pair_width', defaults.DIFF_PAIR_WIDTH),
-                clearance=config.get('clearance', 0.1),
-                via_size=config.get('via_size', 0.3),
-                via_drill=config.get('via_drill', 0.2),
-                grid_step=config.get('grid_step', 0.1),
-                via_cost=config.get('via_cost', 50),
-                max_iterations=config.get('max_iterations', 200000),
-                proximity_heuristic_factor=config.get('proximity_heuristic_factor', 0.02),
-                diff_pair_gap=config.get('diff_pair_gap', 0.101),
+                impedance=config.get('impedance'),  # when set, overrides per-layer width
+                impedance_declare_only=config.get('impedance_declare_only', False),
+                # #486: CPW-over-ground vs microstrip. route_diff.py passes
+                # args.coplanar_gap here; without it the shared Coplanar Gap
+                # control is honoured for single-ended routing but silently
+                # dropped for diff pairs, shipping every coupled pair too wide.
+                coplanar_gap=config.get('coplanar_gap', 0.0),
+                # #424: route_diff.py passes --ripup-blocker-select here; without
+                # it a non-default blocker strategy applied to single-ended
+                # routing only and diff-pair rip-up silently stayed on 'count'.
+                ripup_blocker_select=config.get('ripup_blocker_select',
+                                                defaults.RIPUP_BLOCKER_SELECT),
+                # #755: geometry fallbacks come from routing_defaults, like the
+                # hole-to-hole line below and like planes_gui -- NOT bare
+                # literals that disagree with it (0.1/0.3/0.2 vs 0.25/0.5/0.3;
+                # via_size was the largest divergence, a 0.2mm barrel). A diff
+                # pair carries the SIGNAL via defaults (VIA_SIZE/VIA_DRILL, what
+                # the route tab and route_diff.py resolve to), not the fanout
+                # tab's BGA_* escape-via knobs. The shipping GUI path always
+                # populates all three (_build_routing_config), so this is the
+                # latent-trap arm: a partially-built config must not silently
+                # route to a different geometry than the CLI would.
+                clearance=config.get('clearance', defaults.CLEARANCE),
+                via_size=config.get('via_size', defaults.VIA_SIZE),
+                via_drill=config.get('via_drill', defaults.VIA_DRILL),
+                via_from_class=config.get('via_from_class', False),
+                # #1842: the route tab's Via Span, as route_diff.py --via-span
+                via_span=config.get('via_span'),
+                via_span_type=config.get('via_span_type'),
+                hole_to_hole_clearance=config.get('hole_to_hole_clearance',
+                                                  defaults.HOLE_TO_HOLE_CLEARANCE),
+                board_edge_clearance=config.get('board_edge_clearance',
+                                                defaults.BOARD_EDGE_CLEARANCE),
+                grid_step=config.get('grid_step', defaults.GRID_STEP),
+                via_cost=config.get('via_cost', defaults.VIA_COST),
+                max_iterations=config.get('max_iterations', defaults.MAX_ITERATIONS),
+                proximity_heuristic_factor=config.get('proximity_heuristic_factor', defaults.PROXIMITY_HEURISTIC_FACTOR),
+                keepout_enabled=config.get('keepout_enabled', False),
+                keepout_layer=config.get('keepout_layer', defaults.KEEPOUT_LAYER),
+                diff_pair_gap=config.get('diff_pair_gap', defaults.DIFF_PAIR_GAP),
+                diff_pair_width_from_class=config.get('diff_pair_width_from_class', False),
+                diff_pair_gap_from_class=config.get('diff_pair_gap_from_class', False),
                 min_turning_radius=config.get('min_turning_radius', 0.2),
                 max_setback_angle=config.get('max_setback_angle', 45.0),
                 max_turn_angle=config.get('max_turn_angle', 180.0),
                 diff_chamfer_extra=config.get('diff_chamfer_extra', 1.5),
                 diff_pair_centerline_setback=config.get('diff_pair_centerline_setback'),
-                fix_polarity=config.get('fix_polarity', True),
+                polarity_swap_nets=config.get('polarity_swap_nets'),
                 gnd_via_enabled=config.get('gnd_via_enabled', True),
                 diff_pair_intra_match=config.get('diff_pair_intra_match', False),
+                diff_pair_intra_lane=config.get('diff_pair_intra_lane') or None,
+                ac_couple_match=config.get('ac_couple_match', False),
                 enable_layer_switch=config.get('enable_layer_switch', True),
                 debug_lines=config.get('debug_lines', False),
                 verbose=config.get('verbose', False),
+                # --- #381 D1: thread the FULL merged config through, mirroring the
+                # single-ended route tab (swig_gui.py). Previously ~30 engine params
+                # the tab collected were silently dropped, so a GUI/plan-replayed
+                # diff run ordered pairs and cost-weighted routes DIFFERENTLY from
+                # the equivalent route_diff.py command. config.get(..., <CLI default>)
+                # so absent keys fall to the same value route_diff.py's argparse uses.
+                ordering_strategy=config.get('ordering_strategy', 'mps'),
+                direction_order=config.get('direction'),
+                disable_bga_zones=config.get('no_bga_zones'),
+                max_probe_iterations=config.get('max_probe_iterations', 5000),
+                heuristic_weight=config.get('heuristic_weight', defaults.HEURISTIC_WEIGHT),
+                turn_cost=config.get('turn_cost', 1000),
+                direction_preference_cost=config.get(
+                    'direction_preference_cost', defaults.DIRECTION_PREFERENCE_COST),
+                max_rip_up_count=config.get('max_ripup', defaults.MAX_RIPUP),
+                bus_enabled=config.get('bus_enabled', False),
+                bus_detection_radius=config.get('bus_detection_radius',
+                                                defaults.BUS_DETECTION_RADIUS),
+                bus_attraction_radius=config.get('bus_attraction_radius',
+                                                 defaults.BUS_ATTRACTION_RADIUS),
+                bus_attraction_bonus=config.get('bus_attraction_bonus',
+                                                defaults.BUS_ATTRACTION_BONUS),
+                bus_min_nets=config.get('bus_min_nets', defaults.BUS_MIN_NETS),
+                stub_proximity_radius=config.get('stub_proximity_radius', 2.0),
+                stub_proximity_cost=config.get('stub_proximity_cost', 0.2),
+                via_proximity_cost=config.get('via_proximity_cost', 10.0),
+                bga_proximity_radius=config.get('bga_proximity_radius', 7.0),
+                bga_proximity_cost=config.get('bga_proximity_cost', 0.2),
+                track_proximity_distance=config.get('track_proximity_distance', 2.0),
+                track_proximity_cost=config.get('track_proximity_cost',
+                                                defaults.TRACK_PROXIMITY_COST),
+                # #1146: the Advanced tab's keep-away rules (shared with the
+                # route tab), as route_diff.py --keep-away.
+                keep_away=split_keep_away_specs(config.get('keep_away')) or None,
+                keep_away_free=config.get('keep_away_free', defaults.KEEP_AWAY_FREE),
+                keep_away_cost=config.get('keep_away_cost', defaults.KEEP_AWAY_COST),
+                crossing_layer_check=not config.get('no_crossing_layer_check', False),
+                can_swap_to_top_layer=config.get('can_swap_to_top_layer', False),
+                swappable_net_patterns=config.get('swappable_nets'),
+                crossing_penalty=config.get('crossing_penalty', defaults.CROSSING_PENALTY),
+                routing_clearance_margin=config.get('routing_clearance_margin',
+                                                    defaults.ROUTING_CLEARANCE_MARGIN),
+                vertical_attraction_radius=config.get('vertical_attraction_radius',
+                                                      defaults.VERTICAL_ATTRACTION_RADIUS),
+                vertical_attraction_cost=config.get('vertical_attraction_cost',
+                                                    defaults.VERTICAL_ATTRACTION_COST),
+                ripped_route_avoidance_radius=config.get('ripped_route_avoidance_radius',
+                                                         defaults.RIPPED_ROUTE_AVOIDANCE_RADIUS),
+                ripped_route_avoidance_cost=config.get('ripped_route_avoidance_cost',
+                                                       defaults.RIPPED_ROUTE_AVOIDANCE_COST),
+                length_match_groups=config.get('length_match_groups'),
+                length_match_tolerance=config.get('length_match_tolerance',
+                                                  defaults.LENGTH_MATCH_TOLERANCE),
+                intra_pair_tolerance=config.get('intra_pair_tolerance'),
+                meander_amplitude=config.get('meander_amplitude', defaults.MEANDER_AMPLITUDE),
+                meander_spacing=config.get('meander_spacing', defaults.MEANDER_SPACING),
+                time_matching=config.get('time_matching', False),
+                time_match_tolerance=config.get('time_match_tolerance',
+                                                defaults.TIME_MATCH_TOLERANCE),
+                mps_reverse_rounds=config.get('mps_reverse_rounds', False),
+                mps_layer_swap=config.get('mps_layer_swap', False),
+                keep_input_copper=config.get('keep_input_copper', False),
+                mps_segment_intersection=config.get('mps_segment_intersection', False),
+                schematic_dir=config.get('schematic_dir'),
+                add_teardrops=config.get('add_teardrops', False),
+                # #1399: the shared "Force re-route selected nets" box, here
+                # re-routing the selected pairs AS pairs. The raw patterns are
+                # the #521 exact-name override (None = interactive selection,
+                # which names its nets exactly), as the signal tab passes.
+                force_reroute=config.get('force_reroute', False),
+                net_name_patterns=config.get('net_name_patterns'),
+                skip_routing=config.get('skip_routing', False),
+                debug_memory=config.get('debug_memory', False),
                 return_results=True,
                 pcb_data=self.pcb_data,
+                net_clearances=net_clearances,
                 cancel_check=check_cancel,
                 progress_callback=on_progress,
             )
+            # #857: the Design rules line route_diff.py's main prints (the
+            # exit code is the CLI's alone).
+            from fab_tiers import finish_design_rules
+            finish_design_rules(None, 0)
 
             self._routing_result = {
                 'successful': successful,
                 'failed': failed,
                 'total_time': total_time,
+                'wall_time': time.time() - t0,
                 'results_data': results_data,
+                'config': config,
             }
 
         except Exception as e:
@@ -660,8 +1237,22 @@ class DifferentialTab(wx.Panel):
 
     def _on_routing_complete(self):
         """Handle routing completion."""
-        self.route_btn.Enable()
-        self.cancel_btn.SetLabel("Close")
+        # NOTE: the button is re-enabled in _finish_complete's finally, AFTER
+        # the results are applied -- it is the plan executor's busy signal,
+        # and the completion MessageBox pumps events, so enabling it up
+        # front let the executor start the NEXT step mid-apply (Andy's
+        # 'tracks don't all appear, rerun fixes it').
+        try:
+            # Tee the apply phase's prints into the log tab: the worker's
+            # redirect was restored before this main-thread handler runs.
+            from .gui_utils import redirect_prints_to_log
+            with redirect_prints_to_log(self.append_log):
+                self._on_routing_complete_body()
+        finally:
+            self.route_btn.Enable()
+            self.cancel_btn.SetLabel("Close")
+
+    def _on_routing_complete_body(self):
         self.progress_bar.SetValue(0)
 
         # Check if cancelled
@@ -686,60 +1277,191 @@ class DifferentialTab(wx.Panel):
 
         successful = result.get('successful', 0)
         failed = result.get('failed', 0)
-        total_time = result.get('total_time', 0)
+        wall_time = result.get('wall_time', 0)
         results_data = result.get('results_data', {})
 
         # Apply results to the board
-        tracks_added, vias_added = self._apply_results_to_board(results_data)
+        tracks_added, vias_added, tracks_removed = self._apply_results_to_board(results_data)
+        # The plan executor's "this step produced its result" (gui_utils);
+        # every return above this line is a refusal, a failure or a cancel.
+        from .gui_utils import mark_plan_step_produced
+        mark_plan_step_produced(self)
 
-        self.status_text.SetLabel(f"Complete: {successful} routed, {failed} failed in {total_time:.1f}s")
+        self.status_text.SetLabel(f"Complete: {successful} routed, {failed} failed in {wall_time:.1f}s")
+
+        single_ended_pairs = results_data.get('single_ended_diff_pairs', [])
+        skipped_bad_fanout = results_data.get('skipped_bad_fanout', [])
 
         msg = f"Differential pair routing complete!\n\n"
         msg += f"Routed: {successful}\n"
         msg += f"Failed: {failed}\n"
-        msg += f"Time: {total_time:.1f}s\n\n"
+        if single_ended_pairs:
+            # The CLI summary's wording: a deferred pair is electrically
+            # short, or its coupled route failed (#165, and a 2-terminal
+            # pair's fallback defer), which is not the same thing.
+            # #1764: only the electrically short ones are routed single-ended
+            # next by design; a failed pair is retried as a pair.
+            from diff_pair_custody import deferred_reasons_text, split_deferred_pairs
+            _why = deferred_reasons_text(results_data.get('pair_reports'),
+                                         single_ended_pairs)
+            _design, _failed = split_deferred_pairs(
+                results_data.get('pair_reports'), single_ended_pairs)
+            msg += f"Deferred to single-ended: {len(single_ended_pairs)} ({_why})\n"
+            if _design:
+                msg += (f"  by design, route these single-ended next: "
+                        f"{', '.join(_design)}\n")
+            if _failed:
+                msg += (f"  coupled route failed, retry these as pairs "
+                        f"(Force re-route), not single-ended: "
+                        f"{', '.join(_failed)}\n")
+        if skipped_bad_fanout:
+            msg += (f"Skipped: {len(skipped_bad_fanout)} "
+                    f"(fanout stubs self-overlap - fix the fanout first)\n")
+        # #1303: routed, but the copper placed on the board is not coupled
+        # (the engine measured it; the CLI prints the same "Not coupled" line).
+        uncoupled_pairs = results_data.get('uncoupled_diff_pairs', [])
+        if uncoupled_pairs:
+            # #1361: protected all the same while its members still run
+            # alongside (the engine's pair_reports[].protected).
+            _kept = sorted(r['pair'] for r in results_data.get('pair_reports') or []
+                           if r.get('outcome') == 'uncoupled' and r.get('protected'))
+            msg += (f"Not coupled: {len(uncoupled_pairs)} "
+                    f"(routed, but the board carries no coupled run over "
+                    f"enough of the pair's length - not counted as routed): "
+                    f"{', '.join(uncoupled_pairs)}\n")
+            if _kept:
+                msg += (f"  still alongside, so protected: {', '.join(_kept)}\n")
+        # Companion GND return vias with no legal site (the CLI prints the
+        # same "GND vias not placed" line; each one is named in the log).
+        gnd_not_placed = results_data.get('gnd_vias_not_placed') or []
+        if gnd_not_placed:
+            msg += (f"GND vias not placed: {len(gnd_not_placed)} companion return "
+                    f"via(s) with no legal site, on "
+                    f"{', '.join(sorted({d['pair'] for d in gnd_not_placed}))}\n")
+        _intra_bad = [r['pair'] for r in results_data.get('intra_pair_matching', [])
+                      if r.get('status') not in ('matched', 'within-tolerance', 'skipped')]
+        if _intra_bad:
+            msg += (f"Intra-pair skew NOT matched on the board: "
+                    f"{', '.join(_intra_bad)}\n")
+        # #1799: a chain's member pairs read `skipped` above (the chain is
+        # matched end to end instead), so the chain's own verdict is named
+        # here, worded as the engine's "AC-coupled chain NOT matched" line.
+        from length_matching import ac_chains_not_matched
+        _chain_bad = ac_chains_not_matched(results_data.get('ac_coupled_xnets'))
+        if _chain_bad:
+            msg += (f"AC-coupled chain NOT matched end to end: "
+                    f"{', '.join(_chain_bad)}\n")
+        msg += f"Time: {wall_time:.1f}s\n\n"
         msg += f"Added to board:\n"
         msg += f"  {tracks_added} segments\n"
         msg += f"  {vias_added} vias\n"
+        if tracks_removed > 0:
+            msg += f"  {tracks_removed} stale segment(s) removed\n"
+        if failed > 0:
+            try:
+                from routing_diagnostics import (
+                    suggest_diff_pair_adjustments, format_suggestions_for_dialog)
+                suggestions = suggest_diff_pair_adjustments(
+                    failed=failed, total=successful + failed,
+                    config=result.get('config', {}))
+                block = format_suggestions_for_dialog(suggestions)
+                if block:
+                    msg += "\n" + block + "\n"
+            except Exception as e:
+                print(f"Warning: failed to build diff pair suggestions: {e}")
         msg += "\nUse Edit -> Undo to revert changes."
 
-        wx.MessageBox(msg, "Routing Complete", wx.OK | wx.ICON_INFORMATION)
+        if getattr(getattr(self, 'GetTopLevelParent', lambda: self)(), '_suppress_completion_popups', False):
+            print(msg)  # unattended plan run: no per-step OK dialog
+        else:
+            wx.MessageBox(msg, "Routing Complete", wx.OK | wx.ICON_INFORMATION)
 
         # Refresh the pair list to show updated connectivity
         self.pair_panel.refresh()
 
+    def _apply_status(self, message):
+        """Status update for the apply phase, which runs ON the UI thread.
+
+        _update_progress is marshalled from the engine thread via CallAfter, so
+        the main loop paints it; the apply BLOCKS that loop, so a bare SetLabel
+        would leave the last routing message frozen on screen for the whole
+        apply. Same pattern as the route/planes/fanout tabs; see
+        gui_utils.ui_thread_status for why the repaint is deliberately narrow
+        (no Gauge.Pulse) inside an action plugin.
+        """
+        from .gui_utils import ui_thread_status
+        ui_thread_status(getattr(self, 'status_text', None),
+                         getattr(self, 'progress_bar', None), message)
+
     def _apply_results_to_board(self, results_data):
         """Apply routing results directly to the open pcbnew board."""
         import pcbnew
+        from kicad_parser import POSITION_DECIMALS
         from .swig_gui import _build_layer_mappings
+        from .board_swaps import apply_swaps_to_board
 
         board = pcbnew.GetBoard()
         if board is None:
             wx.MessageBox("Board is no longer open", "Error", wx.OK | wx.ICON_ERROR)
-            return 0, 0
+            return 0, 0, 0
+
+        self._apply_status("Applying diff-pair copper to the board...")
+
+        # Apply pad/stub net swaps (polarity fixes, target swaps) and stub layer
+        # modifications BEFORE adding new tracks - the routes were created
+        # assuming these swaps, so skipping them leaves shorts at swapped pads
+        apply_swaps_to_board(board, results_data)
 
         tracks_added = 0
         vias_added = 0
+        tracks_removed = 0
 
         # Get layer mappings
-        name_to_id, _ = _build_layer_mappings()
+        name_to_id, id_to_name = _build_layer_mappings()
 
         def get_layer_id(layer_name):
             return name_to_id.get(layer_name, pcbnew.F_Cu)
+
+        # Remove original-board copper the cleanup pipeline flagged (dead-end
+        # sweep / cycle prune / graze prune), mirroring the CLI writer's strip
+        # and swig_gui.py's single-ended apply path -- otherwise stale copper
+        # from a prior routing pass stays on the live board.
+        segs_to_remove = results_data.get('segments_to_remove') or []
+        if segs_to_remove:
+            # Counted and width-preferring, as the CLI writer's strip (#1556).
+            from .gui_utils import remove_listed_segments
+            tracks_removed += remove_listed_segments(board, pcbnew, segs_to_remove)
+
+        # Remove original-board VIAS the pipeline flagged (#508 finding 11:
+        # route_diff now returns vias_to_remove; swig_gui parity).
+        vias_to_remove = results_data.get('vias_to_remove') or []
+        if vias_to_remove:
+            via_keys = {(round(v.x, POSITION_DECIMALS),
+                         round(v.y, POSITION_DECIMALS), v.net_id)
+                        for v in vias_to_remove}
+            for track in list(board.GetTracks()):
+                if track.Type() != pcbnew.PCB_VIA_T:
+                    continue
+                vk = (round(pcbnew.ToMM(track.GetPosition().x), POSITION_DECIMALS),
+                      round(pcbnew.ToMM(track.GetPosition().y), POSITION_DECIMALS),
+                      track.GetNetCode())
+                if vk in via_keys:
+                    board.RemoveNative(track)
+                    tracks_removed += 1
 
         # Add segments from routing results
         for result in results_data.get('results', []):
             for seg in result.get('new_segments', []):
                 track = pcbnew.PCB_TRACK(board)
                 track.SetStart(pcbnew.VECTOR2I(
-                    pcbnew.FromMM(seg.start_x),
-                    pcbnew.FromMM(seg.start_y)
+                    mm_to_iu(seg.start_x),
+                    mm_to_iu(seg.start_y)
                 ))
                 track.SetEnd(pcbnew.VECTOR2I(
-                    pcbnew.FromMM(seg.end_x),
-                    pcbnew.FromMM(seg.end_y)
+                    mm_to_iu(seg.end_x),
+                    mm_to_iu(seg.end_y)
                 ))
-                track.SetWidth(pcbnew.FromMM(seg.width))
+                track.SetWidth(mm_to_iu(seg.width))
                 track.SetLayer(get_layer_id(seg.layer))
                 track.SetNetCode(seg.net_id)
                 board.Add(track)
@@ -754,94 +1476,257 @@ class DifferentialTab(wx.Panel):
             self._add_via_to_board(board, via, get_layer_id)
             vias_added += 1
 
-        # Build connectivity to register new items properly
-        board.BuildConnectivity()
+        # Add reuse-connector segments from layer swapping (#340 / #508
+        # finding 9): when a swap anchors its transition on an existing
+        # same-net via, the pad->via connector copper rides the
+        # all_swap_segments channel. swig_gui draws these; this path never
+        # did, leaving the swapped net floating (DRC-clean but open).
+        for seg in results_data.get('all_swap_segments', []):
+            track = pcbnew.PCB_TRACK(board)
+            track.SetStart(pcbnew.VECTOR2I(
+                mm_to_iu(seg.start_x), mm_to_iu(seg.start_y)))
+            track.SetEnd(pcbnew.VECTOR2I(
+                mm_to_iu(seg.end_x), mm_to_iu(seg.end_y)))
+            track.SetWidth(mm_to_iu(seg.width))  # never position-rounded (#362)
+            track.SetLayer(get_layer_id(seg.layer))
+            track.SetNetCode(seg.net_id)
+            board.Add(track)
+            tracks_added += 1
+
+        # Refill zones, THEN rebuild connectivity (refill_all_zones does both,
+        # in that order): a bare BuildConnectivity over stale pours flips new
+        # vias' netcodes to the zones' nets -- see refill_all_zones's docstring.
+        self._apply_status("Refilling zones and rebuilding connectivity...")
+        from .gui_utils import refill_all_zones
+        refill_all_zones(board)
+
+        # Make the live board's DRC constraints consistent with what we just
+        # routed to (issue #160), the GUI counterpart of the CLI route_diff's
+        # fix_kicad_drc_settings auto-fix: loosen the Board Setup floors + Default
+        # net class + non-routing severities to the routed values via the pcbnew
+        # API, so the user's manual DRC only flags genuine problems. Best-effort
+        # and guarded -- never block applying the routes. The user's next save
+        # persists it (mark the board modified).
+        cfg = getattr(self, "_diff_drc_config", None)
+        if tracks_added > 0 and cfg and cfg.get('fix_drc_settings', True):
+            try:
+                from fix_kicad_drc_settings import (compute_targets, severity_plan,
+                                                    apply_targets_to_board, fab_edge_floor)
+                # Grade at the smallest clearance any step actually routed at, like the CLI.
+                import clearance_ledger
+                eff_clearance = clearance_ledger.effective(cfg.get('clearance')) \
+                    if cfg.get('clearance') else cfg.get('clearance')
+                # #1369: the copper-to-hole floor this step HELD, lowered only
+                # to what the copper it just drew needs -- route_diff.py's
+                # step_hole_clearance, from the tab's applied lists.
+                _hole_clr = self._held_hole_clearance(board, results_data,
+                                                      eff_clearance)
+                # #1842: the micro vias' own rule, as fix_project_for_output writes it
+                from .gui_utils import live_micro_via_rule
+                live_micro_via_rule(self.pcb_data, board, results_data, eff_clearance)
+                targets = compute_targets(
+                    clearance=eff_clearance,
+                    hole_clearance=_hole_clr,
+                    hole_to_hole=cfg.get('hole_to_hole_clearance'),
+                    edge_clearance=cfg.get('board_edge_clearance'),
+                    track_width=cfg.get('track_width'),
+                    via_diameter=cfg.get('via_size'),
+                    via_drill=cfg.get('via_drill'),
+                    fab_edge=fab_edge_floor(),
+                    # #530: caps min_clearance at the smallest pad override
+                    minima=board_minima_from_live(board))
+                # #441: record the coupling gap at >= clearance, matching the gap
+                # the engine actually routed to (batch_route_diff_pairs floors gap
+                # up to clearance because KiCad grades P<->N coupling under the plain
+                # clearance rule). Keeps the written diff_pair_gap from sitting below
+                # the class clearance and re-manufacturing the violation on re-grade.
+                _dp_gap = cfg.get('diff_pair_gap')
+                if _dp_gap is not None and cfg.get('clearance'):
+                    _dp_gap = max(_dp_gap, cfg.get('clearance'))
+                # #856: severities only on explicit request; {} = untouched.
+                # The diff-pair gap/width class values are draw defaults and are
+                # no longer written (the #842 ratchet); kwargs kept for the
+                # shared signature.
+                _sev = severity_plan() if cfg.get('relax_drc_severities') else {}
+                if apply_targets_to_board(
+                        board, targets, _sev,
+                        diff_pair_gap=_dp_gap,
+                        diff_pair_width=cfg.get('track_width'),
+                        clamp_nondefault_netclasses=cfg.get('clamp_netclasses', False),
+                        class_ceiling=cfg.get('clearance_ceiling')):  # #1492
+                    board.SetModified()
+                    print("DRC settings: loosened Board Setup floors to the diff-pair routing values (save to persist)")
+            except Exception as e:
+                print(f"(skipped DRC-settings write-back: {e})")
 
         # Refresh the view
+        self._apply_status("Refreshing the board view...")
         pcbnew.Refresh()
 
         # Sync pcb_data from pcbnew board
         if self.sync_pcb_data_callback:
             self.sync_pcb_data_callback()
 
-        return tracks_added, vias_added
+        # Per-step live DRC floors (GUI twin of route_diff.py's per-step
+        # fix_project_for_output). This block used to sit AFTER the return
+        # below, so it never ran: the diff-pair tab was the one routing tab
+        # that never relaxed the floors, and on eth_tap the Default class sat
+        # at track_width 0.125 / via 0.5-0.25 for the whole chain while the CLI
+        # had tightened to 0.0889 / 0.25-0.15 by step 10. Every later step
+        # resolves its geometry from that class, so the two fronts routed with
+        # DIFFERENT parameters from step 11 on (GUI 3581 segments vs CLI 3428).
+        # #693: gated on the shared "Fix DRC settings after routing"
+        # checkbox, like the netclass/severity writeback above -- it used to
+        # run unconditionally, so an unchecked box still moved the board's
+        # Board Setup floors. The CLI gates its twin on
+        # --no-fix-drc-settings.
+        _cfg = getattr(self, '_diff_drc_config', {}) or {}
+        if _cfg.get('fix_drc_settings', True):
+            from .gui_utils import update_live_drc_floors
+            update_live_drc_floors(
+                board,
+                clearance=_cfg.get('clearance'),
+                track_width=(_cfg.get('diff_pair_width')
+                             or _cfg.get('track_width')),
+                via_size=_cfg.get('via_size'),
+                via_drill=_cfg.get('via_drill'),
+                hole_to_hole=_cfg.get('hole_to_hole_clearance'),
+                edge_clearance=_cfg.get('board_edge_clearance'),
+                # #581: recorded as route_diff.py records it
+                same_net_pad_clearance=_cfg.get('same_net_pad_clearance'))
+        else:
+            # The tool records (protected pairs, impedance, same-net pad
+            # clearance) are not DRC floors: an unchecked box must not void
+            # them (#1415, as route_diff.py --no-fix-drc-settings).
+            from .gui_utils import persist_live_tool_records
+            persist_live_tool_records(
+                board, _cfg.get('same_net_pad_clearance'))
+
+        return tracks_added, vias_added, tracks_removed
+
+    def _held_hole_clearance(self, board, results_data, clearance):
+        """#1369: :func:`gui_utils.held_hole_clearance_live` for this tab."""
+        from .gui_utils import held_hole_clearance_live
+        return held_hole_clearance_live(self.pcb_data, board, results_data, clearance)
 
     def _add_via_to_board(self, board, via, get_layer_id):
         """Add a via to the pcbnew board."""
         import pcbnew
         pcb_via = pcbnew.PCB_VIA(board)
         pcb_via.SetPosition(pcbnew.VECTOR2I(
-            pcbnew.FromMM(via.x),
-            pcbnew.FromMM(via.y)
+            mm_to_iu(via.x),
+            mm_to_iu(via.y)
         ))
-        pcb_via.SetWidth(pcbnew.FromMM(via.size))
-        pcb_via.SetDrill(pcbnew.FromMM(via.drill))
+        pcb_via.SetWidth(mm_to_iu(via.size))
+        pcb_via.SetDrill(mm_to_iu(via.drill))
         pcb_via.SetNetCode(via.net_id)
         if hasattr(via, 'layers') and len(via.layers) >= 2:
             top_layer = get_layer_id(via.layers[0])
             bot_layer = get_layer_id(via.layers[1])
-            pcb_via.SetLayerPair(top_layer, bot_layer)
+            from .gui_utils import set_via_layers
+            set_via_layers(pcb_via, top_layer, bot_layer,
+                           getattr(via, 'via_type', None))
+        # Keep a re-placed via's own tenting/plugging/filling (#489 §8).
+        from .gui_utils import apply_via_protection
+        apply_via_protection(pcb_via, getattr(via, 'tenting_attrs', None))
         board.Add(pcb_via)
+
+    def get_polarity_swap_nets(self):
+        """Parse the polarity-swap allowlist field into a pattern list (#279).
+
+        Comma/space-separated globs; empty field -> None (no swaps ever),
+        matching route_diff.py's --polarity-swap-nets semantics.
+        """
+        text = self.polarity_swap_nets_text.GetValue()
+        # _split_net_list, not split(): net names may contain spaces (#493).
+        # Commas stay a separator, so quote a name only if it has whitespace.
+        from .swig_gui import _split_net_list
+        patterns = [t for t in _split_net_list(text.replace(',', ' ')) if t]
+        return patterns or None
 
     def get_config(self):
         """Get the differential pair configuration."""
-        setback = self.centerline_setback.GetValue()
         return {
-            'diff_pair_width': self.diff_pair_width.GetValue(),
-            'diff_pair_gap': self.diff_pair_gap.GetValue(),
+            'diff_pair_width': self._effective_diff_pair_width(),
+            'diff_pair_gap': self._effective_diff_pair_gap(),
+            # #435: override UNCHECKED -> resolve each pair's OWN netclass diff
+            # geometry engine-side (not the Default class the _effective_* value
+            # falls back to, which is only the fallback for classless pairs).
+            'diff_pair_width_from_class': not self.diff_pair_width_check.GetValue(),
+            'diff_pair_gap_from_class': not self.diff_pair_gap_check.GetValue(),
+            'impedance': self.diff_impedance.GetValue() or None,  # 0 = off
+            'impedance_declare_only': self.impedance_declare_only.GetValue(),
             'min_turning_radius': self.min_turning_radius.GetValue(),
             'max_setback_angle': self.max_setback_angle.GetValue(),
             'max_turn_angle': self.max_turn_angle.GetValue(),
             'diff_chamfer_extra': self.chamfer_extra.GetValue(),
-            'diff_pair_centerline_setback': setback if setback > 0 else None,  # 0 = auto
-            'fix_polarity': self.fix_polarity_check.GetValue(),
+            # None = auto (box unticked); a ticked 0 is an explicit 0.
+            'diff_pair_centerline_setback': self._centerline_setback_value(),
+            'polarity_swap_nets': self.get_polarity_swap_nets(),
             'gnd_via_enabled': self.gnd_via_check.GetValue(),
             'diff_pair_intra_match': self.intra_match_check.GetValue(),
+            # #1869: 'auto' or P_NET=REF.PAD:REF.PAD ..., None when empty
+            'diff_pair_intra_lane': self.diff_pair_intra_lane.GetValue().split() or None,
+            'ac_couple_match': self.ac_couple_check.GetValue(),
         }
 
-    def _on_use_netclass_changed(self, event):
-        """Handle the 'Use net class definitions' checkbox toggle."""
-        use_netclass = self.use_netclass_check.GetValue()
+    def _on_diff_geom_override_check(self, event):
+        """Enable/disable the paired spinctrl for whichever override checkbox
+        fired. Unchecked = the value comes from the board Default net-class."""
+        chk = event.GetEventObject()
+        for name in ('diff_pair_width', 'diff_pair_gap', 'centerline_setback'):
+            if getattr(self, name + '_check', None) is chk:
+                getattr(self, name).Enable(chk.GetValue())
+                break
+        if chk is getattr(self, 'centerline_setback_check', None):
+            # Auto <-> a typed setback moves the short-pair threshold.
+            self._on_short_param_changed(event)
+            return
+        event.Skip()
 
-        if use_netclass:
-            # Try to get net class from first selected pair, fall back to Default
-            class_name = self._get_selected_pair_netclass() or 'Default'
-            from .swig_gui import _get_netclass_parameters
-            params = _get_netclass_parameters(class_name)
-            if params:
-                # Update diff pair width and gap from net class
-                if 'diff_pair_width' in params and params['diff_pair_width'] > 0:
-                    self.diff_pair_width.SetValue(params['diff_pair_width'])
-                if 'diff_pair_gap' in params and params['diff_pair_gap'] > 0:
-                    self.diff_pair_gap.SetValue(params['diff_pair_gap'])
-            # Disable manual editing
-            self.diff_pair_width.Enable(False)
-            self.diff_pair_gap.Enable(False)
-        else:
-            # Re-enable manual editing
-            self.diff_pair_width.Enable(True)
-            self.diff_pair_gap.Enable(True)
-
-    def _get_selected_pair_netclass(self):
-        """Get the net class name for the first selected pair, or None."""
+    def _fab_floor_via_parent(self, ctrl_name, val):
+        """Pin ``val`` UP to the parent dialog's fab floor for ``ctrl_name`` when
+        the top-level dialog exposes ``_fab_floored`` (parity with the Basic tab);
+        return ``val`` unchanged when the dialog isn't reachable."""
         try:
-            import pcbnew
-            board = pcbnew.GetBoard()
-            if board is None:
-                return None
-
-            # Get first selected pair's P net
-            selected = self.get_selected_pair_net_ids()
-            if not selected:
-                return None
-
-            _, p_net_id, _ = selected[0]
-            net = board.FindNet(p_net_id)
-            if net:
-                return net.GetNetClassName()
-            return None
+            import wx
+            top = wx.GetTopLevelParent(self)
+            if top is not None and hasattr(top, '_fab_floored'):
+                return top._fab_floored(ctrl_name, val)
         except Exception:
-            return None
+            pass
+        return val
+
+    def _effective_diff_pair_width(self):
+        """Diff-pair leg width to route with. CHECKED: the entered value.
+        UNCHECKED: the board Default net-class ``diff_pair_width``, resolved as
+        route_diff.py resolves it (list_nets.class_diff_pair_geometry: a 0 is
+        unset and falls back to the class track width), else the control value.
+        Floored at the parent's 'track_width' fab floor when the parent dialog
+        is reachable."""
+        if self.diff_pair_width_check.GetValue():
+            val = self.diff_pair_width.GetValue()
+        else:
+            from .swig_gui import _get_netclass_parameters
+            from list_nets import class_diff_pair_geometry
+            board_val = class_diff_pair_geometry(_get_netclass_parameters('Default') or {})[0]
+            val = board_val if board_val is not None else self.diff_pair_width.GetValue()
+        return self._fab_floor_via_parent('track_width', val)
+
+    def _effective_diff_pair_gap(self):
+        """Diff-pair gap to route with. CHECKED: the entered value. UNCHECKED:
+        the board Default net-class ``diff_pair_gap``, resolved as route_diff.py
+        resolves it (a 0 is unset and falls back to the class clearance), else
+        the control value. Floored at the parent's 'clearance' fab floor when
+        the parent dialog is reachable."""
+        if self.diff_pair_gap_check.GetValue():
+            val = self.diff_pair_gap.GetValue()
+        else:
+            from .swig_gui import _get_netclass_parameters
+            from list_nets import class_diff_pair_geometry
+            board_val = class_diff_pair_geometry(_get_netclass_parameters('Default') or {})[1]
+            val = board_val if board_val is not None else self.diff_pair_gap.GetValue()
+        return self._fab_floor_via_parent('clearance', val)
 
     def get_selected_pairs(self):
         """Get list of selected differential pair base names."""

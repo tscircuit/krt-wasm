@@ -1,0 +1,524 @@
+"""
+GND via placement for single-ended routing.
+
+Adds GND vias near signal vias for return current paths.
+"""
+from __future__ import annotations
+
+import math
+from typing import List, Dict
+
+import fab_tiers
+from kicad_parser import PCBData, Via, Zone, pad_drill_capsule, pour_zones
+from geometry_utils import point_to_segment_distance
+from routing_config import GridRouteConfig, GridCoord
+import rust_alloc  # noqa: F401  # issue #419: set MIMALLOC_PURGE_DELAY before grid_router loads
+from grid_router import GridObstacleMap
+
+
+def _zones_after_pour(pcb_data: PCBData, poured_now) -> List[Zone]:
+    """The board's zones with this call's pours applied: `poured_now` is
+    create_plane's zone records, for the caller whose pcb_data does not hold
+    them yet (the Planes tab applies them later; the CLI parses the written
+    file, so it has them already). A record marked `replace_existing` takes
+    the place of that net's pour on that layer, as the written file does."""
+    fresh = [z for z in (poured_now or ()) if not z.get('keepout')]
+    replaced = {(z['net_name'], z['layer']) for z in fresh if z.get('replace_existing')}
+    return ([z for z in (pcb_data.zones or ()) if (z.net_name, z.layer) not in replaced]
+            + [Zone(net_id=z['net_id'], net_name=z['net_name'], layer=z['layer'],
+                    polygon=list(z['polygon_points'])) for z in fresh])
+
+
+def add_gnd_vias_to_existing_board(
+    pcb_data: PCBData,
+    gnd_net_name: str,
+    gnd_via_distance: float,
+    config: GridRouteConfig,
+    obstacles: GridObstacleMap,
+    coord: GridCoord,
+    net_clearances: Dict[int, float] = None,
+    poured_now: List[dict] = None,
+    warnings: List[str] = None
+) -> List[Via]:
+    """
+    Add GND vias near existing signal vias in a PCB that don't already have a nearby GND via.
+
+    This function works with existing board vias, not routing results.
+
+    A return via has to join two layers of its net, or it connects nothing and
+    the chain's closing route.py removes it (#1166,
+    pcb_modification.sweep_dangling_via_branches). Only a pour can give it
+    those layers: the obstacle map stamps the net's own tracks and pads too, so
+    a site never touches them. So a net poured on fewer than two layers gets no
+    return via and a warning, and on a net poured on more, a site must lie
+    inside the net's pours on two layers by the sweep's own test
+    (check_weird.via_support_parts).
+
+    Args:
+        pcb_data: PCB data with existing vias and pads
+        gnd_net_name: Net name for GND (e.g., "GND")
+        gnd_via_distance: Maximum distance to place GND via from signal via (mm)
+        config: Routing config with via size, drill, clearance, layers
+        obstacles: Obstacle map built from the board
+        coord: Grid coordinate converter
+        net_clearances: The net-class map (net_id -> mm) the obstacle map was
+            built with, so the exact check prices each pair as the map did
+        poured_now: This call's zone records, when pcb_data does not hold them
+            yet (see _zones_after_pour)
+        warnings: A list that collects what is printed as a warning, for a
+            front-end whose user does not read the console
+
+    Returns:
+        List of new GND Via objects to add
+    """
+    # The ground resolution, the signal vias and the return copper are the
+    # coverage check's own (return_vias, #1816), so the step and the check
+    # cannot drift. An empty gnd_net_name is AUTO: resolve per signal from its
+    # own ground domain (the default, #489 §5). A NAMED net pins every return
+    # via to it.
+    from net_queries import describe_ground_domains
+    from return_vias import ReturnViaModel
+    _zones = _zones_after_pour(pcb_data, poured_now)
+    model = ReturnViaModel(pcb_data, gnd_net_name, zones=_zones)
+    explicit_name = model.explicit_name
+    if model.inexact_name:
+        print(f"GND net '{explicit_name}' not matched exactly; using "
+              f"'{model.inexact_name}' for return vias")
+
+    if not model.found:
+        target = explicit_name or "GND family"
+        print(f"Warning: GND net '{target}' not found, skipping GND via placement")
+        return []
+    gnd_net_id = model.gnd_net_id
+
+    # Split-ground boards (#489 §5): every signal via used to be stitched to ONE
+    # board-global ground, which can bridge the very domains the split exists to
+    # separate. Each via now returns to its OWN net's domain; single-domain boards
+    # resolve exactly as before.
+    domains = model.domains
+    note = describe_ground_domains(pcb_data, explicit_name)
+    if note:
+        print(note)
+    _return_net_for = model.return_net_for
+
+    # The signal vias: neither ground (every domain) nor power (a rail name,
+    # power pins on two parts, or a pour -- list_nets.power_net_evidence). A
+    # supply rail's via needs no return via of its own.
+    signal_vias = model.signal_vias()
+
+    if not signal_vias:
+        print("No signal vias found in board -- nothing needs a return via yet; a chain pours its planes before any "
+              "fanout or routing (#562), so run the GND return vias after routing")
+        return []
+
+    n_power = sum(1 for v in pcb_data.vias if v.net_id in model.power_ids)
+    print(f"Checking {len(signal_vias)} signal vias for GND via placement"
+          + (f" ({n_power} power-rail vias need none)" if n_power else ""))
+
+    # Minimum distance from signal via center to GND via center: larger of the
+    # copper ring clearance (via_size + clearance) and the drill hole-to-hole
+    # minimum (via_drill + hole_to_hole_clearance), so the paired GND via clears
+    # the signal via on both measures (issue #125). ONE kernel, in fab_tiers,
+    # shared with diff_pair_routing._min_via_center_distance and the placement
+    # escape ledger -- three open-coded copies of one rule is how they drift.
+    min_distance = fab_tiers.min_via_center_distance(
+        config.via_size, config.clearance, config.via_drill,
+        config.hole_to_hole_clearance)
+
+    # Debug: Print clearance parameters
+    print(f"GND via placement parameters:")
+    print(f"  via_size={config.via_size}mm, via_drill={config.via_drill}mm, clearance={config.clearance}mm")
+    print(f"  grid_step={config.grid_step}mm")
+    print(f"  min_distance (center-to-center)={min_distance:.3f}mm")
+
+    new_gnd_vias = []
+    placed_gnd_positions = []
+
+    # Via-to-via minimum clearance (center-to-center) for batch placement: larger
+    # of copper ring (via_size + clearance) and drill hole-to-hole (via_drill +
+    # hole_to_hole_clearance), so a thin-ring via can't land inside the drill
+    # hole-to-hole minimum (issue #125). Literally the same rule on the same
+    # config, so the same number as `min_distance` above -- kept as its own
+    # name because the two READ differently (signal-via-to-GND-via, versus
+    # GND-via-to-GND-via within one batch), and a reader tracing either should
+    # land on a name that says which question it answers.
+    via_via_min_dist = min_distance
+
+    # Grid cells to check for via clearance
+    # The obstacle map already expands tracks by track_width/2 + clearance.
+    # We only need to check cells within via_drill/2 (the actual hole), not the full
+    # via pad, since the obstacle map expansion already accounts for clearance.
+    # Ceil (not floor) the hole radius so this circular clear-check doesn't miss the
+    # outermost ring and let the GND-via hole land ~1 cell into a keep-out (#154 class).
+    # The obstacle map expands each obstacle by (its_half + clearance +
+    # TRACK_width/2) -- the body it models is a TRACK. A via's copper ring is
+    # via_size/2 wide, so scanning only the DRILL radius under-enforced by
+    # (via_size - track_width)/2 ~ 0.19mm and shipped 35-99um sub-clearance
+    # grazes against tracks and SMD pads (Andy's bitaxe DRC2.rpt: every
+    # violation was a stitching via). Scan the full ring shortfall.
+    _ring_shortfall = max(config.via_drill / 2,
+                          config.via_size / 2 - config.track_width / 2)
+    via_check_radius_grid = max(1, coord.to_grid_dist_safe(_ring_shortfall))
+
+    # Board outline, as a LAST-RESORT backstop. The obstacle map's static
+    # off-board keep-out (#422) is the real mechanism and does this properly
+    # (cutouts, milled contours, non-rectangular outlines); this only catches a
+    # caller that built its map with board_edge_clearance unset, which is how a
+    # GND return via once landed 1.40mm outside the board edge and would have
+    # been milled away at depanelization. Bounding-box only, so it is
+    # deliberately permissive -- it never rejects a via the keep-out accepts.
+    _bounds = getattr(pcb_data.board_info, 'board_bounds', None)
+    _edge_keepout = config.board_edge_clearance or 0.0
+
+    def _outside_board(x_mm: float, y_mm: float) -> bool:
+        if not _bounds:
+            return False
+        min_x, min_y, max_x, max_y = _bounds
+        margin = _edge_keepout + config.via_size / 2
+        return not (min_x + margin <= x_mm <= max_x - margin
+                    and min_y + margin <= y_mm <= max_y - margin)
+
+    # Sweep item 11 (#625 follow-up): the clearance checker scanned ALL board
+    # vias and ALL drilled pads in Python per candidate position (candidates =
+    # signal vias x 24 angles x radii -- ~100M+ scalar ops on big boards).
+    # Precompute their arrays once; each candidate then runs two broadcasts
+    # that NOMINATE possible violators, and only those are re-judged by the
+    # scalar formulas in the original iteration order -- so the verdict AND
+    # the first-failure reason string (with its formatted distance) are
+    # byte-identical.
+    import numpy as np
+    _via_xs = np.array([v.x for v in pcb_data.vias], dtype=np.float64)
+    _via_ys = np.array([v.y for v in pcb_data.vias], dtype=np.float64)
+    _drill_pads = [pad for _nid, _pads in pcb_data.pads_by_net.items()
+                   for pad in _pads if pad.drill and pad.drill > 0]
+    _caps = [pad_drill_capsule(p) for p in _drill_pads]
+    _cap_p1x = np.array([c[0][0] for c in _caps], dtype=np.float64)
+    _cap_p1y = np.array([c[0][1] for c in _caps], dtype=np.float64)
+    _cap_dx = np.array([c[1][0] - c[0][0] for c in _caps], dtype=np.float64)
+    _cap_dy = np.array([c[1][1] - c[0][1] for c in _caps], dtype=np.float64)
+    _cap_len_sq = _cap_dx * _cap_dx + _cap_dy * _cap_dy
+    _cap_rad = np.array([c[2] for c in _caps], dtype=np.float64)
+
+    def _cap_d2(px, py):
+        with np.errstate(divide='ignore', invalid='ignore'):
+            t = np.clip(((px - _cap_p1x) * _cap_dx + (py - _cap_p1y) * _cap_dy)
+                        / _cap_len_sq, 0.0, 1.0)
+        t = np.where(_cap_len_sq < 1e-10, 0.0, t)
+        ddx = px - (_cap_p1x + t * _cap_dx)
+        ddy = py - (_cap_p1y + t * _cap_dy)
+        return ddx * ddx + ddy * ddy
+
+    # The grid check below decides on CELLS: a track is stamped as the cells
+    # whose centres lie within its keep-out, and the via as a disc of cells,
+    # so the edge of each is quantised to the grid and a via can sit up to
+    # half a cell into a track or pad the cells call clear (0.006-0.015 mm
+    # grazes at a 0.1 grid, on tracks as narrow as the fab floor). A site the
+    # grid accepts is therefore measured once more, exactly: the via's ring
+    # against every foreign track and pad, at the clearance check_drc grades
+    # the pair at. A through via meets every copper layer.
+    _seg_rows = [s for s in pcb_data.segments if s.layer.endswith('.Cu')]
+    _seg_ax = np.array([s.start_x for s in _seg_rows], dtype=np.float64)
+    _seg_ay = np.array([s.start_y for s in _seg_rows], dtype=np.float64)
+    _seg_bx = np.array([s.end_x for s in _seg_rows], dtype=np.float64)
+    _seg_by = np.array([s.end_y for s in _seg_rows], dtype=np.float64)
+    _seg_hw = np.array([max(s.width, 0.0) / 2.0 for s in _seg_rows], dtype=np.float64)
+    _seg_net = np.array([s.net_id for s in _seg_rows], dtype=np.int64)
+    _seg_dx = _seg_bx - _seg_ax
+    _seg_dy = _seg_by - _seg_ay
+    _seg_l2 = _seg_dx * _seg_dx + _seg_dy * _seg_dy
+    _nc = net_clearances or {}
+    _seg_clr_by_net: Dict[int, np.ndarray] = {}
+
+    def _pair_base(own_net, other_net):
+        # the pair's net classes (#434/#439), as the grid map priced them;
+        # pair_clearance then applies the .kicad_dru layer rule (#498)
+        return max(config.clearance, _nc.get(own_net, 0.0), _nc.get(other_net, 0.0))
+
+    def _seg_clr(own_net):
+        arr = _seg_clr_by_net.get(own_net)
+        if arr is None:
+            arr = np.array([config.pair_clearance(own_net, s.net_id, s.layer,
+                                                  base=_pair_base(own_net, s.net_id))
+                            for s in _seg_rows], dtype=np.float64)
+            _seg_clr_by_net[own_net] = arr
+        return arr
+
+    _cu_pads = [p for _fp in pcb_data.footprints.values() for p in _fp.pads
+                if p.pad_type != 'np_thru_hole'
+                and any(l.endswith('.Cu') for l in (p.layers or []))]
+    _pad_cx = np.array([p.global_x for p in _cu_pads], dtype=np.float64)
+    _pad_cy = np.array([p.global_y for p in _cu_pads], dtype=np.float64)
+    _pad_rad = np.array([math.hypot(p.size_x, p.size_y) / 2.0 for p in _cu_pads],
+                        dtype=np.float64)
+
+    from check_drc import FilledCopperGate, HoleRuleGate, copper_keepout_gate
+    _filled_gate = FilledCopperGate(pcb_data)
+    _hole_gate = HoleRuleGate(pcb_data, getattr(config, 'rules', None))   # #1853
+    if _hole_gate:
+        _hole_gate.watch(vias=new_gnd_vias)    # a later via sees their holes
+    _ko_gate = copper_keepout_gate(pcb_data)
+
+    def _exact_copper_clear(x_mm, y_mm, own_net):
+        vr = config.via_size / 2.0
+        # A filled graphic's interior (#1682): the strokes below stop at its
+        # outline.
+        _fs = _filled_gate.via_hit(x_mm, y_mm, config.via_size, own_net,
+                                   lambda sh: config.pair_clearance(own_net, sh.net_id, sh.layer))
+        if _fs is not None:
+            return (False, f"filled_graphic({_fs.layer})")
+        if _hole_gate and _hole_gate.via_why(x_mm, y_mm, config.via_size,
+                                             config.via_drill, own_net):
+            return (False, "hole_clearance_rule")
+        if len(_seg_rows):
+            with np.errstate(divide='ignore', invalid='ignore'):
+                t = np.clip(((x_mm - _seg_ax) * _seg_dx + (y_mm - _seg_ay) * _seg_dy)
+                            / _seg_l2, 0.0, 1.0)
+            t = np.where(_seg_l2 > 0, t, 0.0)
+            d = np.hypot(x_mm - (_seg_ax + t * _seg_dx), y_mm - (_seg_ay + t * _seg_dy))
+            # a cheap upper bound first, then each foreign net's own pair value
+            near = (_seg_net != own_net) & (d < vr + _seg_hw + _max_clr)
+            if near.any():
+                bad = near & (d < vr + _seg_hw + _seg_clr(own_net) - 1e-6)
+                if bad.any():
+                    i = int(np.nonzero(bad)[0][0])
+                    return (False, f"track_graze({_seg_rows[i].layer})")
+        if len(_cu_pads):
+            from check_drc import point_to_pad_distance
+            reach = vr + _max_clr + _pad_rad
+            for i in np.nonzero(np.hypot(x_mm - _pad_cx, y_mm - _pad_cy) < reach)[0]:
+                p = _cu_pads[i]
+                if p.net_id == own_net:
+                    continue
+                clr = config.pad_pair_clearance(p, own_net, base=_pair_base(own_net, p.net_id))
+                if point_to_pad_distance(x_mm, y_mm, p) < vr + clr - 1e-6:
+                    return (False, f"pad_graze({p.component_ref}.{p.pad_number})")
+        return (True, "clear")
+
+    _max_clr = max(config.max_pair_clearance(),
+                   max(_nc.values()) if _nc else 0.0,
+                   max((getattr(p, 'local_clearance', 0.0) or 0.0) for p in _cu_pads)
+                   if _cu_pads else 0.0)
+
+    def is_via_position_clear(x_mm: float, y_mm: float, sig_via_x: float, sig_via_y: float,
+                              own_net: int = gnd_net_id) -> tuple:
+        """Check if a via can be placed at the given position.
+
+        Returns: (is_clear, reason) where reason explains why it's blocked if not clear.
+
+        Note: We do NOT use obstacles.is_via_blocked() here because that blocks
+        positions within via_size+clearance of ALL vias, including the signal via
+        we're placing near. Since we already enforce min_distance (which equals
+        via_size+clearance), we just need to check track clearance and manually
+        check other vias.
+        """
+        if _outside_board(x_mm, y_mm):
+            return (False, "outside_board_outline")
+
+        gx, gy = coord.to_grid(x_mm, y_mm)
+
+        # Check all layers for track clearance
+        # The obstacle map expands tracks by track_width/2 + clearance, so we only
+        # need to check cells within the via drill radius
+        for layer_idx in range(len(config.layers)):
+            for dx in range(-via_check_radius_grid, via_check_radius_grid + 1):
+                for dy in range(-via_check_radius_grid, via_check_radius_grid + 1):
+                    if dx * dx + dy * dy <= via_check_radius_grid * via_check_radius_grid:
+                        if obstacles.is_blocked(gx + dx, gy + dy, layer_idx):
+                            return (False, f"track_blocked_layer{layer_idx}_at_({dx},{dy})")
+
+        # Check via-to-via clearance for OTHER vias (skip the signal via we're
+        # targeting). Broadcast nominates (band around the strict < threshold
+        # covers the **2-pow vs multiply ULP); candidates re-judged in via
+        # order with the scalar formula so the first-failure reason matches.
+        if len(_via_xs):
+            _dxv = x_mm - _via_xs
+            _dyv = y_mm - _via_ys
+            _d2v = _dxv * _dxv + _dyv * _dyv
+            _thr = (via_via_min_dist * (1 + 1e-9)) ** 2
+            for i in np.nonzero(_d2v < _thr)[0]:
+                via = pcb_data.vias[i]
+                if abs(via.x - sig_via_x) < 0.01 and abs(via.y - sig_via_y) < 0.01:
+                    continue
+                dist = math.sqrt((x_mm - via.x)**2 + (y_mm - via.y)**2)
+                if dist < via_via_min_dist:
+                    return (False, f"too_close_to_via({dist:.2f}mm)")
+
+        # Check drill hole-to-hole clearance from through-hole pad drills (a
+        # physical drill-to-drill minimum -> hole_to_hole_clearance, NOT the copper
+        # clearance, which under-enforces it; issue #125 PAD-DRILL-VIA-DRILL).
+        # Same nomination pattern against the precomputed drill CAPSULES (a
+        # slot is a milled slot, not a round hole; round drills degenerate to
+        # the centre distance).
+        if len(_cap_rad):
+            min_pad_dist = config.hole_to_hole_clearance + config.via_drill / 2
+            _d2c = _cap_d2(x_mm, y_mm)
+            _lim = (min_pad_dist + _cap_rad) * (1 + 1e-9)
+            for i in np.nonzero(_d2c < _lim * _lim)[0]:
+                pad = _drill_pads[i]
+                (p1x, p1y), (p2x, p2y), prad = pad_drill_capsule(pad)
+                dist = point_to_segment_distance(x_mm, y_mm, p1x, p1y, p2x, p2y) - prad
+                if dist < min_pad_dist:
+                    return (False, f"too_close_to_th_pad({dist:.2f}mm)")
+
+        # Check against GND vias we're placing in this batch. Physical spacing,
+        # so EVERY batch via counts regardless of which ground domain it serves.
+        for (px, py), _bnet in placed_gnd_positions:
+            dist = math.sqrt((x_mm - px)**2 + (y_mm - py)**2)
+            if dist < via_via_min_dist:
+                return (False, f"too_close_to_batch_gnd_via({dist:.2f}mm)")
+
+        # A keep-out rule area forbidding vias (#1778). The grid check above
+        # reads TRACK cells only, so an area that forbids vias and allows
+        # tracks -- stamped into the via cells alone -- was never asked;
+        # the gate judges the via's copper disk as KiCad's items_not_allowed
+        # does (and a net-filtered keep-out binding the return net).
+        if _ko_gate is not None and _ko_gate(vias=[Via(
+                x=x_mm, y=y_mm, size=config.via_size, drill=config.via_drill,
+                layers=["F.Cu", "B.Cu"], net_id=own_net)]):
+            return (False, "keepout_area")
+
+        return _exact_copper_clear(x_mm, y_mm, own_net)
+
+    # What a return via can join: the sweep's model, on the zones as the board
+    # will hold them once this call's pours are in (`_zones`, above).
+    from check_weird import via_support_parts
+    _copper = list(pcb_data.board_info.copper_layers or ['F.Cu', 'B.Cu'])
+    _poured_layers: Dict[int, set] = {}
+    for _z in pour_zones(_zones):
+        if _z.layer in _copper:
+            _poured_layers.setdefault(_z.net_id, set()).add(_z.layer)
+
+    def _joins_two_layers(x_mm: float, y_mm: float, net_id: int) -> bool:
+        via = Via(x=x_mm, y=y_mm, size=config.via_size, drill=config.via_drill,
+                  layers=["F.Cu", "B.Cu"], net_id=net_id)
+        _span, fixed, by_seg = via_support_parts(
+            via, [s for s in pcb_data.segments if s.net_id == net_id],
+            pcb_data.pads_by_net.get(net_id, []),
+            [z for z in _zones if z.net_id == net_id], _copper)
+        return len(set(fixed) | set(by_seg.values())) >= 2
+
+    # Try many angles for better coverage (every 15 degrees = 24 directions)
+    angles_deg = list(range(0, 360, 15))
+
+    skipped_has_gnd = 0
+    skipped_no_space = 0
+    skipped_outside_pours = 0
+    skipped_too_few_pours: Dict[int, int] = {}
+    placement_distances = []  # Track distances where GND vias were placed
+
+    for sig_via in signal_vias:
+        sx, sy = sig_via.x, sig_via.y
+        via_gnd_net_id = _return_net_for(sig_via)
+
+        # Check if there's already a same-domain GND via/pad within
+        # gnd_via_distance (the vias placed so far included). Ground copper of
+        # ANOTHER domain is not a return path for this signal, so it must not
+        # satisfy the coverage test (#489 §5).
+        if model.nearest_return(sig_via) <= gnd_via_distance:
+            skipped_has_gnd += 1
+            continue
+
+        if len(_poured_layers.get(via_gnd_net_id, ())) < 2:
+            skipped_too_few_pours[via_gnd_net_id] = (
+                skipped_too_few_pours.get(via_gnd_net_id, 0) + 1)
+            continue
+
+        # Try to place a GND via as close as possible to signal via
+        best_pos = None
+        clear_site_seen = False
+        distance_step = config.grid_step / 2  # Finer step for better placement
+
+        distance = min_distance
+        while distance <= gnd_via_distance:
+            # Try all angles at this distance
+            for angle_deg in angles_deg:
+                angle_rad = math.radians(angle_deg)
+                # Snap to the routing grid: the clearance check works on
+                # grid CELLS, so an off-grid candidate can sit up to half a
+                # cell (25um at 0.05) inside an obstacle the check calls
+                # clear -- the residual 12-22um stitching-via overlaps.
+                gnd_x = round((sx + distance * math.cos(angle_rad))
+                              / config.grid_step) * config.grid_step
+                gnd_y = round((sy + distance * math.sin(angle_rad))
+                              / config.grid_step) * config.grid_step
+
+                is_clear, reason = is_via_position_clear(gnd_x, gnd_y, sx, sy,
+                                                          via_gnd_net_id)
+                if is_clear:
+                    clear_site_seen = True
+                    if _joins_two_layers(gnd_x, gnd_y, via_gnd_net_id):
+                        # Found a valid position at closest possible distance
+                        best_pos = (gnd_x, gnd_y)
+                        break
+
+            if best_pos is not None:
+                break  # Found a position, stop searching
+
+            distance += distance_step
+
+        if best_pos is None:
+            if clear_site_seen:
+                skipped_outside_pours += 1
+            else:
+                skipped_no_space += 1
+        else:
+            actual_dist = math.sqrt((best_pos[0] - sx)**2 + (best_pos[1] - sy)**2)
+            placement_distances.append(actual_dist)
+
+            gnd_via = Via(
+                x=best_pos[0],
+                y=best_pos[1],
+                size=config.via_size,
+                drill=config.via_drill,
+                # Through-hole span like every other routed via (see above).
+                layers=["F.Cu", "B.Cu"],
+                # This signal's OWN ground domain (#489 §5), not one board-global net.
+                net_id=via_gnd_net_id,
+                free=True
+            )
+            new_gnd_vias.append(gnd_via)
+            placed_gnd_positions.append((best_pos, via_gnd_net_id))
+            model.existing_by_net.setdefault(via_gnd_net_id, []).append(best_pos)
+
+    # Summary
+    if new_gnd_vias:
+        print(f"\nAdded {len(new_gnd_vias)} GND vias near signal vias")
+        if len(domains) > 1:
+            per_net: Dict[int, int] = {}
+            for v in new_gnd_vias:
+                per_net[v.net_id] = per_net.get(v.net_id, 0) + 1
+            breakdown = ", ".join(
+                f"{(pcb_data.nets.get(nid).name if pcb_data.nets.get(nid) else nid)}: {n}"
+                for nid, n in sorted(per_net.items(), key=lambda kv: -kv[1]))
+            print(f"  Per ground domain -- {breakdown}")
+        if placement_distances:
+            # fsum for consistency with the rest of the codebase (#493); this
+            # one only feeds the printed summary, so no board depends on it.
+            avg_dist = math.fsum(placement_distances) / len(placement_distances)
+            min_placed = min(placement_distances)
+            max_placed = max(placement_distances)
+            print(f"  Placement distances: min={min_placed:.3f}mm, avg={avg_dist:.3f}mm, max={max_placed:.3f}mm")
+            print(f"  (min_distance theoretical={min_distance:.3f}mm)")
+    if skipped_has_gnd > 0:
+        print(f"  {skipped_has_gnd} signal vias already had nearby GND via/pad")
+    if skipped_no_space > 0:
+        print(f"  {skipped_no_space} signal vias had no clear space for GND via within {gnd_via_distance}mm")
+    if skipped_outside_pours > 0:
+        print(f"  {skipped_outside_pours} signal vias had no clear site within {gnd_via_distance}mm "
+              f"inside their ground net's pours on two layers")
+    for nid, count in sorted(skipped_too_few_pours.items()):
+        net = pcb_data.nets.get(nid)
+        name = net.name if net else nid
+        layers = sorted(_poured_layers.get(nid, ()))
+        poured = f"poured only on {layers[0]}" if layers else "not poured on any layer"
+        text = (f"No return vias on {name} for {count} signal via(s): the net is {poured}. "
+                f"A return via needs {name} on a second layer: with fewer than two layers "
+                f"it joins nothing, and the closing route.py removes it. "
+                f"Pour {name} on a second layer to have return vias.")
+        print(f"Warning: {text}")
+        if warnings is not None:
+            warnings.append(text)
+    if not new_gnd_vias and skipped_has_gnd == len(signal_vias):
+        print("All signal vias already have nearby GND vias/pads")
+
+    return new_gnd_vias

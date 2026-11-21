@@ -1,0 +1,264 @@
+#!/usr/bin/env python3
+"""#1200: a tool writes a copper keep-out rule area, and the router keeps out.
+
+One-Air-Max's ESP32-C6 antenna needs a copper keep-out on every layer. The
+toolchain honours a KiCad rule area, but nothing could create one (the only
+writer was route_planes' pour-only NPTH keep-out), and on a board placed from
+scratch the area has to follow the module's final pose.
+
+Checks (tracked esp_prog):
+  1. kicad_writer: the pour-only keep-out still forbids copper pour alone;
+     generate_rule_area_sexpr forbids what it is asked to and refuses a flag
+     KiCad does not have.
+  2. add_rule_area --ref U2: the area is in U2's frame as the file stores it,
+     the frame of its pads -- a rect around pad 1's local position contains
+     its global one. The parser reads it back on every copper layer with
+     tracks, vias and copper pour not allowed. A re-run replaces it.
+  3. Refusals, by reason: a --ref the board lacks, a layer it lacks.
+  4. route.py routes Net-(R3-Pad2) through a 3 x 2 mm box without the area
+     (non-vacuity) and around it with the area, still routed.
+  5. Once the area is added to that free route, check_drc reports its copper
+     inside the area, and (with kicad-cli present, found as the tools find it)
+     KiCad reports the same tracks as items_not_allowed under a custom rule
+     naming the area -- the area is real to KiCad. kicad-cli 10.0.0 does not
+     enforce a rule area's own keep-out, so the named rule is what it can
+     grade; 10.0.3 and 10.0.7 enforce it as well, which reports each track
+     once per rule, so the leg counts TRACKS per rule, never rows, and the
+     area's own report must be those same tracks or nothing.
+
+    python3 tests/test_1200_add_rule_area.py
+"""
+import contextlib
+import io
+import json
+import os
+import shutil
+import subprocess
+import sys
+import tempfile
+
+TESTS_DIR = os.path.dirname(os.path.abspath(__file__))
+ROOT = os.path.dirname(TESTS_DIR)
+sys.path.insert(0, os.path.join(ROOT, 'py_router'))
+sys.path.insert(0, TESTS_DIR)
+
+from copy_board import copy_board                              # noqa: E402
+from kicad_oracle import find_kicad_cli, kicad_cli_version     # noqa: E402
+from kicad_parser import parse_kicad_pcb                       # noqa: E402
+import run_utils                                               # noqa: E402
+
+BOARD = os.path.join(ROOT, 'kicad_files', 'esp_prog.kicad_pcb')
+NET = 'Net-(R3-Pad2)'
+BOX = (132.0, 99.0, 135.0, 101.0)
+RULE = 'ko_by_name'
+failures = []
+
+
+def check(label, ok, detail=''):
+    print(f"  [{'ok' if ok else 'FAIL'}] {label}{(': ' + detail) if detail else ''}")
+    if not ok:
+        failures.append(label)
+
+
+def parse(path):
+    with contextlib.redirect_stdout(io.StringIO()), \
+            contextlib.redirect_stderr(io.StringIO()):
+        return parse_kicad_pcb(path)
+
+
+def tool(*argv):
+    return subprocess.run([sys.executable, '-X', 'utf8', 'py_router/add_rule_area.py']
+                          + [str(a) for a in argv], cwd=ROOT, capture_output=True,
+                          text=True, encoding='utf-8', errors='replace')
+
+
+def keepout_tracks(rows):
+    """(tracks the rule naming the area reports, tracks its own keep-out
+    reports) in KiCad's items_not_allowed rows. The track is a row's first
+    item, and its uuid names it once however many rules report it: 10.0.3
+    and 10.0.7 report each track under both, 10.0.0 under the rule alone."""
+    def tracks(by_rule):
+        return {json.dumps(v['items'][0].get('uuid') or v['items'][0],
+                           sort_keys=True)
+                for v in rows if v.get('type') == 'items_not_allowed'
+                and v.get('items')
+                and (f"'{RULE}'" in v.get('description', '')) == by_rule}
+    return tracks(True), tracks(False)
+
+
+def kicad_agrees(rows, n_ours):
+    """The two checks of KiCad's report against check_drc's n_ours tracks:
+    the named rule reports exactly that many, and the area's own keep-out
+    reports those same tracks or none (a KiCad that does not enforce it)."""
+    named, own = keepout_tracks(rows)
+    n_rows = sum(1 for v in rows if v.get('type') == 'items_not_allowed')
+    return (len(named) == n_ours and n_ours > 0, own in (set(), named),
+            f'{len(named)} track(s) by the rule, {len(own)} by the area, '
+            f'in {n_rows} items_not_allowed row(s); check_drc {n_ours}')
+
+
+def in_box(x, y):
+    return BOX[0] < x < BOX[2] and BOX[1] < y < BOX[3]
+
+
+def net_copper_in_box(path):
+    pcb = parse(path)
+    nid = next(i for i, n in pcb.nets.items() if n.name == NET)
+    segs = [s for s in pcb.segments if s.net_id == nid]
+    hits = sum(1 for s in segs if any(
+        in_box(s.start_x + t / 40 * (s.end_x - s.start_x),
+               s.start_y + t / 40 * (s.end_y - s.start_y)) for t in range(41)))
+    return len(segs), hits
+
+
+def main():
+    # 1. The writer.
+    from kicad_writer import generate_keepout_zone_sexpr, generate_rule_area_sexpr
+    pour = generate_keepout_zone_sexpr(['F.Cu'], [(0, 0), (1, 0), (1, 1)], 'p')
+    check('the NPTH keep-out still forbids copper pour alone',
+          '(copperpour not_allowed)' in pour and '(tracks allowed)' in pour
+          and '(vias allowed)' in pour)
+    area = generate_rule_area_sexpr(['F.Cu'], [(0, 0), (1, 0), (1, 1)], 'a')
+    check('a rule area forbids tracks, vias and copper pour by default',
+          all(f'({k} not_allowed)' in area for k in ('tracks', 'vias', 'copperpour'))
+          and '(pads allowed)' in area)
+    try:
+        generate_rule_area_sexpr(['F.Cu'], [(0, 0), (1, 0), (1, 1)], 'a',
+                                 not_allowed=('wires',))
+        check('an unknown flag is refused', False)
+    except ValueError as exc:
+        check('an unknown flag is refused', 'wires' in str(exc), str(exc))
+
+    tmp = tempfile.mkdtemp(prefix='t1200_')
+    try:
+        # 2. --ref, read-back, replace.
+        pcb = parse(BOARD)
+        u2 = pcb.footprints['U2']
+        p1 = next(p for p in u2.pads if p.pad_number == '1')
+        out = os.path.join(tmp, 'a.kicad_pcb')
+        r = tool(BOARD, out, '--name', 'ANT_KEEPOUT', '--ref', 'U2', '--rect',
+                 p1.local_x - 0.2, p1.local_y - 0.2, p1.local_x + 0.2, p1.local_y + 0.2)
+        check('add_rule_area says what it wrote',
+              r.returncode == 0 and "wrote rule area 'ANT_KEEPOUT'" in r.stdout
+              and "U2's local frame" in r.stdout, (r.stdout + r.stderr)[-300:])
+        run_utils.evidence(out, 'the written board')
+        kos = [k for k in parse(out).board_info.keepouts]
+        k = kos[0] if kos else {}
+        poly = k.get('polygon') or []
+        xs, ys = [x for x, _ in poly], [y for _, y in poly]
+        check("the area sits on pad 1 (the pads' frame)",
+              bool(poly) and min(xs) < p1.global_x < max(xs)
+              and min(ys) < p1.global_y < max(ys),
+              f'pad1 ({p1.global_x}, {p1.global_y}) bbox '
+              f'{(min(xs), min(ys), max(xs), max(ys)) if poly else None}')
+        check('read back on every copper layer, tracks/vias/pour not allowed',
+              len(kos) == 1 and set(k.get('layers') or ()) == set(pcb.board_info.copper_layers)
+              and k.get('tracks_allowed') is False and k.get('vias_allowed') is False
+              and k.get('copper_pour_allowed') is False, json.dumps(
+                  {kk: (sorted(v) if isinstance(v, set) else v) for kk, v in k.items()
+                   if kk != 'polygon' and kk != 'holes'}, default=str))
+        r = tool(out, out, '--name', 'ANT_KEEPOUT', '--ref', 'U2', '--rect', -3, -3, 3, 3)
+        check('a re-run replaces the area of that name',
+              'replaced 1 earlier area' in r.stdout
+              and len(parse(out).board_info.keepouts) == 1, r.stdout[-200:])
+
+        # 3. Refusals.
+        run_utils.check([sys.executable, '-X', 'utf8', 'py_router/add_rule_area.py',
+                         BOARD, os.path.join(tmp, 'x.kicad_pcb'), '--name', 'k',
+                         '--ref', 'U99', '--rect', '0', '0', '1', '1'],
+                        refuse='U99 names no footprint', code=2, cwd=ROOT)
+        run_utils.check([sys.executable, '-X', 'utf8', 'py_router/add_rule_area.py',
+                         BOARD, os.path.join(tmp, 'x.kicad_pcb'), '--name', 'k',
+                         '--layers', 'In7.Cu', '--rect', '0', '0', '1', '1'],
+                        refuse='not a copper layer', code=2, cwd=ROOT)
+
+        # 4. The router keeps out.
+        res = {}
+        for arm in ('free', 'ko'):
+            inp = os.path.join(tmp, f'in_{arm}.kicad_pcb')
+            with contextlib.redirect_stdout(io.StringIO()), \
+                    contextlib.redirect_stderr(io.StringIO()):
+                copy_board(BOARD, inp)
+            if arm == 'ko':
+                tool(inp, inp, '--name', 'KO', '--rect', *BOX)
+            rout = os.path.join(tmp, f'out_{arm}.kicad_pcb')
+            r = subprocess.run([sys.executable, '-X', 'utf8', 'py_router/route.py',
+                                inp, rout, '--nets', NET], cwd=ROOT,
+                               capture_output=True, text=True, encoding='utf-8',
+                               errors='replace')
+            line = next((l for l in r.stdout.splitlines()
+                         if l.startswith('JSON_SUMMARY_MIN:')), '')
+            routed = json.loads(line.split(':', 1)[1]).get('routed') if line else None
+            res[arm] = (routed,) + net_copper_in_box(rout)
+        check('without the area the route crosses the box (non-vacuity)',
+              res['free'][0] == 1 and res['free'][2] >= 1, str(res['free']))
+        check('with the area the net routes around it',
+              res['ko'][0] == 1 and res['ko'][1] > 0 and res['ko'][2] == 0, str(res['ko']))
+
+        # 5. The graders agree the area is real: the free route with the area
+        # added on top is copper inside it.
+        fpk = os.path.join(tmp, 'free_ko.kicad_pcb')
+        tool(os.path.join(tmp, 'out_free.kicad_pcb'), fpk, '--name', 'KO',
+             '--rect', *BOX)
+        run_utils.evidence(fpk, 'the free route with the area added')
+        r = subprocess.run([sys.executable, '-X', 'utf8', 'py_router/check_drc.py', fpk],
+                           cwd=ROOT, capture_output=True, text=True, encoding='utf-8',
+                           errors='replace')
+        n_ours = r.stdout.count("in keep-out rule area 'KO'")
+        check('check_drc reports the free route inside the area', n_ours >= 1,
+              str(n_ours))
+        # The count, on both shapes of report (#1591), with no KiCad needed:
+        # 10.0.0 reports each track under the named rule alone, 10.0.3 and
+        # 10.0.7 under the area's own keep-out too -- one row per rule.
+        def row(uuid, by_rule):
+            return {'type': 'items_not_allowed', 'items': [{'uuid': uuid}],
+                    'description': 'Items not allowed'
+                                   + (f" (rule '{RULE}')" if by_rule else '')}
+        enforced = [row(u, r) for u in 'abc' for r in (False, True)]
+        for label, rows, want in (
+                ('a 10.0.0 report (rule rows only)',
+                 [row(u, True) for u in 'abc'],
+                 (True, True)),
+                ('a 10.0.7 report (each track twice)', enforced, (True, True)),
+                ('a report a track short', enforced[:-2], (False, True)),
+                ('a report whose area names another track', enforced + [row('d', False)],
+                 (True, False)),
+                ('an empty report', [], (False, True))):
+            got = kicad_agrees(rows, 3)
+            check(f'the KiCad count reads {label} right',
+                  got[:2] == want, got[2])
+        kicad_cli = find_kicad_cli(warn=False)
+        if kicad_cli:
+            # kicad-cli 10.0.0 does not enforce a rule area's own keep-out (a
+            # track across one, written by pcbnew itself, reports nothing), but
+            # it does enforce a custom rule naming the area -- which still
+            # proves KiCad reads the area's name and outline as written.
+            # 10.0.3 and 10.0.7 enforce the area too, so there each track is
+            # one row per rule (#1591): count tracks, per rule, never rows.
+            with open(os.path.splitext(fpk)[0] + '.kicad_dru', 'w') as f:
+                f.write(f'(version 1)\n(rule {RULE}\n'
+                        '  (constraint disallow track via)\n'
+                        '  (condition "A.intersectsArea(\'KO\')"))\n')
+            rep = os.path.join(tmp, 'drc.json')
+            subprocess.run([kicad_cli, 'pcb', 'drc', '--format', 'json',
+                            '--severity-all', '-o', rep, fpk], capture_output=True)
+            run_utils.evidence(rep, 'the KiCad DRC report')
+            with open(rep, encoding='utf-8') as f:
+                rows = json.load(f).get('violations', [])
+            ok_named, ok_own, detail = kicad_agrees(rows, n_ours)
+            ver = f'kicad-cli {kicad_cli_version(kicad_cli) or "?"}'
+            check('KiCad reports the same copper inside the area under the rule '
+                  'naming it', ok_named, f'{ver}: {detail}')
+            check("the area's own keep-out reports those same tracks, or none",
+                  ok_own, f'{ver}: {detail}')
+        else:
+            print('  [skip] kicad-cli not present: KiCad cross-check not run')
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+    print('FAILED: ' + ', '.join(failures) if failures else 'PASS')
+    return 1 if failures else 0
+
+
+if __name__ == '__main__':
+    sys.exit(main())

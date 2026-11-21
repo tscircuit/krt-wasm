@@ -1,0 +1,984 @@
+"""
+Parse placement-relevant geometry from KiCad PCB files.
+
+Extracts courtyard boundaries and other footprint geometry that
+kicad_parser doesn't provide, for use by the placement tool.
+
+Both readers here split footprint blocks with ``kicad_parser.find_matching_paren``
+rather than a naive paren counter: a property value containing a lone paren (an
+MPN like ``"TCR2EF115,LM(CT"``) makes a naive scan run past the block end and
+swallow the following footprints (issue #113).
+
+The courtyard reader deliberately mirrors ``kicad_parser._footprint_edge_points``,
+which solved the same problems one layer up for Edge.Cuts: every shape kind
+(fp_line / fp_rect / fp_arc / fp_circle / fp_poly), and an element gap that
+cannot cross into the next element (see ``_FP_ELEMENT_GAP``).
+"""
+from __future__ import annotations
+
+import math
+import re
+from typing import Dict, NamedTuple, Optional, Set, Tuple
+
+from kicad_parser import (_arc_to_segments, find_matching_paren,
+                          footprint_head_flags, iter_footprint_blocks,
+                          strip_bare_shape_locks, upgrade_legacy_arcs)
+
+Bbox = Tuple[float, float, float, float]
+
+# Regex gap that matches anything EXCEPT the start of another footprint element
+# or a layer tag, so a lazy match cannot run past the current element to a later
+# ``(layer ...)`` token. This is the footprint-level twin of kicad_parser's
+# _GR_ELEMENT_GAP (issue #77, board graphics).
+#
+# With a plain `.*?` here, a match could START on a silk fp_line and BORROW the
+# layer tag of a later courtyard element, dragging the silk element's
+# coordinates into the courtyard bbox: with the standard element order (silk,
+# courtyard, fab) a 0402 whose true courtyard is (-0.5,-0.4)-(0.5,0.4) read as
+# (-2.0,-0.9)-(2.0,0.4). Usually that only INFLATES a part (spurious clearance
+# rejections, phantom halo cost), but on a non-rectangular courtyard it can lose
+# an extreme and UNDER-estimate, letting real overlap validate; it also made the
+# swap-identity guard see two instances of one footprint as different shapes
+# purely because their neighbouring silk differed (#456 item 3).
+_FP_ELEMENT_GAP = r'(?:(?!\(fp_|\(pad\b|\(layers?\b)[\s\S])*?'
+
+_CRTYD_LAYER = r'\(layer\s+"([FB])\.CrtYd"\)'
+_FAB_LAYER = r'\(layer\s+"([FB])\.Fab"\)'
+# #896. The LAST resort before the pad bbox, and the only drawn geometry a
+# hand-rolled library may carry at all: on esp_prog (OLIMEX) not one of 21
+# footprints draws a courtyard and six -- CON1, CON2, U1, U2, Q1, Q2 -- draw no
+# .Fab either, so silk is their only body. Read through the same
+# `_courtyard_points_by_side`, so `_FP_ELEMENT_GAP` protects it too; a
+# hand-written silk regex is exactly how #456 item 3 comes back.
+_SILK_LAYER = r'\(layer\s+"([FB])\.SilkS"\)'
+_NUM = r'([\d.eE+-]+)'
+
+
+def _footprint_blocks(content: str):
+    """Yield (key, footprint_text) for every footprint block.
+
+    The key is the parser's own (#726), so a courtyard, a fab outline and a
+    lock all land under the name `pcb.footprints` uses. This mattered as soon
+    as duplicates stopped collapsing: `placement/labels.py` looks a courtyard
+    up as `courtyard_sides.get(fp.reference)`, so a `TP4~2` against a
+    `TP4`-keyed map would silently find nothing and fall back to the pad bbox.
+
+    Two behaviour changes come with delegating, both in the conservative
+    direction. The old regex required a non-empty `(property "Reference" ...)`,
+    so it skipped reference-LESS blocks and KiCad 6/7 `(fp_text reference ...)`
+    blocks ENTIRELY -- those now appear, under their `#uuid` / 6-7 names.
+    `extract_locked_refs` therefore starts returning `#uuid` keys for locked
+    NPTH drill dots (thunderscope has 86), which adds to lock sets and never
+    subtracts.
+    """
+    for _start, _end, fp_text, _raw_ref, key in iter_footprint_blocks(content):
+        yield key, fp_text
+
+
+#: #1094: `(path, mtime, size) -> [(key, footprint_text)]`. Every reader
+#: below splits the whole file into footprint blocks, and one
+#: check_assembly grade calls five of them twice each (occupancy and fab
+#: bodies): the split was 5 of its 7 seconds on glasgow_revC.
+_BLOCK_CACHE: Dict[tuple, list] = {}
+
+
+def _file_blocks(pcb_file: str) -> list:
+    """`_footprint_blocks` of a board FILE, split once per file version."""
+    import os as _os
+    try:
+        st = _os.stat(pcb_file)
+        key = (_os.path.abspath(pcb_file), st.st_mtime_ns, st.st_size)
+    except OSError:
+        key = None
+    if key is not None and key in _BLOCK_CACHE:
+        return _BLOCK_CACHE[key]
+    with open(pcb_file, 'r', encoding='utf-8') as f:
+        # A pre-6.0 file's center/angle fp_arcs read as start/mid/end, the
+        # only arc form the outline readers here match (read-only copy).
+        blocks = list(_footprint_blocks(strip_bare_shape_locks(upgrade_legacy_arcs(f.read()))))
+    if key is not None:
+        if len(_BLOCK_CACHE) > 8:
+            _BLOCK_CACHE.clear()
+        _BLOCK_CACHE[key] = blocks
+    return blocks
+
+
+def extract_locked_refs(pcb_file: str) -> Set[str]:
+    """
+    Find all footprints marked as locked in the PCB file.
+
+    Returns set of component references (e.g., {"P1", "J1"}).
+    """
+    blocks = _file_blocks(pcb_file)
+
+    locked = set()
+    for ref, fp_text in blocks:
+        # Check for (locked yes) before the first pad
+        # It appears early in the footprint block, before properties
+        first_pad = fp_text.find('(pad ')
+        search_region = fp_text[:first_pad] if first_pad > 0 else fp_text[:500]
+        if (re.search(r'\(locked(?:\s+yes)?\)', search_region)  # (locked) 2021 nightlies
+                or 'locked' in footprint_head_flags(fp_text)):  # KiCad 6: bare
+            locked.add(ref)
+    return locked
+
+
+def _full_circle_arc(sx, sy, mx, my, ex, ey, grid=1e-6):
+    """`((cx, cy), r)` when an fp_arc's start and end coincide (in KiCad's
+    1 nm unit, `grid`) but its mid does not: KiCad draws that as a FULL
+    circle whose diameter is start-mid, and closes it (kicad-cli 10, final
+    P1 verifier: such an arc alone over a pin reports pth_inside_courtyard).
+    `_arc_to_segments` reads it as the zero-length chord start-end. None
+    otherwise -- ends a few nm apart are an ordinary (near-full) arc."""
+    def q(v):
+        return round(v / grid)
+    if (q(sx), q(sy)) != (q(ex), q(ey)) or (q(sx), q(sy)) == (q(mx), q(my)):
+        return None
+    return ((sx + mx) / 2.0, (sy + my) / 2.0), math.hypot(mx - sx, my - sy) / 2
+
+
+def _courtyard_points_by_side(fp_text: str,
+                              _CRTYD_LAYER: str = _CRTYD_LAYER
+                              ) -> Dict[str, list]:
+    """Local-frame outline points of one footprint, keyed by 'F' / 'B'.
+
+    Defaults to the courtyard layers; pass a different single-group layer
+    regex (e.g. `_FAB_LAYER`) to read another outline layer with the same
+    geometry rules (run-6: the fab BODY channel). The parameter shadows the
+    module constant so the regex sites below stay untouched."""
+    pts: Dict[str, list] = {}
+
+    def add(side, *xy_pairs):
+        pts.setdefault(side, []).extend(xy_pairs)
+
+    for m in re.finditer(
+            r'\(fp_(line|rect)\s+\(start\s+' + _NUM + r'\s+' + _NUM + r'\)\s+'
+            r'\(end\s+' + _NUM + r'\s+' + _NUM + r'\)' + _FP_ELEMENT_GAP
+            + _CRTYD_LAYER, fp_text, re.DOTALL):
+        x1, y1, x2, y2 = (float(m.group(i)) for i in range(2, 6))
+        if m.group(1) == 'rect':
+            # all four corners: a rect's start/end alone don't bound it once the
+            # footprint rotates (same reason as _footprint_edge_points)
+            add(m.group(6), (x1, y1), (x2, y2), (x1, y2), (x2, y1))
+        else:
+            add(m.group(6), (x1, y1), (x2, y2))
+
+    for m in re.finditer(
+            r'\(fp_arc\s+\(start\s+' + _NUM + r'\s+' + _NUM + r'\)\s+'
+            r'\(mid\s+' + _NUM + r'\s+' + _NUM + r'\)\s+'
+            r'\(end\s+' + _NUM + r'\s+' + _NUM + r'\)' + _FP_ELEMENT_GAP
+            + _CRTYD_LAYER, fp_text, re.DOTALL):
+        sx, sy, mx, my, ex, ey = (float(m.group(i)) for i in range(1, 7))
+        full = _full_circle_arc(sx, sy, mx, my, ex, ey)
+        if full is not None:
+            (cx, cy), r = full
+            add(m.group(7), (cx - r, cy - r), (cx + r, cy + r))
+            continue
+        for seg in _arc_to_segments((sx, sy), (mx, my), (ex, ey)):
+            add(m.group(7), *seg)
+
+    for m in re.finditer(
+            r'\(fp_circle\s+\(center\s+' + _NUM + r'\s+' + _NUM + r'\)\s+'
+            r'\(end\s+' + _NUM + r'\s+' + _NUM + r'\)' + _FP_ELEMENT_GAP
+            + _CRTYD_LAYER, fp_text, re.DOTALL):
+        cx, cy, ex, ey = (float(m.group(i)) for i in range(1, 5))
+        r = math.hypot(ex - cx, ey - cy)
+        # the disc's bbox; rotation-invariant about the centre
+        add(m.group(5), (cx - r, cy - r), (cx + r, cy + r))
+
+    # fp_poly carries its vertices in a nested (pts (xy ...) ...) block, so it is
+    # read as a balanced sub-expression rather than by a flat regex.
+    for pm in re.finditer(r'\(fp_poly\b', fp_text):
+        poly_text = fp_text[pm.start():find_matching_paren(fp_text, pm.start())]
+        lm = re.search(_CRTYD_LAYER, poly_text)
+        if not lm:
+            continue
+        for xm in re.finditer(r'\(xy\s+' + _NUM + r'\s+' + _NUM + r'\)', poly_text):
+            add(lm.group(1), (float(xm.group(1)), float(xm.group(2))))
+
+    return pts
+
+
+def _bbox(points) -> Bbox:
+    xs = [p[0] for p in points]
+    ys = [p[1] for p in points]
+    return (min(xs), min(ys), max(xs), max(ys))
+
+
+def extract_courtyard_sides(pcb_file: str) -> Dict[str, Dict[str, Bbox]]:
+    """
+    Parse courtyard extents from each footprint block, kept PER SIDE.
+
+    Returns dict mapping component reference to {'F': bbox} / {'B': bbox} /
+    both, where each bbox is (local_min_x, local_min_y, local_max_x,
+    local_max_y) in the footprint's local coordinate system. These must be
+    transformed to global coordinates using the footprint's position and
+    rotation. A reference with no courtyard on any layer is absent entirely.
+
+    Side matters because a back-side part and a front-side part overlap in XY
+    without overlapping in copper; `extract_courtyard_bboxes` keeps the legacy
+    union-of-sides view for callers that don't model side.
+    """
+    blocks = _file_blocks(pcb_file)
+
+    result: Dict[str, Dict[str, Bbox]] = {}
+    for ref, fp_text in blocks:
+        if '.CrtYd"' not in fp_text:
+            continue
+        by_side = _courtyard_points_by_side(fp_text)
+        if by_side:
+            result[ref] = {side: _bbox(pts) for side, pts in by_side.items()}
+    return result
+
+
+def extract_fab_sides(pcb_file: str) -> Dict[str, Dict[str, Bbox]]:
+    """Per-side F/B.Fab BODY-outline bboxes, `extract_courtyard_sides`'s
+    sibling (run-6). The fab outline is the drawn component BODY with no
+    courtyard margin, so a cross-footprint fab intersection is two parts
+    physically colliding -- the discriminating channel between a real stack
+    and a legitimate shell-overhang courtyard kiss."""
+    blocks = _file_blocks(pcb_file)
+    result: Dict[str, Dict[str, Bbox]] = {}
+    for ref, fp_text in blocks:
+        if '.Fab"' not in fp_text:
+            continue
+        by_side = _courtyard_points_by_side(fp_text, _FAB_LAYER)
+        if by_side:
+            result[ref] = {side: _bbox(pts) for side, pts in by_side.items()}
+    return result
+
+
+def extract_silk_sides(pcb_file: str) -> Dict[str, Dict[str, Bbox]]:
+    """Per-side F/B.SilkS bboxes -- `extract_fab_sides`'s sibling (#896).
+
+    THIS IS NOT A BODY ON ITS OWN, and callers must not treat it as one. On a
+    stock KiCad footprint silk is a pair of clipped side ticks that bracket the
+    pads on one axis and are cut away on the other: measured on esp_prog, all 10
+    footprints drawing both fab and silk have a silk bbox NARROWER than the fab
+    body along the pad axis (Y1: 0.508mm against a 3.200mm body) and WIDER
+    across it. There is no offset that reconciles the two -- the sign of the
+    error differs per axis -- which is why `placement.body` unions this with the
+    pad bbox rather than substituting it, and why nothing here applies an
+    expansion. `placement.body.body_geometry` is the only intended consumer.
+    """
+    blocks = _file_blocks(pcb_file)
+    result: Dict[str, Dict[str, Bbox]] = {}
+    for ref, fp_text in blocks:
+        if '.SilkS"' not in fp_text:
+            continue
+        by_side = _courtyard_points_by_side(fp_text, _SILK_LAYER)
+        if by_side:
+            result[ref] = {side: _bbox(pts) for side, pts in by_side.items()}
+    return result
+
+
+#: Coordinates are snapped to this grid (mm) before an outline is noded, so two
+#: segment ends KiCad wrote as 1.2500001 and 1.25 still meet.
+_OUTLINE_SNAP_MM = 1e-4
+#: A polygonised outline must contain every drawn vertex to within this (mm);
+#: otherwise part of the drawing did not close and the convex hull is used.
+_OUTLINE_COVER_TOL_MM = 1e-3
+#: Segment ends within this of each other are joined on a second attempt
+#: when a drawing does not close as written (#1094 verifier: ulx3s BAT1).
+#: KiCad's own courtyard chaining epsilon (`BuildCourtyardCaches`, 0.02 mm):
+#: a drawing it closes is a courtyard it tests pins against, and one this
+#: called open read `courtyard_malformed` and gated nothing (fa10 P1 verifier:
+#: synthetic gaps of 15 and 19 um close in KiCad, 30 um does not). A drawing
+#: joined at this distance is also ACCEPTED at it (`tol` below): judged at
+#: `_OUTLINE_COVER_TOL_MM`, the joined shape's moved corner always failed,
+#: which is how glasgow J4's 8 um corner gap read open while kicad-cli
+#: closes it.
+_OUTLINE_JOIN_MM = 0.02
+#: ...as far as it can be seen through the `_OUTLINE_SNAP_MM` grid: snapping
+#: both ends can grow a gap by up to sqrt(2) grid steps (final P1 verifiers:
+#: a 19.97 um diagonal gap off the grid snapped to 20.08 and read open, while
+#: KiCad closes it), and KiCad rounds a rotated footprint's ends to its 1 nm
+#: unit first, which can shrink a gap by up to sqrt(2) nm more (a 20.001 um
+#: gap at 15 degrees: KiCad 19.9999, closed). Generous, like the join
+#: itself: a gap between 20 and ~20.14 um closes here and not in KiCad
+#: (KNOWN_CONSERVATIVE in test_1212).
+_OUTLINE_JOIN_REACH_MM = _OUTLINE_JOIN_MM + math.sqrt(2) * (
+    _OUTLINE_SNAP_MM + 1e-6)
+OUTLINE_POLYGON = 'polygon'
+OUTLINE_HULL = 'hull'
+#: One read of a board's outlines per (path, mtime, size, layer): a single
+#: check_assembly reads them twice (occupancy and fab), and the placement
+#: tools grade the same file again and again.
+_SHAPE_CACHE: Dict[tuple, Dict[str, Dict[str, tuple]]] = {}
+
+
+def _nested_even_odd(geoms):
+    """One outline from closed contours the way KiCad assembles a courtyard
+    (`ConvertOutlineToPolygon`): a contour enclosed by an ODD number of the
+    others is a hole in its parent, one enclosed by an even number an
+    outline. So two concentric circles are a RING -- glasgow MK1-MK4's
+    mounting-hole keep-outs, 34 mm2 in KiCad, which a plain union filled to
+    78.5 mm2. Contours that overlap without one enclosing the other are
+    united, and an exact duplicate counts once.
+    """
+    from shapely.geometry import Polygon
+    from shapely.ops import unary_union
+
+    contours = []
+    for g in geoms:
+        stack = [g]
+        while stack:
+            h = stack.pop()
+            if h is None or h.is_empty:
+                continue
+            if h.geom_type == 'Polygon':
+                c = Polygon(h.exterior)
+                if c.area > 0 and not any(c.equals(q) for q in contours):
+                    contours.append(c)
+            else:
+                stack.extend(getattr(h, 'geoms', ()))
+    if not contours:
+        return None
+    depth = [sum(1 for j, q in enumerate(contours)
+                 if j != i and q.contains(c))
+             for i, c in enumerate(contours)]
+    shape = None
+    for d in sorted(set(depth)):
+        level = unary_union([c for c, k in zip(contours, depth) if k == d])
+        if shape is None:
+            shape = level
+        elif d % 2:
+            shape = shape.difference(level)
+        else:
+            shape = shape.union(level)
+    return shape
+
+
+def _outline_shapes_by_side(fp_text: str, layer_re: str,
+                            even_odd: bool = False,
+                            with_parts: bool = False) -> Dict[str, tuple]:
+    """The TRUE drawn outline of one footprint on `layer_re`, per side (#1094).
+
+    `{side: (shapely geometry in the local frame, how)}`, where `how` is
+    `OUTLINE_POLYGON` when the drawing closes and `OUTLINE_HULL` when it does
+    not (an open courtyard drawing, a missing segment) and the convex hull of
+    every drawn vertex stands in for it. Never smaller than what was drawn.
+
+    `_courtyard_points_by_side` reads the same elements but keeps only their
+    points, which is all a bbox needs; a bbox cannot survive a 45 degree
+    rotation (StickHub: 74 phantom courtyard pairs, KiCad finds 0), and an
+    oriented bbox cannot either, because a stepped courtyard such as StickHub
+    U1's 24 segments still over-states its corners by 2 mm2. This keeps the
+    shape.
+
+    `even_odd` assembles nested contours as KiCad assembles a COURTYARD
+    (`_nested_even_odd`: a contour inside another is a hole). Off, every
+    closed contour is united -- a .Fab drawing's inner circle is a detail
+    of the body (a button, a lens), not a hole through it.
+
+    `with_parts`: each value is `(geometry, how, parts)`, `parts` the closed
+    shapes the outline was composed from (one per drawn area or closed
+    chain; the hull alone when the drawing did not close).
+    """
+    from shapely.geometry import LineString, Point, Polygon, box
+    from shapely.ops import polygonize, unary_union
+
+    def snap(v):
+        return round(v / _OUTLINE_SNAP_MM) * _OUTLINE_SNAP_MM
+
+    lines: Dict[str, list] = {}
+    areas: Dict[str, list] = {}
+    verts: Dict[str, list] = {}
+    rings: Dict[str, list] = {}   # full-circle arcs: (circle, start)
+
+    def seg(side, a, b):
+        # A zero-length element (a line, or an arc whose start, mid and end
+        # coincide) is no part of the outline: KiCad drops it (kicad-cli 10:
+        # a square plus a zero-length fp_line, fp_arc or fp_rect is NOT
+        # malformed, and a pin under the square is reported), so its point
+        # must not be a vertex the outline has to cover. An arc whose ends
+        # meet but whose mid does not is a full circle (`_full_circle_arc`).
+        a = (snap(a[0]), snap(a[1]))
+        b = (snap(b[0]), snap(b[1]))
+        if a == b:
+            return
+        verts.setdefault(side, []).extend((a, b))
+        lines.setdefault(side, []).append(LineString((a, b)))
+
+    for m in re.finditer(
+            r'\(fp_(line|rect)\s+\(start\s+' + _NUM + r'\s+' + _NUM + r'\)\s+'
+            r'\(end\s+' + _NUM + r'\s+' + _NUM + r'\)' + _FP_ELEMENT_GAP
+            + layer_re, fp_text, re.DOTALL):
+        x1, y1, x2, y2 = (float(m.group(i)) for i in range(2, 6))
+        side = m.group(6)
+        if m.group(1) == 'rect':
+            if (snap(x1), snap(y1)) == (snap(x2), snap(y2)):
+                continue  # zero-size: dropped, as `seg` drops a point
+            r = box(min(x1, x2), min(y1, y2), max(x1, x2), max(y1, y2))
+            areas.setdefault(side, []).append(r)
+            verts.setdefault(side, []).extend(r.exterior.coords)
+        else:
+            seg(side, (x1, y1), (x2, y2))
+
+    for m in re.finditer(
+            r'\(fp_arc\s+\(start\s+' + _NUM + r'\s+' + _NUM + r'\)\s+'
+            r'\(mid\s+' + _NUM + r'\s+' + _NUM + r'\)\s+'
+            r'\(end\s+' + _NUM + r'\s+' + _NUM + r'\)' + _FP_ELEMENT_GAP
+            + layer_re, fp_text, re.DOTALL):
+        sx, sy, mx, my, ex, ey = (float(m.group(i)) for i in range(1, 7))
+        ring = _full_circle_arc(sx, sy, mx, my, ex, ey)
+        if ring is not None:
+            c = Point(*ring[0]).buffer(ring[1], 32)
+            rings.setdefault(m.group(7), []).append((c, (snap(sx), snap(sy))))
+            verts.setdefault(m.group(7), []).extend(c.exterior.coords)
+            continue
+        for a, b in _arc_to_segments((sx, sy), (mx, my), (ex, ey)):
+            seg(m.group(7), a, b)
+
+    for m in re.finditer(
+            r'\(fp_circle\s+\(center\s+' + _NUM + r'\s+' + _NUM + r'\)\s+'
+            r'\(end\s+' + _NUM + r'\s+' + _NUM + r'\)' + _FP_ELEMENT_GAP
+            + layer_re, fp_text, re.DOTALL):
+        cx, cy, ex, ey = (float(m.group(i)) for i in range(1, 5))
+        # A circle stays a circle: its bbox corners rotate off the disc.
+        c = Point(cx, cy).buffer(math.hypot(ex - cx, ey - cy), 32)
+        areas.setdefault(m.group(5), []).append(c)
+        verts.setdefault(m.group(5), []).extend(c.exterior.coords)
+
+    for pm in re.finditer(r'\(fp_poly\b', fp_text):
+        poly_text = fp_text[pm.start():find_matching_paren(fp_text, pm.start())]
+        lm = re.search(layer_re, poly_text)
+        if not lm:
+            continue
+        pts = [(snap(float(xm.group(1))), snap(float(xm.group(2))))
+               for xm in re.finditer(r'\(xy\s+' + _NUM + r'\s+' + _NUM + r'\)',
+                                     poly_text)]
+        if len(pts) >= 3:
+            p = Polygon(pts)
+            if not p.is_valid:
+                p = p.buffer(0)
+            areas.setdefault(lm.group(1), []).append(p)
+        verts.setdefault(lm.group(1), []).extend(pts)
+
+    def covers(shape, pts, tol=_OUTLINE_COVER_TOL_MM):
+        if shape is None or shape.is_empty:
+            return False
+        import shapely
+        return float(shapely.distance(shape, shapely.points(pts)).max()
+                     ) <= tol
+
+    def joined(segs):
+        """`segs` with each DANGLING end -- one no other end meets exactly
+        -- moved onto the nearest other dangling end within
+        `_OUTLINE_JOIN_REACH_MM`, nearest pairs first: a chain's loose ends
+        bridged, the way KiCad chains a courtyard. Ends that already meet
+        are left alone, so an arc's short chords and a side drawn in short
+        pieces keep their shape (a 20 um merge of ALL ends collapsed a
+        0.1 mm fillet's chords); a 15 um piece between two 10 um gaps still
+        closes (its four loose ends pair up). A segment is never joined to
+        ITSELF: a 12 um piece between two 15 um gaps would otherwise pair
+        its own ends first and vanish, leaving both gaps open (KiCad
+        closes it)."""
+        ends = [tuple(ln.coords[k]) for ln in segs for k in (0, -1)]
+        seen: Dict[tuple, int] = {}
+        for p in ends:
+            k = (round(p[0], 6), round(p[1], 6))
+            seen[k] = seen.get(k, 0) + 1
+        free = [i for i, p in enumerate(ends)
+                if seen[(round(p[0], 6), round(p[1], 6))] == 1]
+        cands = []
+        for a, i in enumerate(free):
+            for j in free[a + 1:]:
+                if i // 2 == j // 2:
+                    continue
+                d = math.hypot(ends[i][0] - ends[j][0],
+                               ends[i][1] - ends[j][1])
+                if d <= _OUTLINE_JOIN_REACH_MM + 1e-9:
+                    cands.append((d, i, j))
+        moved: Dict[int, tuple] = {}
+        used: set = set()
+        for _d, i, j in sorted(cands):
+            if i in used or j in used:
+                continue
+            used.update((i, j))
+            moved[j] = ends[i]
+        out = []
+        for k in range(len(segs)):
+            a = moved.get(2 * k, ends[2 * k])
+            b = moved.get(2 * k + 1, ends[2 * k + 1])
+            if a != b:
+                out.append(LineString((a, b)))
+        return out
+
+    # A full-circle arc nests like any contour (a hole inside an outline)
+    # -- unless its START lies on another contour. KiCad decides hole or
+    # outline from a contour's FIRST point, and a point on an edge is not
+    # inside it: a circle drawn from the square's edge inward is outline,
+    # the same circle drawn from its far side (its mid on the edge) a hole
+    # (third fix verifier, kicad-cli 10). Such a circle is united here.
+    united: Dict[str, list] = {}
+    for side, rs in rings.items():
+        for k, (c, start) in enumerate(rs):
+            p = Point(start)
+            others = (list(lines.get(side, ()))
+                      + [a.boundary for a in areas.get(side, ())]
+                      + [o.boundary for j, (o, _s) in enumerate(rs) if j != k])
+            if any(g.distance(p) <= _OUTLINE_SNAP_MM for g in others):
+                united.setdefault(side, []).append(c)
+            else:
+                areas.setdefault(side, []).append(c)
+
+    compose = _nested_even_odd if even_odd else unary_union
+
+    def composed(geoms, side):
+        g = compose(geoms) if geoms else None
+        if united.get(side):
+            g = unary_union(([g] if g is not None else []) + united[side])
+        return g
+
+    out: Dict[str, tuple] = {}
+    for side in set(verts) | set(areas):
+        parts = list(areas.get(side, []))
+        if lines.get(side):
+            parts.extend(polygonize(unary_union(lines[side])))
+        how = OUTLINE_POLYGON
+        shape = composed(parts, side)
+        pts = verts.get(side, [])
+        tol = _OUTLINE_COVER_TOL_MM
+        if pts and lines.get(side) and not covers(shape, pts):
+            # Ends that miss each other by a few microns (ulx3s BAT1's
+            # courtyard, glasgow J4's 8 um corner: KiCad closes them, a
+            # strict join does not). Two ways to close them, tried in turn:
+            # snap the drawing onto itself (an end within `_OUTLINE_JOIN_MM`
+            # of another segment moves onto it), then bridge each loose end
+            # to the nearest loose end (`joined`: a 15 um piece between two
+            # 10 um gaps).
+            # The first that covers every drawn vertex to within the join
+            # distance is the outline.
+            #
+            # GENEROUS BY DESIGN. KiCad's own chaining (end to end, nearest
+            # first) is not reproduced exactly: each stricter emulation
+            # tried here missed drawings KiCad closes (corner-touching
+            # squares, a nested square, an arc beside a corner: the pin
+            # under them is a real pth_inside_courtyard, and reading them
+            # open made it pass). Closing generously errs the other way --
+            # a T that stops 15 um short, crossing ends, a stray parallel
+            # line read closed here while KiCad flags malformed_courtyard
+            # (it still tests a pin against the contours that do close).
+            # Measured against kicad-cli's verdict on 178 drawings (#1212):
+            # no drawing KiCad closes reads open here. NOT modelled: a
+            # drawing that closes plus debris no join absorbs (a stray piece outside it, a
+            # there-and-back spike, a flat fp_rect or 2-point fp_poly)
+            # reads as the hull here, its pins `courtyard_malformed`
+            # (listed, not gating), where KiCad flags it malformed AND
+            # tests its pins against the square.
+            import shapely
+            from shapely.geometry import MultiLineString
+            ml = MultiLineString([list(ln.coords) for ln in lines[side]])
+            for cand_lines in (shapely.snap(ml, ml, _OUTLINE_JOIN_REACH_MM),
+                               joined(lines[side])):
+                retry = list(areas.get(side, [])) + list(
+                    polygonize(unary_union(cand_lines)))
+                if retry:
+                    cand = composed(retry, side)
+                    if covers(cand, pts, _OUTLINE_JOIN_REACH_MM):
+                        shape, tol, parts = cand, _OUTLINE_JOIN_REACH_MM, retry
+                        break
+        if pts and not covers(shape, pts, tol):
+            from shapely.geometry import MultiPoint
+            shape, how = MultiPoint(pts).convex_hull, OUTLINE_HULL
+            parts = [shape]
+        if shape is None or shape.is_empty or shape.area <= 0:
+            continue
+        out[side] = ((shape, how, tuple(parts) + tuple(united.get(side, ())))
+                     if with_parts else (shape, how))
+    return out
+
+
+def _extract_outline_shapes(pcb_file: str, layer_re: str, marker: str,
+                            even_odd: bool = False
+                            ) -> Dict[str, Dict[str, tuple]]:
+    import os as _os
+    try:
+        st = _os.stat(pcb_file)
+        key = (_os.path.abspath(pcb_file), st.st_mtime_ns, st.st_size,
+               layer_re, even_odd)
+    except OSError:
+        key = None
+    if key is not None and key in _SHAPE_CACHE:
+        return dict(_SHAPE_CACHE[key])
+    result = _read_outline_shapes(pcb_file, layer_re, marker, even_odd)
+    if key is not None:
+        if len(_SHAPE_CACHE) > 16:
+            _SHAPE_CACHE.clear()
+        _SHAPE_CACHE[key] = result
+    return dict(result)
+
+
+def _read_outline_shapes(pcb_file: str, layer_re: str, marker: str,
+                         even_odd: bool = False
+                         ) -> Dict[str, Dict[str, tuple]]:
+    blocks = _file_blocks(pcb_file)
+    result: Dict[str, Dict[str, tuple]] = {}
+    for ref, fp_text in blocks:
+        if marker not in fp_text:
+            continue
+        by_side = _outline_shapes_by_side(fp_text, layer_re, even_odd)
+        if by_side:
+            result[ref] = by_side
+    return result
+
+
+def extract_courtyard_shapes(pcb_file: str) -> Dict[str, Dict[str, tuple]]:
+    """Per-side courtyard OUTLINES, `{ref: {side: (geometry, how)}}` (#1094).
+
+    `extract_courtyard_sides`' shape-keeping twin: same footprints, same keys,
+    same elements, local frame. The bbox of each geometry is the bbox that
+    function returns, so a consumer can use the bbox as a broad phase and this
+    as the exact test.
+    """
+    return _extract_outline_shapes(pcb_file, _CRTYD_LAYER, '.CrtYd"',
+                                   even_odd=True)
+
+
+def extract_fab_shapes(pcb_file: str) -> Dict[str, Dict[str, tuple]]:
+    """Per-side .Fab body OUTLINES; `extract_fab_sides`' twin (#1094)."""
+    return _extract_outline_shapes(pcb_file, _FAB_LAYER, '.Fab"')
+
+
+def extract_silk_shapes(pcb_file: str) -> Dict[str, Dict[str, tuple]]:
+    """Per-side F/B.SilkS OUTLINES, `{ref: {side: (geometry, how)}}` (#1401);
+    `extract_silk_sides`' shape-keeping twin. `how` is `OUTLINE_POLYGON` when
+    the silk CLOSES into a loop (a drawn housing) and `OUTLINE_HULL` when it
+    does not (corner brackets, side ticks), where the convex hull of what was
+    drawn stands in. Only the first is an outline a part can be said to sit
+    inside."""
+    return _extract_outline_shapes(pcb_file, _SILK_LAYER, '.SilkS"')
+
+
+#: Horizontal slabs a courtyard shape that is not axis-aligned (an arc, a
+#: diagonal) is covered by (`shape_boxes`): each slab's box spans what the
+#: shape holds in it, so the cover is never smaller than the shape.
+COVER_SLABS = 8
+#: Box coordinates are rounded OUTWARD to this grid (mm) before boxes are
+#: united, so two shapes meeting on one drawn line share its coordinate; a
+#: coordinate within a nanometre of the grid is on it.
+_BOX_GRID = 1e-6
+
+
+def _polygons(geom):
+    """The polygons of a shapely geometry, at any nesting."""
+    if geom is None or geom.is_empty:
+        return []
+    if geom.geom_type == 'Polygon':
+        return [geom]
+    return [q for g in getattr(geom, 'geoms', ()) for q in _polygons(g)]
+
+
+def _rectilinear(poly) -> bool:
+    cs = list(poly.exterior.coords)
+    return all(abs(a[0] - b[0]) < 1e-9 or abs(a[1] - b[1]) < 1e-9
+               for a, b in zip(cs, cs[1:]))
+
+
+def shape_boxes(geom) -> list:
+    """Axis-aligned boxes covering `geom` (local frame): exactly when its
+    outline is axis-aligned, otherwise outward, slab by slab
+    (`COVER_SLABS`). A hole is covered."""
+    from shapely.geometry import Polygon, box
+    out = []
+    for poly in _polygons(geom):
+        shell = Polygon(poly.exterior)
+        x0, y0, x1, y1 = shell.bounds
+        if shell.area >= (x1 - x0) * (y1 - y0) - 1e-9:
+            out.append((x0, y0, x1, y1))
+            continue
+        if _rectilinear(shell):
+            ys = sorted({c[1] for c in shell.exterior.coords})
+        else:
+            ys = [y0 + (y1 - y0) * k / COVER_SLABS
+                  for k in range(COVER_SLABS + 1)]
+        for ya, yb in zip(ys, ys[1:]):
+            for q in _polygons(shell.intersection(box(x0, ya, x1, yb))):
+                bx0, _by0, bx1, _by1 = q.bounds
+                if bx1 > bx0:
+                    out.append((bx0, ya, bx1, yb))
+    return out
+
+
+def union_boxes(boxes) -> list:
+    """The union of axis-aligned boxes as DISJOINT boxes (they may share an
+    edge): cut into vertical slabs at every box's x, the covered y spans of
+    each slab merged, and a span carried on while the next slab has it too.
+    Sorted."""
+    g = _BOX_GRID
+    bs = [(math.floor(b[0] / g + 1e-3) * g, math.floor(b[1] / g + 1e-3) * g,
+           math.ceil(b[2] / g - 1e-3) * g, math.ceil(b[3] / g - 1e-3) * g)
+          for b in boxes]
+    bs = [tuple(round(v, 9) for v in b) for b in bs]
+    bs = [b for b in bs if b[2] > b[0] and b[3] > b[1]]
+    xs = sorted({v for b in bs for v in (b[0], b[2])})
+    out, open_ = [], {}
+    for xa, xb in zip(xs, xs[1:]):
+        spans = []
+        for b in sorted((b[1], b[3]) for b in bs
+                        if b[0] <= xa and b[2] >= xb):
+            if spans and b[0] <= spans[-1][1]:
+                spans[-1] = (spans[-1][0], max(spans[-1][1], b[1]))
+            else:
+                spans.append(b)
+        now = {}
+        for sp in spans:
+            now[sp] = open_.pop(sp, xa)
+        for sp, start in open_.items():
+            out.append((start, sp[0], xa, sp[1]))
+        open_ = now
+    for sp, start in open_.items():
+        out.append((start, sp[0], xs[-1], sp[1]))
+    return sorted(out)
+
+
+_BOX_CACHE: Dict[tuple, Dict[str, Dict[str, tuple]]] = {}
+
+_CRTYD_AREA = re.compile(r'\((?:fp_rect|fp_circle)\b' + _FP_ELEMENT_GAP
+                         + _CRTYD_LAYER, re.DOTALL)
+_CRTYD_ENDS = re.compile(r'\(fp_(?:line|arc)\s+\(start\s+' + _NUM + r'\s+'
+                         + _NUM + r'\)' + r'(?:\s+\(mid\s+' + _NUM + r'\s+'
+                         + _NUM + r'\))?\s+\(end\s+' + _NUM + r'\s+' + _NUM
+                         + r'\)' + _FP_ELEMENT_GAP + _CRTYD_LAYER, re.DOTALL)
+
+
+def _may_not_be_a_box(fp_text: str) -> bool:
+    """Whether one footprint's courtyard can be other than one box on a side:
+    two drawn areas, an area and a drawn loop, line and arc pieces that close
+    more than one loop (edges - vertices + components, their ends the
+    vertices), or one polygon or loop of more than four corners. A cheap
+    screen: what passes is measured."""
+    areas: Dict[str, int] = {}
+    for m in _CRTYD_AREA.finditer(fp_text):
+        areas[m.group(1)] = areas.get(m.group(1), 0) + 1
+    for pm in re.finditer(r'\(fp_poly\b', fp_text):
+        body = fp_text[pm.start():find_matching_paren(fp_text, pm.start())]
+        lm = re.search(_CRTYD_LAYER, body)
+        if lm:
+            if len(re.findall(r'\(xy\s', body)) > 4:
+                return True
+            areas[lm.group(1)] = areas.get(lm.group(1), 0) + 1
+    chains: Dict[str, dict] = {}
+    edges: Dict[str, int] = {}
+    for m in _CRTYD_ENDS.finditer(fp_text):
+        parent = chains.setdefault(m.group(7), {})
+
+        def find(k):
+            while parent.setdefault(k, k) != k:
+                k = parent[k]
+            return k
+        a = (round(float(m.group(1)), 3), round(float(m.group(2)), 3))
+        b = (round(float(m.group(5)), 3), round(float(m.group(6)), 3))
+        parent[find(a)] = find(b)
+        edges[m.group(7)] = edges.get(m.group(7), 0) + 1
+    for side in set(areas) | set(chains):
+        parent = chains.get(side, {})
+        loops = (edges.get(side, 0) - len(parent)
+                 + len({k for k in parent if parent[k] == k}))
+        if areas.get(side, 0) + loops >= 2 or edges.get(side, 0) > 4:
+            return True
+    return False
+
+
+def extract_courtyard_boxes(pcb_file: str) -> Dict[str, Dict[str, tuple]]:
+    """`{ref: {side: boxes}}` for each courtyard drawn as several shapes, or
+    as one axis-aligned shape (an L, a U, a step), whose union is not its
+    bounding box: the disjoint boxes (`union_boxes`) covering its shapes
+    (`shape_boxes`), in the footprint's local frame. Their bounding box is
+    `extract_courtyard_sides`' box. A courtyard of one shape that is not
+    axis-aligned (a chamfer, a circle), one that does not close, or one
+    whose shapes fill their bounding box is absent: the placer seats it on
+    that box, as it always did."""
+    import os as _os
+    try:
+        st = _os.stat(pcb_file)
+        key = (_os.path.abspath(pcb_file), st.st_mtime_ns, st.st_size)
+    except OSError:
+        key = None
+    if key is not None and key in _BOX_CACHE:
+        return dict(_BOX_CACHE[key])
+    from shapely.geometry import box
+    from shapely.ops import unary_union
+    result: Dict[str, Dict[str, tuple]] = {}
+    for ref, fp_text in _file_blocks(pcb_file):
+        if '.CrtYd"' not in fp_text or not _may_not_be_a_box(fp_text):
+            continue
+        by_side = _outline_shapes_by_side(fp_text, _CRTYD_LAYER,
+                                          even_odd=True, with_parts=True)
+        for side, (shape, how, parts) in by_side.items():
+            # a shape inside another adds nothing to the occupancy (a ring's
+            # inner circle is a hole the boxes cover anyway)
+            parts = [g for i, g in enumerate(parts)
+                     if not any(j != i and h.buffer(1e-6).contains(g)
+                                and not (g.buffer(1e-6).contains(h) and j > i)
+                                for j, h in enumerate(parts))]
+            if how != OUTLINE_POLYGON or not parts or (
+                    len(parts) == 1 and not all(_rectilinear(q) and not q.interiors
+                                                for q in _polygons(parts[0]))):
+                continue
+            boxes = union_boxes(b for g in parts for b in shape_boxes(g))
+            # never less than the outline the grade reads
+            if len(boxes) >= 2 and unary_union([box(*b) for b in boxes]).buffer(
+                    1e-9).contains(shape):
+                result.setdefault(ref, {})[side] = tuple(boxes)
+    if key is not None:
+        if len(_BOX_CACHE) > 16:
+            _BOX_CACHE.clear()
+        _BOX_CACHE[key] = result
+    return dict(result)
+
+
+def extract_courtyard_bboxes(pcb_file: str) -> Dict[str, Bbox]:
+    """
+    Parse courtyard (F.CrtYd / B.CrtYd) extents from each footprint block.
+
+    Returns dict mapping component reference to (local_min_x, local_min_y,
+    local_max_x, local_max_y) — the courtyard bounding box in the footprint's
+    local coordinate system, unioned over both sides. These must be transformed
+    to global coordinates using the footprint's position and rotation.
+
+    See `extract_courtyard_sides` for the per-side view.
+    """
+    out: Dict[str, Bbox] = {}
+    for ref, sides in extract_courtyard_sides(pcb_file).items():
+        boxes = list(sides.values())
+        out[ref] = (min(b[0] for b in boxes), min(b[1] for b in boxes),
+                    max(b[2] for b in boxes), max(b[3] for b in boxes))
+    return out
+
+
+#: #1245: the text a footprint draws to say where the BOARD EDGE goes --
+#: "PCB Edge", "PCB edge", "Board edge", "PCB EDGE", "PCB Edges" (any case;
+#: a space, '_' or '-' between the words). KiCad 10's stock library carries
+#: it on 154 footprints, on Dwgs.User or Cmts.User (one on F.Fab). Not
+#: "PCB connector edge" (a card-edge PLUG's own fingers: the board is the
+#: mating body there, `mating` abstains on it anyway) or "Panel Edge".
+EDGE_MARKER_TEXT = re.compile(r'\b(?:pcb|board)[ _-]?edges?\b', re.IGNORECASE)
+
+
+class EdgeMarker(NamedTuple):
+    """A footprint's "PCB Edge" marker, as the board file stores it (#1245):
+    the marker texts `(x, y, angle, layer, text)` -- position in the
+    footprint's LOCAL frame, angle as stored, which is the ABSOLUTE board
+    angle (KiCad writes an fp_text angle on screen, the footprint's own
+    rotation included) -- and every straight line the footprint draws,
+    `(x1, y1, x2, y2, layer)`, local (fp_line, and each side of an fp_rect).
+    Raw: `mating.marker_face_local` decides what it says."""
+    texts: Tuple
+    lines: Tuple
+
+
+def _elements(fp_text: str, head: str):
+    """Each balanced `(head ...)` element of one footprint block."""
+    for m in re.finditer(r'\(' + head + r'\b', fp_text):
+        yield fp_text[m.start():find_matching_paren(fp_text, m.start())]
+
+
+def _element_layer(el: str) -> str:
+    m = re.search(r'\(layer\s+"?([^"\s)]+)"?', el)
+    return m.group(1) if m else ''
+
+
+_MARKER_TEXT_HEAD = re.compile(
+    r'\(fp_text\s+user\s+"((?:[^"\\]|\\.)*)"')
+_AT = re.compile(r'\(at\s+' + _NUM + r'\s+' + _NUM + r'(?:\s+' + _NUM + r')?')
+_START_END = re.compile(r'\(start\s+' + _NUM + r'\s+' + _NUM + r'\)\s*'
+                        r'\(end\s+' + _NUM + r'\s+' + _NUM + r'\)')
+
+
+def is_edge_marker_text(node: str) -> bool:
+    """Whether one footprint text node is a "PCB Edge" marker text, as
+    `edge_marker_of` reads one (#1715: a pile keeps its angle to the part)."""
+    m = _MARKER_TEXT_HEAD.match(node)
+    return bool(m and EDGE_MARKER_TEXT.search(m.group(1)))
+
+
+def edge_marker_of(fp_text: str) -> Optional[EdgeMarker]:
+    """The `EdgeMarker` one footprint block draws, or None when it draws no
+    marker text."""
+    if 'edge' not in fp_text.lower():
+        return None
+    texts = []
+    for el in _elements(fp_text, 'fp_text'):
+        m = _MARKER_TEXT_HEAD.match(el)
+        if not m or not EDGE_MARKER_TEXT.search(m.group(1)):
+            continue
+        at = _AT.search(el, m.end())
+        if not at:
+            continue
+        texts.append((float(at.group(1)), float(at.group(2)),
+                      float(at.group(3)) if at.group(3) else 0.0,
+                      _element_layer(el[at.end():]), m.group(1)))
+    if not texts:
+        return None
+    lines = []
+    for head in ('fp_line', 'fp_rect'):
+        for el in _elements(fp_text, head):
+            se = _START_END.search(el)
+            if not se:
+                continue
+            x1, y1, x2, y2 = (float(se.group(i)) for i in range(1, 5))
+            layer = _element_layer(el[se.end():])
+            if head == 'fp_line':
+                lines.append((x1, y1, x2, y2, layer))
+            else:
+                lines.extend(((x1, y1, x2, y1, layer), (x2, y1, x2, y2, layer),
+                              (x2, y2, x1, y2, layer), (x1, y2, x1, y1, layer)))
+    return EdgeMarker(tuple(texts), tuple(lines))
+
+
+def extract_edge_markers(pcb_file: str) -> Dict[str, EdgeMarker]:
+    """`{ref: EdgeMarker}` for every footprint that draws a "PCB Edge"
+    marker (#1245). Footprint graphics reach neither parse path, so this
+    reads the FILE, as the courtyard and fab readers do."""
+    out: Dict[str, EdgeMarker] = {}
+    for ref, fp_text in _file_blocks(pcb_file):
+        mk = edge_marker_of(fp_text)
+        if mk is not None:
+            out[ref] = mk
+    return out
+
+
+def courtyard_for_side(sides: Optional[Dict[str, Bbox]],
+                       side: str) -> Optional[Bbox]:
+    """The courtyard a part on `side` should use: its own side's if drawn,
+    else the other side's (a footprint mounted on B whose library drew only
+    F.CrtYd is common), else None so the caller falls back to the pad bbox."""
+    if not sides:
+        return None
+    return sides.get(side) or next(iter(sides.values()))
+
+
+def warn_missing_courtyards(refs, label: str = 'placement',
+                            estimates=None) -> None:
+    """Say what placement does with the pad-bearing parts that draw no
+    courtyard (`refs`), up front, before anything is placed.
+
+    Placement seats such a part on an ESTIMATED courtyard (#1300,
+    `body.estimated_courtyards`): what it occupies, its .Fab body, else its
+    silk, else its pads, united with its pads -- the occupancy
+    check_assembly grades it on. `estimates` ({ref: CourtyardEstimate}) are
+    those estimates; their refs are named in one NOTE, per basis (`fab` /
+    `silk` / `pad_bbox`, `body.format_estimates`). A drawn courtyard is
+    authoritative and replaces the estimate, so there is nothing to
+    synthesize. Only a ref with no estimate (a container, a part the
+    placer's fallback keeps on its pads) is modelled by its bare pad box,
+    `compute_footprint_bbox_local`, with no margin at all: that one is the
+    WARNING, since it can be packed into its neighbour's body. Silence was
+    the complaint in #456 item 3; a warning that called every such part a
+    pad box led a user to draw courtyards of their own (#1466).
+    """
+    from placement.body import format_estimates
+    refs = set(refs)
+    estimates = {r: e for r, e in (estimates or {}).items() if r in refs}
+    note = format_estimates(estimates, label)
+    if note:
+        print(note)
+    refs = sorted(r for r in refs if r not in estimates)
+    if not refs:
+        return
+    shown = ', '.join(refs[:12]) + (', ...' if len(refs) > 12 else '')
+    print(f"  WARNING [{label}]: {len(refs)} footprint(s) have no courtyard "
+          f"(F/B.CrtYd) and no estimate, so they fall back to their pad "
+          f"bounding box, which carries no courtyard margin: {shown}")

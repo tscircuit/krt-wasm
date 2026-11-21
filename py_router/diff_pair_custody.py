@@ -1,0 +1,1256 @@
+"""Per-pair failure diagnostics + reconciliation casualty custody for
+differential-pair routing (Tier-1 lever: diff commits 1+3).
+
+Two engine-side gaps this module closes (inside batch_route_diff_pairs, so the
+CLI front and the GUI plugin inherit both for free):
+
+1. DIAGNOSTICS - when a diff pair fails / is deferred, JSON_SUMMARY now carries
+   a structured per-pair record saying WHY (reason code + stage + blockers),
+   including an explicit 'pose-router-failure' code so PoseRouter search
+   exhaustion is never silent again (#346), plus a member audit that verifies
+   BOTH members' connectivity claims against actual pad connectivity.
+
+2. CASUALTY CUSTODY - a net ripped during diff routing whose reroute never
+   landed used to ship at ZERO copper with no custody. Every committed rip is
+   now recorded (net id -> its pre-rip copper); at end of run a casualties-only
+   reconciliation (depth 1, no rip authority) runs restore-FIRST semantics:
+   verify actually broken, restore the original geometry (collision-aware
+   restore_net refuses restores that would short copper routed meanwhile -
+   never a blind restore), then re-route the still-broken with the restored
+   copper as obstacles; last resort is a piece-level partial restore of the
+   non-colliding copper (parity with route.py's #134 last resort).
+
+All imports of routing machinery are lazy (function-level) so this module can
+be imported by diff_pair_loop / reroute_loop without cycles.
+"""
+from __future__ import annotations
+
+from typing import Dict, List, Optional, Tuple
+
+from terminal_colors import RED, GREEN, RESET
+
+
+# --------------------------------------------------------------------------
+# Part 1: per-pair failure diagnostics
+# --------------------------------------------------------------------------
+
+def classify_diff_pair_failure(result: Optional[dict]) -> str:
+    """Map a final failed route-result dict to a stable reason code.
+
+    Codes (additive vocabulary - graders match on these strings):
+      endpoint-resolution-failure  route returned None (no usable endpoints)
+      polarity-swap-denied         P/N mismatch, swap forbidden by policy (#279),
+                                   and the swap, routed as a probe, would couple
+                                   the pair where nothing else did (#1802)
+      polarity-mismatch            P/N mismatch, and the swap (allowed, or probed
+                                   when denied) does not resolve it either
+      pn-crossing                  P/N tracks must cross; untangle failed
+      connector-graze              emitted geometry grazes committed foreign copper (#165/#246)
+      no-escape-path               endpoint escape blocked (probe/setback: 0 search iterations)
+      needs-fanout                 endpoint escape blocked for the PAIR only -- a single
+                                   track still launches there, so the terminal needs a
+                                   coupled fanout, not more room (#764)
+      pose-router-failure          PoseRouter centerline search exhausted (#346)
+      no-route                     failed with no iterations and no blocked cells
+    Call BEFORE the caller pops blocked_cells_* off the result.
+    """
+    if result is None:
+        return 'endpoint-resolution-failure'
+    if result.get('polarity_skip'):
+        return ('polarity-swap-denied' if result.get('polarity_swap_denied')
+                else 'polarity-mismatch')
+    if result.get('pn_crossing'):
+        return 'pn-crossing'
+    if result.get('connector_graze'):
+        return 'connector-graze'
+    if result.get('needs_fanout'):
+        # #764: the coupled sweep failed where a single-ended re-probe succeeded.
+        # Distinct from no-escape-path: more clearance/setback cannot fix it, an
+        # escape built by the fanout step can.
+        return 'needs-fanout'
+    if result.get('probe_blocked'):
+        return 'no-escape-path'
+    fwd = result.get('iterations_forward', 0)
+    bwd = result.get('iterations_backward', 0)
+    has_cells = bool(result.get('blocked_cells_forward')
+                     or result.get('blocked_cells_backward')
+                     or result.get('blocked_cells'))
+    if fwd == 0 and bwd == 0 and has_cells:
+        # Setback / probe-derived failure: the search never launched - the
+        # terminal escape itself is blocked.
+        return 'no-escape-path'
+    if result.get('iterations', 0) > 0:
+        # The coupled centerline is routed by the pose-based A* (PoseRouter);
+        # a search that ran and exhausted is a pose-router failure. Explicit
+        # code per #346 (these used to be an unreported wall).
+        return 'pose-router-failure'
+    return 'no-route'
+
+
+def deferred_reasons_text(pair_reports, pair_names) -> str:
+    """Why the pairs in ``pair_names`` were left whole for the single-ended
+    pass, counted by their pair_reports ``failure_reason``:
+    "2 electrically short, 1 coupled route failed". One wording for the
+    CLI's end-of-run summary and the GUI's completion dialog."""
+    names = set(pair_names or ())
+    counts: Dict[str, int] = {}
+    for rep in pair_reports or ():
+        if rep.get('pair') in names:
+            why = rep.get('failure_reason') or 'unknown'
+            counts[why] = counts.get(why, 0) + 1
+    return ', '.join(f"{n} {why.replace('-', ' ')}"
+                     for why, n in sorted(counts.items()))
+
+
+#: #1764: the `single_ended_followup_reasons` values a pair is left
+#: single-ended for BY DESIGN -- its far terminals were peeled off a coupled
+#: trunk, or it is too short for coupling to buy anything -- so the next
+#: all-nets route.py connects it. Every other value is a coupled route that
+#: FAILED: the pair should be coupled, and route.py would de-pair it (#1399).
+FOLLOWUP_BY_DESIGN = ('peeled-terminals', 'electrically-short')
+
+
+def single_ended_followup_reasons(state, diff_pair_ids_to_route) -> Dict[str, str]:
+    """#1764: {member net name: why it is left single-ended}, one entry per
+    net of ``state.diff_pair_single_ended_nets``.
+
+    'peeled-terminals' when the pair kept a coupled result (a `partial`
+    pair: only its far terminals were peeled off the chain); otherwise the
+    pair's recorded diagnostic reason -- 'electrically-short', or the code of
+    the coupled route that failed ('coupled-route-failed', 'no-escape-path',
+    ...) -- else 'unknown'. A result the single-ended member fallback laid is
+    not a coupled one."""
+    sing = state.diff_pair_single_ended_nets
+    rr = state.routed_results
+    out: Dict[str, str] = {}
+    for pair_name, pair in diff_pair_ids_to_route:
+        nids = [n for n in (pair.p_net_id, pair.n_net_id) if n in sing]
+        if not nids:
+            continue
+        _p, _n = rr.get(pair.p_net_id), rr.get(pair.n_net_id)
+        coupled = (_p is not None and _n is not None
+                   and not (_p.get('se_member_fallback')
+                            or _n.get('se_member_fallback')))
+        why = ('peeled-terminals' if coupled else
+               state.pair_diagnostics.get(pair_name, {}).get('reason') or 'unknown')
+        for n in nids:
+            out[sing[n]] = why
+    for nm in sing.values():
+        out.setdefault(nm, 'unknown')
+    return out
+
+
+def single_ended_followup_lines(reasons: Dict[str, str], open_nets,
+                                fallback=None) -> List[str]:
+    """#1764: the log block for the nets a pair step leaves single-ended,
+    grouped by why. Printed AFTER the step's own single-ended member
+    fallback, so it says what that fallback did instead of promising a
+    command whose outcome is not known yet.
+
+    ``reasons`` is single_ended_followup_reasons(); ``open_nets`` the nets
+    still open on the board this step ships; ``fallback`` the member
+    fallback's summary ('routed'/'partial'/'failed' name lists). A by-design
+    net still open gets the all-nets route.py; a FAILED pair gets a
+    route_diff --force-reroute retry, never route.py (#1399)."""
+    if not reasons:
+        return []
+    fb = {}
+    for key in ('routed', 'partial', 'failed'):
+        for nm in (fallback or {}).get(key) or ():
+            fb[nm] = key
+    open_nets = set(open_nets or ())
+
+    def _row(nm):
+        tail = reasons[nm]
+        if nm in fb:
+            tail += f"; this step's single-ended fallback: {fb[nm]}"
+        tail += '; still open' if nm in open_nets else '; connected'
+        return f"    {nm}  ({tail})"
+
+    def _eg(cmd, names, extra=''):
+        return (f"    e.g.  {cmd} <this_output> <out2> --nets "
+                + " ".join(f"'{n}'" for n in names[:4])
+                + (" ..." if len(names) > 4 else "") + extra)
+
+    design = sorted(n for n, why in reasons.items() if why in FOLLOWUP_BY_DESIGN)
+    failed = sorted(n for n, why in reasons.items() if why not in FOLLOWUP_BY_DESIGN)
+    lines = ["", "=" * 60,
+             f"{len(reasons)} net(s) left single-ended by this pair step:"]
+    if design:
+        lines.append(f"  {len(design)} by design (peeled far terminals, or an "
+                     f"electrically short pair):")
+        lines += [_row(n) for n in design]
+        still = [n for n in design if n in open_nets]
+        if still:
+            lines.append("    the all-nets route.py step connects these P->P / N->N:")
+            lines.append(_eg('route.py', still))
+        else:
+            lines.append("    all connected: nothing is left for route.py")
+    if failed:
+        lines.append(f"  {RED}{len(failed)} whose COUPLED ROUTE FAILED{RESET} - "
+                     f"they should be coupled; retry them as a pair with "
+                     f"route_diff (route.py would de-pair them, #1399):")
+        lines += [_row(n) for n in failed]
+        lines.append(_eg('route_diff.py', failed, ' --force-reroute'))
+    lines.append("=" * 60)
+    return lines
+
+
+def split_deferred_pairs(pair_reports, pair_names) -> Tuple[List[str], List[str]]:
+    """#1764: the pairs in ``pair_names`` split by their pair_reports
+    ``failure_reason`` into (left single-ended by design, coupled route
+    failed). The GUI's completion dialog reads it; the CLI's log reads
+    single_ended_followup_lines."""
+    names = set(pair_names or ())
+    design, failed = [], []
+    for rep in pair_reports or ():
+        if rep.get('pair') in names:
+            (design if rep.get('failure_reason') in FOLLOWUP_BY_DESIGN
+             else failed).append(rep['pair'])
+    return sorted(design), sorted(failed)
+
+
+def blocker_names(rippable_blockers, diff_pair_by_net_id, limit: int = 3) -> List[str]:
+    """Human names (pair name when applicable) for the top blocking nets."""
+    names = []
+    for b in rippable_blockers[:limit]:
+        if b.net_id in diff_pair_by_net_id:
+            names.append(diff_pair_by_net_id[b.net_id][0])
+        else:
+            names.append(b.net_name)
+    return names
+
+
+def record_pair_diag(state, pair_name: str, **fields):
+    """Merge diagnostic fields into a pair's record (most recent wins)."""
+    rec = state.pair_diagnostics.setdefault(pair_name, {})
+    for k, v in fields.items():
+        if v is not None:
+            rec[k] = v
+
+
+def audit_pair_members(pcb_data, diff_pairs_list, tolerance: float = 0.02) -> Dict[str, Dict[str, bool]]:
+    """Verify each pair member's connectivity claim against the ACTUAL pad
+    connectivity (authoritative union-find, same checker route.py's #189 sweep
+    uses) - there are known cases of one member silently incomplete.
+
+    Returns {pair_name: {'p': bool, 'n': bool}} (True = all pads connected).
+    Nets with <2 pads are trivially connected.
+    """
+    from check_connected import check_net_connectivity
+    segs_by_net: Dict[int, list] = {}
+    vias_by_net: Dict[int, list] = {}
+    zones_by_net: Dict[int, list] = {}
+    for s in pcb_data.segments:
+        segs_by_net.setdefault(s.net_id, []).append(s)
+    for v in pcb_data.vias:
+        vias_by_net.setdefault(v.net_id, []).append(v)
+    for z in getattr(pcb_data, 'zones', []) or []:
+        zones_by_net.setdefault(z.net_id, []).append(z)
+    audit: Dict[str, Dict[str, bool]] = {}
+    for pair_name, pair in diff_pairs_list:
+        rec = {}
+        for tag, nid in (('p', pair.p_net_id), ('n', pair.n_net_id)):
+            pads = pcb_data.pads_by_net.get(nid, [])
+            if len(pads) < 2:
+                rec[tag] = True
+                continue
+            r = check_net_connectivity(
+                nid, segs_by_net.get(nid, []), vias_by_net.get(nid, []),
+                pads, zones_by_net.get(nid, []), tolerance=tolerance)
+            rec[tag] = bool(r.get('connected'))
+        audit[pair_name] = rec
+    return audit
+
+
+#: #1303: a span of P and N counts as coupled up to this multiple of the gap
+#: the pair was routed at. The router lays its coupled run AT the gap (a 45
+#: degree run lands ~12 um wider after grid snapping); via approach tracks and
+#: the single-ended legs of a hybrid sit 3-6x the gap apart, and KiCad would
+#: count those too under a rule that sets no maximum gap.
+COUPLED_GAP_FACTOR = 1.5
+
+#: #1361: a pair whose copper is not coupled at the routed gap still runs
+#: ALONGSIDE its partner where KiCad's coupling geometry finds P and N facing
+#: each other up to this gap (mm). It is the router's own radius for a member
+#: that has not split from its partner: the #444 seam re-ask counts copper
+#: farther than 1 mm from the partner as split (`_split_len`). A re-ask is one
+#: single-ended A* per net pulled toward its partner, so it runs a few times
+#: the routed gap apart -- ulx3s GPDI at 0.8 mm, set by the HDMI connector's
+#: pins (P and N 1 mm apart with a ground pin between). A pair split onto two
+#: layers (imx6ulz DQS0) runs alongside nowhere; two members routed to
+#: separate connectors (sata_sniffer GTX_RX3_AC, P and N 20 mm apart) face
+#: each other at no maximum gap, but not within this one.
+ALONGSIDE_GAP_MM = 1.0
+
+
+#: #1429: the least share of a pair's length its coupled run must cover for
+#: the pair to read COUPLED, on top of the one-pitch floor
+#: (`coupled_floor_mm`). The pitch alone let a sliver pass on any length: a
+#: 21.5 mm pair carrying 0.5 mm coupled read 'coupled', kept its routed
+#: credit and its #521 protection. 10% catches such slivers and spares a short
+#: pair whose fan-in from far-apart pads is most of its length (a USB pair
+#: coupled over a quarter of it); over the corpus's routed pairs it reads 62 of
+#: 1008 that pass the pitch as uncoupled. A hybrid's coupled middle (1.4 mm of
+#: a 3 mm pair) is well above it.
+COUPLED_SHARE_FLOOR = 0.10
+
+
+def coupled_floor_mm(track_width: float, gap: float) -> float:
+    """#1303: the least coupled run that makes a pair's copper COUPLED: one
+    pair pitch (track width + gap). Below it the "coupling" is where two legs
+    happen to pass each other -- a corner sliver of 2 um to 0.15 mm on
+    recorded runs -- not a run the router laid coupled. It is a floor, not
+    the whole test: the run must also cover COUPLED_SHARE_FLOOR of the pair's
+    length (#1429, `meets_coupled_floor`)."""
+    return (track_width or 0.0) + (gap or 0.0)
+
+
+def pair_length_mm(rec: Dict) -> float:
+    """#1429: a pair's length for the coupled share: the longer member's
+    TRACK length, max(length_p_mm, length_n_mm). It is the length KiCad's
+    coupling test measures `coupled_mm` against -- its diff_pair_uncoupled
+    "actual" is max(P, N) - coupled, tracks only, no via barrel or pad --
+    so coupled + uncoupled is this length, and the share is the coupled
+    part of the same copper."""
+    return max(rec.get('length_p_mm') or 0.0, rec.get('length_n_mm') or 0.0)
+
+
+def coupled_share(coupled_mm: float, length_mm: float) -> float:
+    """#1429: coupled_mm / length_mm, capped at 1 (KiCad's measure counts a
+    span once per facing partner segment, so the sum can exceed the length);
+    0 for a pair with no track length."""
+    if not length_mm or length_mm <= 0:
+        return 0.0
+    return min(1.0, coupled_mm / length_mm)
+
+
+def meets_coupled_floor(coupled_mm: float, length_mm: float,
+                        floor_mm: float) -> bool:
+    """#1429: True when `coupled_mm` of a pair `length_mm` long is a coupled
+    run: at least one pitch (`floor_mm`, `coupled_floor_mm`) AND at least
+    COUPLED_SHARE_FLOOR of the length. The single test behind both
+    `coupled` and `alongside` in `measure_pair_copper`."""
+    eps = 1e-9
+    return (coupled_mm >= floor_mm - eps
+            and coupled_mm >= COUPLED_SHARE_FLOOR * length_mm - eps)
+
+
+def self_overlap_line(pair_name, rec):
+    """#1873: the console line for a pair whose member runs back along itself,
+    or None. Every overlap is in the copper record (`self_overlaps`); the
+    line is printed only for an overlap longer than twice its track's
+    width, since a shorter one is the size of a corner, not a leg laid
+    twice."""
+    long_ = [r for r in (rec or {}).get('self_overlaps') or ()
+             if r.get('along_mm', 0.0) > 2.0 * r.get('width_mm', 0.0)]
+    if not long_:
+        return None
+    so = rec.get('self_overlap_mm') or {}
+    worst = max(long_, key=lambda r: r['along_mm'])
+    return (f"Self-overlap: {pair_name} has copper laid along itself ("
+            + ', '.join(f"{k.upper()} {v:.4f} mm" for k, v in sorted(so.items()) if v)
+            + f"; the longest {worst['along_mm']:.4f} mm on a {worst['width_mm']:g} mm "
+            f"track); its length and skew count that stretch twice")
+
+
+def measure_pair_copper(pcb_data, diff_pairs_list, routed_results,
+                        geometry_of) -> Dict[str, Dict]:
+    """#1303: what each pair the run CLAIMS to have routed coupled delivers on
+    the board it ships, read off `pcb_data` (the copper the writer emits; the
+    KICAD_BOARD_LEDGER audit holds the two equal).
+
+    The outcome used to come from result existence: both members had a
+    non-single-ended result, so the pair was 'coupled'. imx6ulz DQS0 shipped
+    that way with P on In2.Cu only and N on B.Cu only -- 0 mm coupled, 4.5 mm
+    of skew -- because the #444 seam re-ask had replaced the coupled middle
+    with two single-ended routes.
+
+    `geometry_of(pair)` -> (track_width, gap) the pair was routed at. Returns
+    {pair_name: record} for every pair with a coupled-route result on both
+    members: `net_queries.diff_pair_copper` measured with the gap window
+    (none, COUPLED_GAP_FACTOR x gap), plus 'gap_mm', 'gap_window_mm',
+    'coupled_floor_mm', 'coupled_share' (coupled_mm over `pair_length_mm`),
+    'coupled_share_floor' and 'coupled' (`meets_coupled_floor`: coupled_mm
+    at least one pitch AND at least COUPLED_SHARE_FLOOR of the length, #1429).
+
+    #1361: a record that is not coupled also carries 'alongside_mm' (the same
+    KiCad measure with the window (none, ALONGSIDE_GAP_MM)),
+    'alongside_window_mm', 'alongside_share' and 'alongside' (the same two
+    floors, #1429: a sliver alongside is no more a pair than a sliver coupled).
+    It reports nothing -- the outcome stays 'uncoupled' -- it is what #521
+    protection reads (`route_diff.coupled_protection_pairs`)."""
+    from net_queries import diff_pair_copper, diff_pair_coupling, CopperIndex
+    out: Dict[str, Dict] = {}
+    index = None
+    for pair_name, pair in diff_pairs_list:
+        rr_p = routed_results.get(pair.p_net_id)
+        rr_n = routed_results.get(pair.n_net_id)
+        if rr_p is None or rr_n is None or rr_p.get('se_member_fallback') \
+                or rr_n.get('se_member_fallback'):
+            continue
+        width, gap = geometry_of(pair)
+        hi = COUPLED_GAP_FACTOR * gap if gap else None
+        try:
+            if index is None:
+                index = CopperIndex(pcb_data)
+            rec = diff_pair_copper(pcb_data, pair.p_net_id, pair.n_net_id, None, hi,
+                                   index=index)
+        except Exception as exc:                             # noqa: BLE001
+            # A grader must never cost the run its routed board. Unmeasured is
+            # said, and the pair keeps the outcome its result gives it.
+            print(f"{RED}#1303: could not measure {pair_name}'s copper "
+                  f"({type(exc).__name__}: {exc}){RESET}")
+            out[pair_name] = {'error': f'{type(exc).__name__}: {exc}',
+                              'coupled': True, 'coupled_share': None,
+                              'skew_mm': None, 'gap_mm': gap}
+            continue
+        floor = coupled_floor_mm(width, gap)
+        length = pair_length_mm(rec)
+        rec.update(gap_mm=gap, gap_window_mm=[None, None if hi is None else round(hi, 4)],
+                   coupled_floor_mm=round(floor, 4),
+                   coupled_share=round(coupled_share(rec['coupled_mm'], length), 4),
+                   coupled_share_floor=COUPLED_SHARE_FLOOR,
+                   coupled=meets_coupled_floor(rec['coupled_mm'], length, floor))
+        # #1873: a member laid back along itself counts that copper twice in
+        # the skew above (all of a net's copper, KiCad's measure). Recorded,
+        # every overlap, and only where there is some; the console line is
+        # self_overlap_line's. A member that was not searched (over the
+        # segment limit) or could not be is said too: no key at all would
+        # read as "none found".
+        try:
+            from net_queries import net_self_overlap
+            _so, _rows = {}, []
+            for k, nid in (('p', pair.p_net_id), ('n', pair.n_net_id)):
+                _tot, _r = net_self_overlap(pcb_data, nid)
+                _so[k] = _tot
+                _rows += [dict(x, member=k) for x in _r]
+        except Exception as exc:                             # noqa: BLE001
+            print(f"{RED}#1873: could not search {pair_name} for copper laid "
+                  f"along itself ({type(exc).__name__}: {exc}){RESET}")
+            rec['self_overlap_error'] = f'{type(exc).__name__}: {exc}'
+        else:
+            # a member that was not searched stays None beside its partner's
+            # length: 0.0 would claim it was searched and has none
+            if any(_so.values()):
+                rec['self_overlap_mm'] = dict(_so)
+                rec['self_overlaps'] = _rows
+            if any(v is None for v in _so.values()):
+                rec['self_overlap_not_searched'] = sorted(
+                    k for k, v in _so.items() if v is None)
+        if not rec['coupled']:
+            try:
+                along = diff_pair_coupling(pcb_data, pair.p_net_id, pair.n_net_id,
+                                           None, ALONGSIDE_GAP_MM,
+                                           index=index)['coupled_mm']
+            except Exception as exc:                         # noqa: BLE001
+                # Unmeasured is not alongside: the pair stays unprotected,
+                # as it was before #1361.
+                print(f"{RED}#1361: could not measure how far {pair_name} runs "
+                      f"alongside ({type(exc).__name__}: {exc}){RESET}")
+                along = 0.0
+            rec.update(alongside_mm=round(along, 4),
+                       alongside_window_mm=[None, ALONGSIDE_GAP_MM],
+                       alongside_share=round(coupled_share(along, length), 4),
+                       alongside=meets_coupled_floor(along, length, floor))
+        out[pair_name] = rec
+    return out
+
+
+def build_pair_reports(state, diff_pair_ids_to_route, member_audit,
+                       skipped_fanout=(), pair_copper=None) -> List[Dict]:
+    """Assemble the per-pair JSON records (additive JSON_SUMMARY key).
+
+    outcome: 'coupled' (both members routed coupled), 'partial' (coupled trunk
+    with terminals peeled to the single-ended follow-up), 'deferred' (whole
+    pair left for the single-ended follow-up), 'failed', 'skipped' (fanout
+    pre-check, #242), 'uncoupled' (#1303: the run routed both members, but
+    the copper it ships is not coupled -- see `pair_copper`).
+
+    pair_copper: `measure_pair_copper`'s records (#1303). A pair carrying
+    one gets it as `copper`, and the outcome is decided by it: a 'coupled'
+    pair whose copper is not coupled is 'uncoupled', a 'partial' one is
+    flagged `no_coupled_trunk`.
+
+    failure_reason (set for 'failed' and 'deferred'): a classify_diff_pair_
+    failure code, 'congestion' or 'multipoint-leg-failure' for a pair whose
+    coupled route failed -- a 2-terminal pair deferred as the fallback keeps
+    its code. A deferred pair otherwise carries 'electrically-short' (every
+    leg below the coupled floor: coupling buys nothing) or
+    'coupled-route-failed' (a multipoint pair no coupled chain could route,
+    deferred as the fallback, #165). 'unknown' when nothing was recorded.
+    """
+    reports = []
+    routed_results = state.routed_results
+    sing = state.diff_pair_single_ended_nets
+    for pair_name, pair in diff_pair_ids_to_route:
+        diag = state.pair_diagnostics.get(pair_name, {})
+        aud = member_audit.get(pair_name, {})
+        # A member routed by the single-ended fallback is NOT a coupled route:
+        # without this exclusion a deferred/failed pair whose members were both
+        # connected single-ended would misreport outcome 'coupled'.
+        _rr_p = routed_results.get(pair.p_net_id)
+        _rr_n = routed_results.get(pair.n_net_id)
+        coupled = (_rr_p is not None and _rr_n is not None
+                   and not (_rr_p.get('se_member_fallback')
+                            or _rr_n.get('se_member_fallback')))
+        deferred = pair.p_net_id in sing or pair.n_net_id in sing
+        if coupled:
+            outcome = 'partial' if deferred else 'coupled'
+        elif deferred:
+            outcome = 'deferred'
+        else:
+            outcome = 'failed'
+        incomplete = [nm for tag, nm in (('p', pair.p_net_name),
+                                         ('n', pair.n_net_name))
+                      if not aud.get(tag, True)]
+        # A COUPLED claim contradicted by actual pad connectivity (#514).
+        mismatch = bool(outcome == 'coupled' and incomplete)
+        if mismatch:
+            # #602: demote the OUTCOME as well, not just the summary bucket.
+            # route_diff already keeps such a pair out of routed_diff_pairs,
+            # but the per-pair record kept saying 'coupled' next to its own
+            # 'members with disconnected pads' -- one JSON blob carrying two
+            # verdicts, and callers read the optimistic one (muzy_zynq4
+            # /HDMI_CK + /HDMI_D2, lwdo_sdr, spartan6_4layer). 'incomplete'
+            # is distinct from the by-design 'partial': a partial pair's
+            # peeled terminals are EXPECTED to close in the single-ended
+            # follow-up, whereas this one claimed a finished coupled route
+            # and did not deliver it.
+            outcome = 'incomplete'
+        # 'partial' credit discriminator: a partial pair KEEPS its
+        # routed_diff_pairs credit while it kept ANY coupled trunk copper;
+        # it is demoted ONLY when it kept no coupled trunk copper at all.
+        # (An earlier rule demoted on member count -- 'partial' + both
+        # members incomplete -- which misfires on multipoint pairs whose
+        # extra pads are DELIBERATELY deferred: tigard /USB_D keeps a
+        # coupled, DRC-clean trunk while the redundant J1-row pads close in
+        # the designed single-ended follow-up, expected step-level state,
+        # not false success; that rule dropped test_tigard_usb_diff from
+        # 12/12 to 9/12 with the copper unchanged. Incomplete members are
+        # already counted as pad deficit at chain level, so credit with a
+        # real coupled trunk hides nothing.) Trunk signal, recorded not
+        # derived: 'is_diff_pair' is stamped ONLY by the coupled-route
+        # constructors (route_diff_pair_with_obstacles, the multipoint leg
+        # merge) -- never by single-ended results -- and 'new_segments'
+        # nonempty means that coupled result committed real copper.
+        no_coupled_trunk = bool(
+            outcome == 'partial'
+            and not any(rr.get('is_diff_pair') and rr.get('new_segments')
+                        for rr in (_rr_p, _rr_n) if rr))
+        # #1303: the copper decides, not the result. A pair whose results
+        # exist but whose WRITTEN copper is not coupled is not a coupled
+        # route: 'coupled' becomes 'uncoupled', and a 'partial' pair has no
+        # coupled trunk to keep its credit with.
+        cop = (pair_copper or {}).get(pair_name)
+        copper_uncoupled = bool(cop is not None and not cop.get('coupled'))
+        if copper_uncoupled and outcome == 'coupled':
+            outcome = 'uncoupled'
+        if copper_uncoupled and outcome == 'partial':
+            no_coupled_trunk = True
+        if no_coupled_trunk:
+            print(f"{RED}DEMOTED {pair_name}: no coupled trunk copper kept "
+                  f"-- 'partial' pair dropped from routed_diff_pairs{RESET}")
+        rep = {
+            'pair': pair_name,
+            'p_net': pair.p_net_name,
+            'n_net': pair.n_net_name,
+            'outcome': outcome,
+            'failure_reason': (diag.get('reason') or 'unknown'
+                               ) if outcome in ('failed', 'deferred') else None,
+            'failure_stage': (diag.get('stage')
+                              ) if outcome in ('failed', 'deferred') else None,
+            'incomplete_members': incomplete,
+            # A summary claim contradicted by the actual copper. Two causes:
+            # (1) a COUPLED claim contradicted by actual pad connectivity --
+            # the "one member silently incomplete" class (#514, peaksat CAN).
+            # 'partial'-with-incomplete-members is deliberately NOT that: a
+            # partial pair already DECLARES disconnected members (its peeled
+            # terminals close in the single-ended follow-up, which runs
+            # after this audit), so flagging it here made every multipoint
+            # pair with a by-design peeled leg -- tigard /USB_D's redundant
+            # J1 row -- read as a contradicted claim and demoted it from
+            # routed_diff_pairs while its trunk was coupled and its board
+            # finished clean. incomplete_members stays populated either way.
+            # (2) a PARTIAL claim with no coupled trunk copper kept at all
+            # (no_coupled_trunk above) -- there is no coupled route to
+            # credit. route_diff reads this flag to move the pair from
+            # routed_diff_pairs to partial_diff_pairs.
+            # NOTE `mismatch` is the CAPTURED value: #602 rewrites
+            # `outcome` to 'incomplete' above, so re-testing
+            # `outcome == 'coupled'` here would be permanently False and
+            # would drop #602's audit flag on the merge.
+            'member_audit_mismatch': bool(mismatch or no_coupled_trunk),
+            'no_coupled_trunk': no_coupled_trunk,
+        }
+        if cop is not None:
+            rep['copper'] = cop
+        # #766: a HYBRID ESCAPE is a coupled middle plus point-to-point
+        # (single-ended) terminal legs. Its members connect and its copper is
+        # DRC-clean, so it is genuinely routed and keeps its credit -- but
+        # 'coupled' means "both members routed coupled", and this pair's
+        # TERMINALS are not. Disclose it rather than silently reclassify:
+        # demoting to 'partial' would drop the pair out of routed_diff_pairs
+        # and imply downstream work that does not exist (a partial pair's
+        # terminals are peeled to a follow-up pass; a hybrid's are already
+        # routed). The terminals are where P/N geometry breaks, which is
+        # where intra-pair skew comes from -- so a caller holding a skew
+        # budget needs to see this, and `successful` never showed it.
+        if any(rr.get('hybrid_escape') for rr in (_rr_p, _rr_n) if rr):
+            rep['coupled_terminals'] = False
+            rep['escape'] = 'hybrid'
+        # #1742: a pair that fit only narrowed -- both members at this width
+        # where the full width does not fit (the shipped-width rows say
+        # where and how long)
+        _nar = next((rr.get('pair_narrowed_to') for rr in (_rr_p, _rr_n)
+                     if rr and rr.get('pair_narrowed_to')), None)
+        if _nar is not None and outcome != 'deferred':
+            rep['narrowed_to_mm'] = _nar
+            # #1747: per narrowed layer, the P/N gap it was built at (the gap
+            # holding the impedance target at that width, floored at the
+            # clearance) and the differential impedance it reaches there
+            _gz = next((rr.get('pair_narrowed_gaps') for rr in (_rr_p, _rr_n)
+                        if rr and rr.get('pair_narrowed_gaps')), None)
+            if _gz:
+                rep['narrowed_gap_mm'] = {l: g for l, (g, _z) in sorted(_gz.items())}
+                rep['narrowed_zdiff_ohm'] = {l: z for l, (_g, z) in sorted(_gz.items())}
+        if diag.get('blocking_nets'):
+            rep['blocking_nets'] = diag['blocking_nets']
+        if diag.get('retry_hint') and outcome in ('failed', 'deferred'):
+            # #1802: a polarity ladder and the hybrid escape both failed at
+            # the terminal; the run's grid can decide that
+            rep['retry_hint'] = diag['retry_hint']
+        if diag.get('casualty'):
+            rep['casualty'] = diag['casualty']
+        if diag.get('se_fallback'):
+            # Per-member single-ended fallback outcome (additive):
+            # {'p': 'routed'|'partial'|'failed'|'already-connected', 'n': ...}
+            rep['se_fallback'] = diag['se_fallback']
+        reports.append(rep)
+    for name, p_name, n_name in skipped_fanout:
+        reports.append({
+            'pair': name, 'p_net': p_name, 'n_net': n_name,
+            'outcome': 'skipped', 'failure_reason': 'fanout-self-overlap',
+            'failure_stage': 'pre-route',
+            'incomplete_members': [p_name, n_name],
+            'member_audit_mismatch': False,
+            'no_coupled_trunk': False,
+        })
+    return sorted(reports, key=lambda r: r['pair'])
+
+
+# --------------------------------------------------------------------------
+# Part 1b: single-ended member fallback (Class 2 - BOTH members attempted)
+# --------------------------------------------------------------------------
+
+def _member_connected(pcb_data, nid: int) -> bool:
+    """Authoritative connectivity of one pair member on the CURRENT board."""
+    from check_connected import check_net_connectivity
+    pads = pcb_data.pads_by_net.get(nid, [])
+    if len(pads) < 2:
+        return True
+    segs = [s for s in pcb_data.segments if s.net_id == nid]
+    vias = [v for v in pcb_data.vias if v.net_id == nid]
+    zones = [z for z in (getattr(pcb_data, 'zones', []) or [])
+             if z.net_id == nid]
+    r = check_net_connectivity(nid, segs, vias, pads, zones, tolerance=0.02)
+    return bool(r.get('connected'))
+
+
+def _single_ended_engine(state, nets_to_route, net_clearances):
+    """What a member fallback routes single-ended with.
+
+    The diff engine bakes each layer's impedance width into its maps
+    (`reserve_layer_widths`; pads and the board edge too since #1736), for the
+    pose router, which has no track margin to carry a width on. So on those
+    maps a wide member's margin is 0, and a member that does not fit at its
+    full width has no narrower route to fall back to there.
+
+    Take the single-ended engine whole instead: the nominal reserve and a map
+    stamped at it, so the margin prices every obstacle class and a route that
+    does not fit at full width can neck down, as it does in route.py. A run
+    with no layer wider than the call's width has identical stamps either
+    way and keeps the map it already holds.
+
+    Returns (config, base map, lift records of the run's own build): the build
+    rebinds the per-build lift records on the board, and the caller puts these
+    back when it is done, since a later reader holds the run's maps."""
+    config = state.config
+    if not any(config.get_track_width(layer) > config.track_width + 1e-9
+               for layer in config.layers):
+        return config, state.base_obstacles, None
+    from dataclasses import replace
+    from obstacle_map import build_base_obstacle_map
+    pcb_data = state.pcb_data
+    records = {k: getattr(pcb_data, k, None) for k in (
+        '_net_tie_lift', '_graphic_own_pad_lift', '_graphic_own_pad_via_lift')}
+    se_config = replace(config, reserve_layer_widths=False)
+    print("Building single-ended obstacle map for the member fallback...")
+    return (se_config,
+            build_base_obstacle_map(pcb_data, se_config, nets_to_route,
+                                    net_clearances=net_clearances),
+            records)
+
+
+def run_single_ended_member_fallback(state, diff_pairs_list, nets_to_route,
+                                     net_clearances) -> Dict:
+    """Single-ended completion pass for non-coupled diff pairs: attempt BOTH
+    members (P->P and N->N), engine-side.
+
+    A pair that fails or defers coupled routing is handed to "the single-ended
+    follow-up" -- but batch_route_diff_pairs itself never attempted the
+    members. A chain (or GUI diff tab) with no downstream single-ended pass
+    shipped them unrouted, and downstream churn could route ONE member while
+    the other was silently dropped (ulx3s FPDI_D1: FPDI_D1- routed, FPDI_D1+
+    shipped at zero copper). This pass gives EVERY disconnected member of
+    every pair with NO coupled result one plain single-ended attempt
+    (multipoint-aware, no rip-up), records the per-member outcome into the
+    pair diagnostics (pair_reports[..]['se_fallback']), and reports honestly.
+
+    Members that fail here keep their copper unchanged and stay listed for the
+    downstream single-ended pass (which has the full rip-up arsenal); members
+    routed here become already-connected no-ops downstream. DRC-safe: each
+    member routes in the single-ended engine (`_single_ended_engine`), with all
+    other nets' copper priced as obstacles. ``nets_to_route`` and
+    ``net_clearances`` are what the run's base maps were built with.
+
+    Returns a JSON-ready summary dict ('attempted'/'routed'/'partial'/'failed'
+    lists of member net names).
+    """
+    from routing_context import (build_single_ended_obstacles,
+                                 record_single_ended_success)
+    from single_ended_routing import (route_net_with_obstacles,
+                                      route_multipoint_main,
+                                      route_multipoint_taps)
+    from connectivity import get_multipoint_net_pads
+
+    summary = {'attempted': [], 'routed': [], 'partial': [], 'failed': []}
+    pcb_data = state.pcb_data
+
+    todo = []
+    for pair_name, pair in diff_pairs_list:
+        if (pair.p_net_id in state.routed_results
+                or pair.n_net_id in state.routed_results):
+            # A coupled / hybrid / reroute result exists (fully-coupled or
+            # 'partial' peeled pairs): the member audit covers those; the
+            # fallback owns only pairs with NO coupled copper at all.
+            continue
+        members = [('p', pair.p_net_id, pair.p_net_name),
+                   ('n', pair.n_net_id, pair.n_net_name)]
+        if all(_member_connected(pcb_data, nid) for _, nid, _ in members):
+            continue
+        todo.append((pair_name, pair, members))
+    if not todo:
+        return summary
+
+    print("\n" + "=" * 60)
+    print(f"Single-ended member fallback: {len(todo)} non-coupled pair(s) - "
+          f"attempting BOTH members P->P / N->N (no rip-up)")
+    print("=" * 60)
+
+    config, base_obstacles, records = _single_ended_engine(
+        state, nets_to_route, net_clearances)
+    for pair_name, pair, members in todo:
+        outcomes = {}
+        for tag, nid, nm in members:
+            if _member_connected(pcb_data, nid):
+                outcomes[tag] = 'already-connected'
+                continue
+            summary['attempted'].append(nm)
+            obstacles, _ = build_single_ended_obstacles(
+                base_obstacles, pcb_data, config, state.routed_net_ids,
+                state.remaining_net_ids, state.all_unrouted_net_ids, nid,
+                state.gnd_net_id, state.track_proximity_cache, state.layer_map,
+                ripped_route_layer_costs=state.ripped_route_layer_costs,
+                ripped_route_via_positions=state.ripped_route_via_positions)
+            mp_pads = get_multipoint_net_pads(pcb_data, nid, config)
+            if mp_pads:
+                res = route_multipoint_main(pcb_data, nid, config, obstacles,
+                                            mp_pads)
+                if res and not res.get('failed') and res.get('is_multipoint'):
+                    tap = route_multipoint_taps(pcb_data, nid, config,
+                                                obstacles, res)
+                    if tap:
+                        res = tap
+            else:
+                res = route_net_with_obstacles(pcb_data, nid, config, obstacles)
+            if res and not res.get('failed'):
+                res['se_member_fallback'] = True
+                if 'route_length' not in res:
+                    from net_queries import calculate_route_length
+                    res['route_length'] = calculate_route_length(
+                        res.get('new_segments') or [],
+                        res.get('new_vias') or [], pcb_data)
+                state.results.append(res)
+                record_single_ended_success(
+                    pcb_data, res, nid, config, state.remaining_net_ids,
+                    state.routed_net_ids, state.routed_net_paths,
+                    state.routed_results, state.track_proximity_cache,
+                    state.layer_map)
+                if _member_connected(pcb_data, nid):
+                    outcomes[tag] = 'routed'
+                    summary['routed'].append(nm)
+                    print(f"  {GREEN}SE FALLBACK ROUTED{RESET} {nm} "
+                          f"({pair_name} {tag.upper()} member)")
+                else:
+                    outcomes[tag] = 'partial'
+                    summary['partial'].append(nm)
+                    print(f"  {RED}SE FALLBACK PARTIAL{RESET} {nm}: copper "
+                          f"committed but pad(s) still disconnected")
+            else:
+                outcomes[tag] = 'failed'
+                summary['failed'].append(nm)
+                print(f"  {RED}SE FALLBACK FAILED{RESET} {nm} "
+                      f"({pair_name} {tag.upper()} member) - left for the "
+                      f"downstream single-ended pass")
+        record_pair_diag(state, pair_name, se_fallback=outcomes)
+    if records is not None:
+        for key, value in records.items():
+            setattr(pcb_data, key, value)
+    return summary
+
+
+MEMBER_FALLBACK_WIDTH_SITE = 'pair member fallback copper shipped under width'
+COUPLED_PAIR_WIDTH_SITE = 'coupled pair copper shipped under width'
+#: #1742: a pair that fit only narrowed, both members together
+NARROWED_PAIR_WIDTH_SITE = 'coupled pair narrowed to fit, both members'
+
+#: A segment within this of the width the pair router draws its connectors
+#: at is that connector, delivered at its own request (#1725).
+DRAWN_WIDTH_TOL = 1e-4
+
+
+def disclose_pair_widths(pcb_data, members, input_keys, site, area=None) -> Dict:
+    """The design-rules rows of pair members' narrowed copper, as shipped.
+
+    Route.py's rule for a net with its own width (found reviewing #1282), on
+    the same helpers: one row per member net, measured on the board this run
+    ships (`pcb_data.segments` once the engine is done), graded on the copper
+    THIS run laid -- a segment whose `segment_identity` is in `input_keys`
+    was on the input board -- against the member's own width on that
+    copper's layer. Every `track_width` row of a covered member, recorded per
+    routing ATTEMPT, is replaced by the measurement, so a member that necked
+    in one attempt and shipped at full width records nothing, and copper that
+    never shipped no longer fails --strict-sizes.
+
+    `members` is {net_id: (width_on, drawn)}: `width_on(layer)` the member's
+    own width on a layer, `drawn` the narrower width the pair router draws
+    the member's terminal connectors at by design (the pair's track width,
+    matched to the stubs it lands on), or None. New copper at `drawn` is
+    delivered at that request and is not a shortfall; copper under it is.
+    Rows of other kinds (vias, clearance) and of other nets are untouched.
+    Copper at the width of the rule area whose track_width rule binds it
+    (``area``, #1843) is the board's own rule, not a shortfall
+    (`area_clearance.neck_census` discloses it).
+    Returns the shortfall per covered net name."""
+    from routing_common import new_copper_width_shortfall
+    from area_clearance import is_room_neck
+    from fab_tiers import replace_track_rows
+    if not members:
+        return {}
+    names = {nid: net.name for nid, net in pcb_data.nets.items()}
+    by_name = {names[nid]: nid for nid in members if nid in names}
+
+    def _as_drawn(seg):
+        m = members.get(seg.net_id)
+        return (m is not None and m[1] is not None
+                and abs(seg.width - m[1]) <= DRAWN_WIDTH_TOL)
+
+    short = new_copper_width_shortfall(
+        [s for s in pcb_data.segments if not _as_drawn(s) and not is_room_neck(area, s)],
+        lambda nid: names.get(nid, f"Net {nid}"), input_keys,
+        lambda nm, layer: (members[by_name[nm]][0](layer)
+                           if nm in by_name else None))
+    replace_track_rows(
+        set(by_name.values()),
+        [(by_name[nm], nm, r['requested_mm'], r['min_mm'], r['under_mm'])
+         for nm, r in short.items()],
+        site)
+    return short
+
+
+def disclose_member_fallback_widths(pcb_data, config, member_names,
+                                    input_keys) -> Dict:
+    """:func:`disclose_pair_widths` for the member fallback (#1679).
+
+    On a run with a layer wider than the call's `track_width`, a fallback
+    member that does not fit at its layer width necks down in the
+    single-ended engine, and that ladder records nothing. Each member with
+    such a layer is graded against its own width
+    (`config.get_net_track_width`), with no drawn connector width: the
+    single-ended engine draws none.
+
+    `member_names` is the fallback summary's `attempted` list. The members
+    belong to pairs with no coupled copper, so no row of a coupled pair is
+    touched."""
+    member_names = set(member_names or ())
+    members = {}
+    for nid, net in pcb_data.nets.items():
+        if (net.name in member_names and config.layers
+                and max(config.get_net_track_width(nid, layer)
+                        for layer in config.layers)
+                > config.track_width + 1e-9):
+            members[nid] = (lambda layer, _n=nid:
+                            config.get_net_track_width(_n, layer), None)
+    return disclose_pair_widths(pcb_data, members, input_keys,
+                                MEMBER_FALLBACK_WIDTH_SITE,
+                                area=getattr(config, 'area_clearance', None))
+
+
+def disclose_coupled_pair_widths(pcb_data, config, pairs, fallback_names,
+                                 input_keys, pair_geom=None, narrowed=None) -> Dict:
+    """:func:`disclose_pair_widths` for the pairs routed coupled (#1725).
+
+    The pair router records its narrowings per routing ATTEMPT: a `terminal
+    neck` row each time an attempt's connector or terminal leg necks, and a
+    `pair partner neck` row for each candidate that passes the intra-pair
+    gate -- which a later gate, a rip-up or a reroute can still discard. So
+    the rows counted attempts, among them copper that never shipped. Every
+    member of `pairs` ([(name, pair)], the call's pairs) the member fallback
+    did not attempt (`fallback_names`, graded by
+    :func:`disclose_member_fallback_widths`) is graded instead on the copper
+    it ships, against the width the pair router asks for: the layer's width
+    (`get_track_width`, the impedance width where the run has one) on the
+    pair's own config, whose track width is the pair's class geometry
+    (`pair_geom`, {p_net_id: (width, gap)}) or the call's. The connectors the
+    router draws at that track width to land on the pads and stubs are
+    delivered as asked, so a pair shipped coupled at full width records
+    nothing. KiCad grades a track only against the board's minimum track
+    width and `.kicad_dru` track_width rules (a net class width is the
+    router's default, not a DRC limit), so a row here is disclosure of a
+    request not met, not a DRC flag.
+
+    `narrowed` ({p_net_id: width}, #1742) names the pairs that fit only
+    narrowed to that width, both members together: their members' rows
+    carry their own site (`NARROWED_PAIR_WIDTH_SITE`), so a deliberate
+    matched narrowing reads apart from a neck. Their connectors are drawn at
+    the narrowed width where it is below the pair's track width, so that
+    copper is graded too."""
+    from dataclasses import replace
+    fallback_names = set(fallback_names or ())
+    pair_geom = pair_geom or {}
+    narrowed = narrowed or {}
+    members, narrowed_members = {}, {}
+    for _name, pair in pairs or ():
+        geom = pair_geom.get(pair.p_net_id)
+        pcfg = config if geom is None else replace(config, track_width=geom[0])
+        nar = narrowed.get(pair.p_net_id)
+        for nid, nm in ((pair.p_net_id, pair.p_net_name),
+                        (pair.n_net_id, pair.n_net_name)):
+            if nm in fallback_names:
+                continue
+            if nar is None:
+                members[nid] = (pcfg.get_track_width, pcfg.track_width)
+            else:
+                narrowed_members[nid] = (
+                    pcfg.get_track_width,
+                    pcfg.track_width if nar > pcfg.track_width + DRAWN_WIDTH_TOL else None)
+    area = getattr(config, 'area_clearance', None)
+    short = disclose_pair_widths(pcb_data, members, input_keys,
+                                 COUPLED_PAIR_WIDTH_SITE, area=area)
+    short.update(disclose_pair_widths(pcb_data, narrowed_members, input_keys,
+                                      NARROWED_PAIR_WIDTH_SITE, area=area))
+    return short
+
+
+# --------------------------------------------------------------------------
+# Part 2: reconciliation casualty custody
+# --------------------------------------------------------------------------
+
+def record_casualty(state, net_id: int, saved_result: dict,
+                    ripped_ids: List[int], was_in_results: bool):
+    """Custody record for a COMMITTED rip (the ripper's route landed and the
+    ripped net was queued for reroute, i.e. its copper is gone from the board
+    unless a later reroute succeeds). Keyed by every ripped net id; overwrites
+    an older record - the most recent complete geometry is the one to restore.
+    """
+    if saved_result is None:
+        return
+    for rid in (ripped_ids or [net_id]):
+        state.casualty_custody[rid] = (net_id, saved_result,
+                                       list(ripped_ids or [net_id]),
+                                       was_in_results)
+
+
+def run_casualty_reconcile(state, progress_callback=None,
+                           cancel_check=None, input_ids=None,
+                           register_partial=False) -> Dict:
+    """Casualties-only end-of-run reconciliation (final_reconcile=
+    'casualties-only', depth 1 - no recursive rip authority).
+
+    Restore-first semantics, never a blind restore:
+      A. verify each casualty is ACTUALLY still broken (absent from
+         routed_results - a later reroute may have already recovered it);
+      B. restore the original pre-rip copper via the collision-aware
+         restore_net (it refuses a restore that would short copper routed
+         while the net was ripped, so restored copper can never collide with
+         newly routed copper);
+      C. re-route the still-broken (restore refused) with the restored copper
+         already committed as obstacles - one plain attempt, no rip-up;
+      D. last resort: piece-level partial restore of the non-colliding copper
+         (parity with route.py's #134 last resort) - a partial net beats zero.
+
+    input_ids is the set of id()s of the copper the calling run was handed
+    (its original segments and vias). D's write-list entry is built from it
+    (rip_up_reroute.restore_write_entry), as route.py's #134 last resort's
+    is: a restored INPUT piece rides no write-list (#1311). None appends the
+    whole restore, as before. register_partial=True also makes D's restore
+    the net's result in state.routed_results (route.py, #1758): route.py's
+    #87 write-list filter and its dead-end sweep's protect set
+    (_unfinished_net_ids) read only routed_results, so without it the
+    restored pieces were dropped and trimmed. route_diff leaves it off: it
+    has no #87 filter, and to it a routed_results entry means "routed this
+    run" -- its cleanup scope (diff_cleanup_scope) would then sweep the
+    restore, and the single-ended member fallback, the intra-pair matcher
+    and #521 protection would read it as a routed pair.
+
+    progress_callback(i, n, label) fires per casualty in the restore and
+    reroute loops (#527: this phase used to run with the PREVIOUS phase's
+    message still on screen). cancel_check is honored only around the
+    depth-1 REROUTE attempts (the expensive part): a cancelled casualty
+    skips C and drops straight to the partial restore, so custody is never
+    abandoned -- cancelling must not ship a ripped net at zero copper.
+
+    Returns a JSON-ready summary dict.
+    """
+    summary = {'attempted': 0, 'restored': [], 'rerouted': [],
+               'partial': [], 'unrecovered': []}
+    custody = getattr(state, 'casualty_custody', None)
+    if not custody:
+        return summary
+
+    pcb_data, config = state.pcb_data, state.config
+
+    def _label(net_id):
+        if net_id in state.diff_pair_by_net_id:
+            return state.diff_pair_by_net_id[net_id][0]
+        net = pcb_data.nets.get(net_id)
+        return net.name if net else f"net_{net_id}"
+
+    def _pair_name(net_id):
+        info = state.diff_pair_by_net_id.get(net_id)
+        return info[0] if info else None
+
+    # A: verify actually broken; dedupe pair halves sharing one custody record.
+    broken, seen = [], set()
+    for rid in sorted(custody):
+        if rid in state.routed_results:
+            continue  # recovered by a later reroute - not a casualty
+        net_id, saved, ripped_ids, was_in = custody[rid]
+        if id(saved) in seen:
+            continue
+        seen.add(id(saved))
+        broken.append((net_id, saved, ripped_ids, was_in))
+    if not broken:
+        return summary
+    summary['attempted'] = len(broken)
+
+    print("\n" + "=" * 60)
+    print(f"Final reconciliation (casualties-only, depth 1): {len(broken)} "
+          f"net(s)/pair(s) ripped during routing never re-routed")
+    print("=" * 60)
+    if progress_callback:
+        progress_callback(0, 0, f"Reconciling {len(broken)} ripped net(s)...")
+
+    from rip_up_reroute import restore_net
+
+    # B: restore-FIRST (collision-aware; refused restores stay ripped and are
+    # stashed for the piece-level last resort).
+    still_broken = []
+    for _b_idx, (net_id, saved, ripped_ids, was_in) in enumerate(broken):
+        if progress_callback:
+            progress_callback(_b_idx + 1, len(broken),
+                              f"Reconcile restore: {_label(net_id)}")
+        restore_net(net_id, saved, ripped_ids, was_in, pcb_data,
+                    state.routed_net_ids, state.routed_net_paths,
+                    state.routed_results, state.diff_pair_by_net_id,
+                    state.remaining_net_ids, state.results, config,
+                    state.track_proximity_cache, state.layer_map,
+                    state.working_obstacles, state.net_obstacles_cache,
+                    state.ripped_route_layer_costs,
+                    state.ripped_route_via_positions,
+                    refused_sink=state.collision_refused_net_ids)
+        if all(r in state.routed_results for r in (ripped_ids or [net_id])):
+            name = _label(net_id)
+            print(f"  {GREEN}RESTORED{RESET} {name}: original pre-rip copper "
+                  f"re-instated (casualty custody)")
+            summary['restored'].append(name)
+            pn = _pair_name(net_id)
+            if pn:
+                record_pair_diag(state, pn, casualty='restored-original')
+        else:
+            still_broken.append((net_id, saved, ripped_ids, was_in))
+
+    # C: depth-1 reroute of the still-broken, with all restored copper as
+    # obstacles. No rip-up (no recursive rip authority).
+    for _c_idx, (net_id, saved, ripped_ids, was_in) in enumerate(still_broken):
+        name = _label(net_id)
+        if progress_callback:
+            progress_callback(_c_idx + 1, len(still_broken),
+                              f"Reconcile reroute: {name}")
+        rerouted = False
+        pair_info = state.diff_pair_by_net_id.get(net_id)
+        if cancel_check and cancel_check():
+            # Cancelled: skip the expensive reroute attempt but NEVER abandon
+            # custody -- fall through to the partial restore below so the net
+            # doesn't ship at zero copper.
+            pass
+        elif pair_info is not None:
+            pair_name, pair = pair_info
+            from routing_context import (build_diff_pair_obstacles,
+                                         record_diff_pair_success)
+            from diff_pair_routing import route_diff_pair_with_obstacles
+            from layer_swap_fallback import add_own_stubs_as_obstacles_for_diff_pair
+            from polarity_swap import apply_polarity_swap
+            obstacles, unrouted_stubs = build_diff_pair_obstacles(
+                state.diff_pair_base_obstacles, pcb_data, config,
+                state.routed_net_ids, state.remaining_net_ids,
+                state.all_unrouted_net_ids, pair.p_net_id, pair.n_net_id,
+                state.gnd_net_id, state.track_proximity_cache, state.layer_map,
+                state.diff_pair_extra_clearance,
+                add_own_stubs_func=add_own_stubs_as_obstacles_for_diff_pair,
+                ripped_route_layer_costs=state.ripped_route_layer_costs,
+                ripped_route_via_positions=state.ripped_route_via_positions)
+            res = route_diff_pair_with_obstacles(
+                pcb_data, pair, config, obstacles, state.base_obstacles,
+                unrouted_stubs)
+            if res and not res.get('failed') and not res.get('probe_blocked'):
+                state.results.append(res)
+                apply_polarity_swap(pcb_data, res, state.pad_swaps, pair_name,
+                                    state.polarity_swapped_pairs)
+                record_diff_pair_success(
+                    pcb_data, res, pair, pair_name, config,
+                    state.remaining_net_ids, state.routed_net_ids,
+                    state.routed_net_paths, state.routed_results,
+                    state.diff_pair_by_net_id, state.track_proximity_cache,
+                    state.layer_map,
+                    working_obstacles=state.working_obstacles,    # #806
+                    net_obstacles_cache=state.net_obstacles_cache)
+                record_pair_diag(state, pair_name, casualty='rerouted')
+                rerouted = True
+        else:
+            from routing_context import (build_single_ended_obstacles,
+                                         record_single_ended_success)
+            from single_ended_routing import route_net_with_obstacles
+            obstacles, _ = build_single_ended_obstacles(
+                state.base_obstacles, pcb_data, config, state.routed_net_ids,
+                state.remaining_net_ids, state.all_unrouted_net_ids, net_id,
+                state.gnd_net_id, state.track_proximity_cache, state.layer_map,
+                ripped_route_layer_costs=state.ripped_route_layer_costs,
+                ripped_route_via_positions=state.ripped_route_via_positions)
+            res = route_net_with_obstacles(pcb_data, net_id, config, obstacles)
+            if res and not res.get('failed'):
+                state.results.append(res)
+                record_single_ended_success(
+                    pcb_data, res, net_id, config, state.remaining_net_ids,
+                    state.routed_net_ids, state.routed_net_paths,
+                    state.routed_results, state.track_proximity_cache,
+                    state.layer_map)
+                # `record_single_ended_success` takes no obstacle map -- it
+                # updates pcb_data and the tracking dicts only. The main loop
+                # refreshes separately around its own calls; this branch did
+                # not, so a casualty RE-ROUTE (as opposed to branch D's
+                # partial restore, which already refreshes) left the working
+                # map holding that net's PRE-ROUTE footprint.
+                #
+                # Measured on cparti_fpga's retry step with KICAD_STAGE_AUDIT,
+                # once the #134 and rescue sites were fixed this was the last
+                # remaining source of invariant-E staleness: "REROUTED
+                # SRAM_A8" left 1 stale entry, 1599 of its 2465 cells
+                # unblocked and 119 via cells unblocked.
+                from obstacle_cache import refresh_net_obstacles  # #806
+                refresh_net_obstacles(state.working_obstacles,
+                                      state.net_obstacles_cache,
+                                      pcb_data, config, [net_id])
+                rerouted = True
+        if rerouted:
+            print(f"  {GREEN}REROUTED{RESET} {name}: casualty re-routed with "
+                  f"restored copper as obstacles")
+            summary['rerouted'].append(name)
+            continue
+
+        # D: last resort - piece-level partial restore of non-colliding copper
+        # (route.py #134 parity). Piece-wise collision check against the
+        # settled board, so nothing restored can short copper routed meanwhile.
+        from rip_up_reroute import _saved_route_collides
+        from pcb_modification import add_route_to_pcb_data
+        stash = getattr(pcb_data, '_refused_saved_134', {}) or {}
+        src = stash.get(net_id, saved)
+        keep_segs = [sg for sg in (src.get('new_segments') or [])
+                     if not _saved_route_collides(
+                         {'new_segments': [sg], 'new_vias': []},
+                         pcb_data, ripped_ids, config.clearance,
+                         config=config)]
+        keep_vias = [v for v in (src.get('new_vias') or [])
+                     if not _saved_route_collides(
+                         {'new_segments': [], 'new_vias': [v]},
+                         pcb_data, ripped_ids, config.clearance,
+                         config=config)]
+        pn = _pair_name(net_id)
+        from pcb_modification import drop_orphan_restore_pieces
+        drop_orphan_restore_pieces(keep_segs, keep_vias, net_id, pcb_data)
+        if keep_segs or keep_vias:
+            dropped = (len(src.get('new_segments') or []) - len(keep_segs)
+                       + len(src.get('new_vias') or []) - len(keep_vias))
+            pruned = dict(src)
+            pruned['new_segments'] = keep_segs
+            pruned['new_vias'] = keep_vias
+            pruned['partial_restore_134'] = True
+            # Which restore this is: net_rescue.rescue_candidates takes a
+            # casualty put back here, and not the #134 last resort's.
+            pruned['casualty_restore'] = True
+            add_route_to_pcb_data(pcb_data, pruned,
+                                  debug_lines=config.debug_lines)
+            from obstacle_cache import refresh_net_obstacles  # #806
+            refresh_net_obstacles(state.working_obstacles,
+                                  state.net_obstacles_cache, pcb_data, config,
+                                  sorted(set(ripped_ids or []) | {net_id}))
+            # #1758: on route.py (register_partial) the restore is the net's
+            # AUTHORITATIVE result, as the route.py #134 sibling's is (#508
+            # finding 8 / #1427): route.py's
+            # #87 filter keeps only results routed_results names, and its
+            # dead-end sweep protects only nets whose routed_results entry is
+            # stamped partial_restore_134 (_unfinished_net_ids) -- so a
+            # restore appended to results alone was dropped from the
+            # write-list and its pieces trimmed as dead ends, and the net
+            # shipped none of the copper this line says it restored. Only the
+            # nets whose copper the restore carries, and only where no
+            # result exists (A's entry condition: the casualty has none).
+            from rip_up_reroute import restore_write_entry
+            _wentry = (pruned if input_ids is None
+                       else restore_write_entry(pruned, input_ids))
+            if _wentry is not None:
+                state.results.append(_wentry)
+            if register_partial:
+                for _rid in sorted({o.net_id for o in keep_segs + keep_vias}):
+                    if _rid not in state.routed_results:
+                        state.routed_results[_rid] = pruned
+            # Same registration the route.py sibling owes (see there): a net in
+            # neither routed_net_ids nor remaining_net_ids is never stamped as
+            # foreign copper by `build_single_ended_obstacles`, so this restore
+            # would be invisible to every map built afterwards. Refreshing the
+            # cache entry alone does not cover it -- the cache is consulted
+            # only for remaining_net_ids.
+            for _rid in sorted(set(ripped_ids or []) | {net_id}):
+                if _rid in state.remaining_net_ids:
+                    state.remaining_net_ids.remove(_rid)
+                if _rid not in state.routed_net_ids:
+                    state.routed_net_ids.append(_rid)
+            print(f"  {RED}PARTIAL{RESET} {name}: reroute failed; restored "
+                  f"{len(keep_segs)} segment(s) + {len(keep_vias)} via(s) of "
+                  f"its pre-rip route (dropped {dropped} colliding piece(s)); "
+                  f"net remains PARTIAL for a later pass")
+            summary['partial'].append(name)
+            if pn:
+                record_pair_diag(state, pn, reason='ripped-not-restored',
+                                 stage='casualty-reconcile',
+                                 casualty='partial-restore')
+        else:
+            print(f"  {RED}UNRECOVERED{RESET} {name}: restore collides and "
+                  f"reroute failed; net ships unrouted")
+            summary['unrecovered'].append(name)
+            if pn:
+                record_pair_diag(state, pn, reason='ripped-not-restored',
+                                 stage='casualty-reconcile',
+                                 casualty='unrecovered')
+    return summary

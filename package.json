@@ -21,8 +21,9 @@
     "build:ts": "tsc --project tsconfig.json",
     "build": "bun run build:wasm && bun run build:ts",
     "typecheck": "tsc --noEmit --project tsconfig.json",
-    "test": "bun test tests/visual-snapshots",
-    "test:update": "BUN_UPDATE_SNAPSHOTS=1 bun test tests/visual-snapshots"
+    "test": "bun test tests/bus-routing.test.ts tests/visual-snapshots",
+    "test:update": "BUN_UPDATE_SNAPSHOTS=1 bun test tests/visual-snapshots",
+    "prepack": "bun run build"
   },
   "peerDependencies": {
     "tscircuit": "*"

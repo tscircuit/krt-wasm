@@ -1,0 +1,1160 @@
+# Routing Configuration API (`routing_config`, `routing_utils`)
+
+- **`routing_config.py`** — `GridRouteConfig` (every routing parameter in
+  one dataclass), `GridCoord` (mm ↔ grid conversion), `DiffPairNet`.
+- **`routing_utils.py`** — small shared helpers used throughout the
+  codebase (`pos_key`, `build_layer_map`, pad-cell iteration).
+
+Most `GridRouteConfig` fields map 1:1 to CLI flags; the flag-oriented view
+with tuning advice is in [Configuration](configuration.md). This page is the
+programmatic view.
+
+Examples run from the repository root with the engine directory on the
+import path: `PYTHONPATH=py_router python3 <your script>` (see the
+[overview](python-api.md)).
+
+## `GridRouteConfig`
+
+```python
+from routing_config import GridRouteConfig
+
+config = GridRouteConfig(
+    track_width=0.2, clearance=0.15,
+    via_size=0.5, via_drill=0.3,
+    layers=['F.Cu', 'In1.Cu', 'In2.Cu', 'B.Cu'],
+    grid_step=0.1)
+```
+
+All defaults shown below; lengths in mm, angles in degrees. "Cost" values
+are calibrated at the reference grid step (0.1 mm) and rescaled
+automatically at other grid steps (see [cost scaling](#cost-scaling)).
+These are the dataclass's own defaults, what a bare `GridRouteConfig()`
+gets. The CLIs and the GUI resolve the track geometry from the board's
+Default net class, else `routing_defaults.py` (`TRACK_WIDTH` 0.3,
+`CLEARANCE` 0.25, `VIA_SIZE` 0.5, `VIA_DRILL` 0.3), and pass it in.
+
+### Track, via, and grid
+
+| Field | Default | Meaning |
+|-------|---------|---------|
+| `track_width` | `0.1` | Default trace width |
+| `clearance` | `0.1` | Copper-to-copper clearance |
+| `via_size` | `0.3` | Via outer diameter |
+| `via_drill` | `0.2` | Via hole diameter |
+| `via_rung` | `0` | #568 per-search via legality rung. `0` = the configured via size (normal). `1` = judge via placement at the SMALLER fab-ladder rung, used only on a `dataclasses.replace()` clone for one escalation retry when a route is blocked purely by via legality. There is no CLI flag or GUI control: the engine sets it, and `KICAD_VIA_RUNG` is a kill switch (`2`, the default, keeps the Rust per-rung map; any other value turns the small rung off). |
+| `run_via` | `None` | #1226: the run's `(via_size, via_drill)`, recorded on the clone `route_net_with_obstacles` makes for a net at its own via (`net_via_sizes`). The #568 small rung is stamped against the RUN's via, so a rung-1 retry from that clone ships the run's small fab via (only when it is smaller than the net's own) and judges which path vias need it at the net's own rung. Engine-set only, like `via_rung`. |
+| `via_span` | `None` | #1842: the copper layers, top to bottom, that every via this step lays joins (a contiguous run of the stack, and the only layers the step routes on). `None` = through vias. The obstacle builders read the board through `via_span.SpanView`, so only copper on these layers and drilled pads block a via site. Set from `batch_route(via_span=(top, bottom))` through `via_span.resolve_via_span`. |
+| `via_span_type` | `None` | `Via.via_type` of those vias: `'micro'`, `'blind'` or `'buried'`. |
+| `net_via_sizes` | `{}` | `{net_id: (via_size, via_drill)}` for nets whose resolved class / rule via geometry differs from the call's `via_size`/`via_drill` (#530 decision 4). `config.net_via(net_id)` returns the pair a net draws. The obstacle cache keeps one via-legality **rung** per distinct pair (`obstacle_cache.via_rungs`, rung 0 = the call's size; rust `add_blocked_via_rung` / `is_via_blocked_rung`), every add/remove -- cached or raw (#1226: the per-net adds behind `build_single_ended_obstacles`, the list add/remove twins, the board-edge bands) -- reaches every rung at THAT rung's own via and drill, never the call's size (a larger per-net via would sit (rung - call)/2 inside the copper), and `route_net_with_obstacles` selects the net's rung before the search. A MULTIPOINT net (3+ pads) is searched at the call's size, so its paths complete as they would with no class via, and each via it places is then drawn at the net's own size wherever that is legal at its rung; the rest keep the call's size and are disclosed as a `design_rules` descent. Filled by `batch_route` only when `--via-size` was omitted. Needs `grid_router` 0.22.0+; `route.py` prints a note and routes at the call size on an older binary |
+| `grid_step` | `0.1` | Routing grid resolution |
+| `layers` | `['F.Cu', 'B.Cu']` | Copper layers available to the router |
+
+### Search algorithm
+
+| Field | Default | Meaning |
+|-------|---------|---------|
+| `max_iterations` | `200000` | A* iteration cap per attempt |
+| `max_probe_iterations` | `5000` | Quick probe per direction to detect blocked routes early |
+| `heuristic_weight` | `2.3` | A* greediness (>1 = faster, possibly non-optimal paths); 1.9 -> 2.3 from the #586 corpus dose-response (peak at 2.3, both neighbors worse) |
+| `via_cost` | `75` | Via penalty, in grid steps at the reference grid; 50 -> 75 from the #586 corpus (DRC -13, composes with heuristic 2.3) |
+| `turn_cost` | `1000` | Penalty per direction change (straighter routes) |
+| `direction_order` | `'forward'` | Try `'forward'` or `'backward'` direction first |
+
+### Proximity penalties (soft costs)
+
+Quick table; every field is specified in detail right below — **what feeds it,
+its gates and exemptions, how sources compose, and who consumes it**. Costs are
+"mm-equivalent detour per cell" at the reference grid: `0.2` means a cell at
+the source center costs like 0.2&nbsp;mm of extra path (2&times; the plain move
+cost of a 0.1&nbsp;mm cell); all falloffs are linear from full cost at the
+source to zero at the radius.
+
+| Field | Default | Meaning |
+|-------|---------|---------|
+| `stub_proximity_radius` | `2.0` | Radius around unrouted stubs / unescaped chip pads |
+| `stub_proximity_cost` | `0.2` | Cost at the stub center (mm-equivalent detour) |
+| `via_proximity_cost` | `10.0` | Multiplier on graded proximity when placing a via (0 = no extra cost) |
+| `bga_proximity_radius` | `7.0` | Distance from BGA edges to penalize |
+| `bga_proximity_cost` | `0.2` | Cost at the BGA edge (0 = fully off, radius disarmed too) |
+| `package_proximity_zones` | `None` | Per-package proximity rects `(min_x, min_y, max_x, max_y, radius_mm)` for BGA/QFN/QFP, filled by the batch engines under the opt-in `KICAD_PACKAGE_PROXIMITY`. `None` = legacy (the hard BGA zones at the flat radius) |
+| `track_proximity_distance` | `2.0` | Radius around routed tracks (same layer) |
+| `track_proximity_cost` | `0.0` | Cost near routed tracks (**0 = off by default**) |
+| `keep_away` | `()` | Pairwise keep-away rules `'AGG:VICTIM:GAP'` (#1146); empty = off |
+| `keep_away_free` | `1.5` | Radius around the routed net's own pads where the keep-away band is not priced |
+| `keep_away_cost` | `0.5` | Cost per cell inside a keep-away band (0 = measure and report only) |
+| `plan_probe` | `False` | Marks a config as the global plan's (#589) rough-route PROBE, whose relaxed legality lets probe terminals overlap future nets' copper. Set only on the plan's `replace()` clone — never on a config that emits copper |
+| `ripped_route_avoidance_radius` | `1.0` | Radius around just-ripped routes |
+| `ripped_route_avoidance_cost` | `0.1` | Cost for other nets near a ripped net's former route, reserving it for that net's reroute (the ripped net itself never pays it) |
+
+Two per-cell fields carry all of these: the **stub map** (one all-layer map)
+and the **layer map** (one map per copper layer). Every A* move pays
+`stub(cell) + layer(cell, current layer)` on top of the move cost; placing a
+via pays `(stub + layer-at-destination) x via_proximity_cost` on top of the
+via cost (both routers, single-ended and pose/diff-pair, same formula).
+
+#### Stub map (all-layer): `stub_proximity_radius` / `stub_proximity_cost`
+
+Sources, each with its own gate — this is the complete list:
+
+1. **Stub endpoints** of *unrouted foreign* nets (`connectivity.get_stub_endpoints`).
+   Gate: the net has >= 2 segments forming >= 2 disconnected groups — i.e.
+   PARTIALLY routed copper with free ends (fanout stubs, interrupted routes).
+   A bare unrouted net emits none; a fully-connected net emits none.
+2. **Chip-pad pseudo-stubs** (`net_queries.get_chip_pad_positions`): pads whose
+   future escape needs the surrounding space. Gate: the pad's footprint is a
+   fine-pitch chip package (**BGA/QFN/QFP by `detect_package_type`, >= 4 pads**)
+   AND the net has not yet escaped that pad (no same-net segment end or via
+   within the pad's half-size + 0.05 mm). A pad retires as a source the moment
+   fanout or routing attaches copper to it. (Historically ANY >= 4-pad
+   footprint counted — 4-pad capacitors and multi-pin connectors emitted
+   pseudo-stubs, and a connector's many distinct nets stacked into exactly the
+   open-field noise the #584 sum experiment measured.)
+3. **Ripped-route ghost vias** (see the ripped-route section below) at the
+   `ripped_route_avoidance_*` falloff, per ripped net.
+4. **Plane-flow via avoidance**: `route_planes` / the plane region connector
+   stamp foreign vias into their own scratch maps with caller-chosen
+   radius/cost (same mechanism, different knobs; not part of signal prepare).
+
+Exclusions and exemptions:
+
+- The **current net never repels itself** (its id is excluded from the source
+  net list), and **routed nets are excluded** (their real copper is a hard
+  obstacle instead).
+- **Endpoint exemption** (soft-knobs C5): lookups within one track-width +
+  clearance of the current net's own endpoints return 0, so the final approach
+  to a pad sitting beside foreign stubs is not taxed. This exemption applies
+  to the stub map ONLY — layer-map costs (BGA field, track ghosts) are not
+  endpoint-exempt.
+- `via_proximity_cost = 0` means vias pay **no extra** near stubs (the
+  historical inverted meaning — 0 = hard via ban + ~200x CPU hazard — was
+  removed in Rust 0.20.1).
+
+Two consequences of the definition:
+
+- The stamp is **all-layer**: a stub on B.Cu repels routing on F.Cu.
+  `get_stub_endpoints` returns each stub's layer, but the stamp ignores it.
+- Stub endpoints of nets destined for **planes/pours** emit like any other:
+  a pour needs access space to its pads exactly as a track does (#585 item 2,
+  kept as is).
+
+#### BGA proximity field: `bga_proximity_radius` / `bga_proximity_cost`
+
+Geometry: for every auto-detected **BGA** component (pad-bounding-box zones —
+**QFN/QFP get NEITHER the hard zone NOR the proximity field**; the engine only
+ever auto-detects BGA packages, so a QFN's sole protection is its pads as hard
+obstacles plus chip-pad pseudo-stubs on unescaped pads), the zone interior
+carries the full edge-tier cost on EVERY copper layer (so allowed-cells
+windows punched through the hard block are not free-via holes), with the
+linear ring falling to zero at `bga_proximity_radius` outside the zone edge.
+
+Plumbing: the field rides the **layer map** under a reserved cache key
+(soft-knobs B1), registered once per `batch_route` / `batch_route_diff_pairs`
+call and re-merged on every per-net prepare — stamping it into the base map
+instead would be wiped before every net (that was the pre-B1 silent no-op).
+
+`bga_proximity_cost = 0` fully disarms the feature: the field is not emitted
+AND the `is_in_bga_proximity` radius used by the proximity heuristic and the
+pose router is not armed (historically the radius armed unconditionally, so
+zeroing the cost silently left a 10x diff-pair via cliff active in the 7 mm
+ring; both the cliff and the gap are gone as of Rust 0.20.1).
+
+Definition review flags: the radius is a flat 7 mm regardless of package size;
+QFN/QFP have no hard zone and no proximity ring at all — their escape collar
+carries no graded protection (#585 item 4). Both flags still describe the
+DEFAULT path; `package_proximity_zones` below is the opt-in answer to them.
+
+#### Per-package proximity zones: `package_proximity_zones`
+
+`(min_x, min_y, max_x, max_y, radius_mm)` rects giving **every** fine-pitch
+package — BGA, QFN **and** QFP with >= 4 pads — its own proximity ring, with the
+radius scaled by escape demand rather than flat:
+
+```
+r = bga_proximity_radius * sqrt(n_pads / 1000), clamped to [2.0, bga_proximity_radius]
+```
+
+so a 1000+-ball monster earns the full 7 mm, a 100-ball BGA ~2.2 mm, and any
+QFN the 2 mm floor. Rects are pad-bounding-box anchored (margin 0), like the
+hard zones.
+
+This feeds the **soft field only** — the hard exclusion zones stay BGA-only, so
+a QFN's interior remains routable, just priced. It also defines the
+max-composition boundary in `zoned` sum mode
+(`obstacle_costs.proximity_max_zone_rects`).
+
+`None` (the default) means legacy behavior: the field is built from
+`bga_exclusion_zones` at the flat `bga_proximity_radius`. `bga_proximity_cost`
+and `bga_proximity_radius` still gate the whole field either way — this changes
+*where* the rings go, not whether they exist.
+
+Filled by `batch_route` / `batch_route_diff_pairs` from the board
+(`routing_common.package_proximity_zones`) **only under the opt-in env knob
+`KICAD_PACKAGE_PROXIMITY`**, so a default run leaves it `None`. It is opt-in
+because it screened **negative** as a default (glasgow 7 -> 10 failures, `oc`
+midchain 23 -> 26): the sqrt scaling *shrinks* the ring on exactly the
+large BGAs that need it most, and tiny DFN/SOT packages classified as QFN add
+clutter. A scale-up-only variant with a pad-count floor is the pending idea.
+
+#### Track proximity: `track_proximity_distance` / `track_proximity_cost`
+
+Per-layer corridors around copper **routed in THIS run**: on every routing
+success the net's segments are sampled (~1 mm spacing, deduped within the net)
+into a per-net array in the track-proximity cache; rip-up removes the entry.
+Merged into the layer map on every prepare.
+
+**Default OFF** (`cost 0.0`): a RETRY lever, not a default. Single boards
+gain (2026-08-02: `--track-proximity-cost 2` took cynthion 97.9 -> 100%;
+mid-chain orangecrab failures 23 -> 12 once width-aware), but across the
+corpus it adds DRC (#584: +119 to +244 over the dose grid), so retry with it,
+compare, and keep whichever run grades better.
+
+The field is **width-aware** (#585): full cost across the copper (± width/2),
+then the standard falloff from the copper edge, so a 2 mm trunk casts a wider
+field than a 0.1 mm signal; ripped-route ghosts get the same treatment.
+**Pre-existing input-board copper does not emit** — nets registered as
+rippable-pre-existing skip the cache. Ghosting it is opt-in
+(`KICAD_TRACK_PROX_PREEXISTING`) because it screened negative mid-chain
+(failures 12 -> 17 at cost 2, +50% time): existing diff/plane copper
+over-constrains the signal step.
+
+#### Pairwise keep-away: `keep_away` / `keep_away_free` / `keep_away_cost`
+
+A user-declared spacing between two net groups above the clearance (#1146) --
+clocks, I2C, relay coils and switch nodes kept a few tenths of a millimetre
+further from analog nets than the netclass asks. Each rule `AGG:VICTIM:GAP`
+names two sides as comma-separated net patterns (resolved like `--nets`)
+and/or net classes as `class=NAME` (a glob; `!class=NAME` takes one out,
+`class=Default` is every net no class claims; a class never brings in an
+`unconnected-*` net), and a GAP in mm (at most 10), edge to edge on the same
+layer. Rules are separated by spaces, so a space inside a net or class name
+is written `?` (`class=High?Speed`). `class=Digital:class=Audio:0.5` is KiCad's
+`A.NetClass == 'Digital' && B.NetClass == 'Audio'` as a soft rule; classes
+are read from the board's project by the resolver the router and `check_drc`
+share. The run logs one line per rule with the number of nets each side
+resolved to, and a warning, once, for each pattern that matched nothing.
+While a net of either side is
+routed, every cell where its track would sit closer than GAP to the other
+side's copper (pads, tracks, vias -- pre-existing copper and copper routed
+earlier in the run alike) costs `keep_away_cost` on the **layer map**.
+Nets of one side route against each other at the normal clearance, and a net
+matching both sides keeps away from both. The clearance stays the hard floor;
+the keep-away is soft, so a band the router cannot avoid is still routed
+through.
+
+Within `keep_away_free` of the routed net's OWN pads the band is not priced,
+so a pin can leave a package whose neighbouring pins belong to the other group
+(a relay's coil pin beside its contact pins). A diff pair is priced as one
+object, its band widened by the pair's half-extent (a hybrid pair's
+single-ended legs as one track each).
+
+The band is a flat cost per cell. It is composed on the layer map like every
+other source, so in the default MAX composition a cell inside the band costs
+`max(keep_away_cost, other sources)`, and a via landing there pays it times
+`via_proximity_cost`. The field is built in `keep_away.py` from each opposite
+net's copper, cached per net until that net's copper changes, and folded into
+every single-ended and diff-pair obstacle builder as the `('keepaway',)`
+ghost source.
+
+The band is rebuilt from the copper as it is at each prepare, so it follows
+rip-up and restore: a ripped net takes its tracks' band with it (its pads keep
+theirs) and a restored one brings the same band back. It is read from the
+geometry itself rather than from the copper epoch, because many passes edit
+tracks in place without bumping it. Who routes first matters: a net is priced
+against the other side's tracks routed before it and against all of its pads.
+The stub-swap and tap-relocation rescues route on a map prepared like the
+main pass's; `net_rescue` and terminal escalation, which route on clones no
+builder prepared, stamp the band themselves (a rescue rung only where the
+band reaches its window); and the plane finalize's reroute and region-join
+sub-runs inherit the rules. The copper the finalize lays directly -- pad
+taps, join segments, oracle welds -- does not price it, but the report below
+is measured on the shipped board, so it counts them.
+
+Because it is soft, the route step measures what shipped: per net of either
+group left inside a band, the track length inside it beyond the free radius,
+the closest spacing to the other side's copper and the net it came closest
+to, with board totals. The printed `JSON_SUMMARY['keep_away']` is the first
+pass's reading; `route.py` measures again on the board it ships, after the
+plane finalize and the reconciliation, and that reading is the one
+`--json-out` carries (`measured_on`), the GUI's `results_data['keep_away']`
+carries as a list, and the log prints when it differs. It reads the whole
+board, so `--keep-away-cost 0` grades a board without changing the route,
+including a board with nothing left to route. `route.py` and `route_diff.py` take the rules; in the GUI they are the
+Advanced tab's Keep-away field, used by the Route and Differential tabs.
+
+The rules can also be **declared once, in the board's design brief**
+(`<board>.design-brief.json`, key `keep_away`, #1253): a list of rules in this
+syntax, one per entry, as a string or `{"rule": ..., "why": ...}`. The engines
+(`batch_route`, `batch_route_diff_pairs`) read that key off the brief beside
+`input_file` (else `PCBData.source_path`) through
+`keep_away.resolve_keep_away`, the way `.kicad_dru` is discovered, and add
+each rule not already given after the caller's. So the CLI and the GUI both
+honour it with no flag or control. The run prints `Keep-away: N rule(s) read
+from the design brief`, and a malformed brief rule is refused with the rule
+parser's message (exit 2 on the CLI, a dialog in the GUI). `batch_route` reads
+the brief in its outermost call only; its nested sub-runs inherit the merged
+rules. A board with no brief, or a brief without the key, routes exactly as
+before. `check_floorplan` grades the same rules on the placed pads, before any
+track exists (`keep_away` in [the floorplan intent](floorplan-intent.md)).
+`keep_away.unpriced_rules(rules, board_path)` answers the reverse question
+with the same reader: which of a list of rules the engines will NOT price on
+that board. check_floorplan asks it about the intent it grades and warns
+about a `keep_away` row no brief beside the board declares.
+
+#### Via proximity multiplier: `via_proximity_cost`
+
+Not a field — a multiplier consumed at via placement in BOTH routers:
+`(stub + layer-at-destination) x via_proximity_cost` added to the via cost.
+Because the layer map carries every contributor, this multiplies BGA fields,
+track ghosts, ripped-route ghosts, congestion and plane-fragility costs alike
+— a via in a fragile pour neck at default fragility pays up to 10 x 2.0
+mm-equivalent. `0` = no extra cost (see stub map above); fractional values
+round up to at least 1.
+
+#### Ripped-route avoidance: `ripped_route_avoidance_radius` / `_cost`
+
+When rip-up removes a net's copper, its former corridor keeps a per-net ghost:
+segment corridors go to the **layer map** (per layer), via sites to the
+**stub map** (all-layer), both at this falloff. A ghost is a RESERVATION: every
+other net pays it -- the net that ripped the victim included, so it takes no
+more of the corridor than it needs -- and the ripped net's own reroute does
+not, so it can go back. Only a contention rip records one: an own-tree seam
+re-ask (#444) rips nothing anyone else wanted. Ghosts are dropped the moment
+the ripped net has real copper again (soft-knobs C1 — a re-routed net's ghost
+would otherwise repel everyone from a corridor that is already re-occupied or
+legitimately free), and a net can never appear as both a live corridor and a
+ghost (enforced with a warning at merge). The #540 outer-pass "casualty"
+ghosts and the plane-repair corridor ghosts (soft mode) ride the same dicts
+and falloff (plane-repair floors zero knobs to 0.1/1.0 rather than no-op).
+
+#### Env-gated fields riding the same layer map
+
+These compose with everything above and are documented here because they are
+otherwise invisible in flag tables:
+
+| Field | Env knob | Default | What it prices |
+|-------|----------|---------|----------------|
+| Plane fragility | `KICAD_PLANE_FRAGILITY_COST` | **2.0 = ON** | Cells near pour boundaries/necks, so signals do not bisect a plane. The LARGEST default field (10x the stub tier). `0` reverts. Which copper it was rasterized from is disclosed in `JSON_SUMMARY.plane_fragility` (below). |
+| Congestion v1 | `KICAD_CONGESTION_COST` | 0 = off | All-layer copper-density field. |
+| Congestion v2 | `KICAD_CONGESTION2_COST` | 0 = off | Demand/capacity bins, owner-exempt (your own destination does not repel you). A source in the layer-map composition pass since d52f1c2 (#585 item 7): sums in sum mode, max-mode unchanged by commutativity. |
+| History congestion | `KICAD_HISTORY_COST` | **0.1 = ON** | PathFinder-style negotiated congestion (#590): per-CELL, CUMULATIVE conflict history for the rest of the call. On by default since 2026-08-13; `0` turns it off. See below. |
+
+##### Plane fragility: which copper it priced (#831)
+
+The field is rasterized from the EXACT KiCad fill when pcbnew finishes within
+`EXACT_FILL_TIMEOUT` (300 s), else from the drawn zone OUTLINES -- which, for a
+full-board pour, price only a board-edge band. The choice used to be a console
+line only. `batch_route` now emits it in `JSON_SUMMARY.plane_fragility`:
+
+```json
+"plane_fragility": {"source": "zone_outlines", "islands": 0,
+                    "refill_status": "timeout",
+                    "why": "the KiCad refill TIMED OUT after 300s (limit 300s)",
+                    "machine_dependent": true}
+```
+
+`source` is one of `live_board` (the GUI's staged refill of the live board),
+`live_board_in_process` (the GUI's in-process fallback: live copper, clearances
+as of board load), `kicad_refill`, `zone_outlines`, `none` (no zones, or the
+field is off). `refill_status` is the `RefillStatus` reason the fill returned.
+**`machine_dependent: true` is the value a grader must not miss**: the fallback
+was taken because the refill timed out on THIS machine (or, in the GUI, the UI
+thread did not pump the save), so a faster machine routes the same board
+against different geometry. Every other fallback reason -- no pcbnew, the refill
+failed, the pour is empty -- is a fact about the board or the install and would
+repeat anywhere. The console prints a `WARNING` naming machine speed in the
+same case. There is deliberately no size pre-flight predicate: the corpus
+measurement behind that decision is in `tests/stress/RUNBOOK.md` ("Exact-fill
+timing census (#831)").
+
+##### Pour guard (#1260): an out-of-scope pour the run could only cut
+
+Not a cost: a hard obstacle. Routing through another net's pour is normal (the
+refill clears around the track), but a track that crosses a pour island from
+edge to edge cuts it in two, and KiCad's refill then deletes the piece that no
+longer touches a pad of the pour's net, or leaves that net open if the pour was
+its only connection. For a zone net in the run's scope the plane finalize
+repairs that; for one outside it (not matched by the caller's net filter, the
+`finalize_excluded_nets`) nothing does.
+
+So `batch_route` (`pour_guard.install_pour_barriers`, both fronts) blocks each
+fill island of an out-of-scope pour on a routing layer when **no routed net has
+a terminal inside it** (a pad, via or track end, holes included: a net with no
+terminal inside can enter the island only to cross it) and a cut would cost
+something. The island must touch two or more of its own net's pads, vias or
+tracks, or touch one and be at least the minimum island area (the zone's own in
+area-removal mode, else KiCad's default, 10 mm^2). The barriers land in
+`GridRouteConfig.pour_barriers`, and every `build_base_obstacle_map` stamps
+them as track and via keep-outs at the larger of the pair clearance and the
+zone's own clearance. Copper placed off those maps is held to the same keep-out
+(#1783): the pad taps' via search skips a site inside it
+(`pour_guard.barrier_via_site_filter`) and a tap whose via or trace still
+enters it is refused (`pour_guard.barrier_entered`; the part of a trace lying
+on its own pad's copper is not measured, since the fill already clears the
+pad there), which covers the #189
+via-in-pad unblock and its #535 off-pad escape and the net rescue's #666
+bare-ball escape, whose fanout-rescue rung asks the same; a pad no clear site
+reaches stays open, as the A* would leave it. Islands that hold a routed terminal stay crossable, so
+ordinary routing over a full-board pour is unchanged. Geometry: the exact KiCad
+fill (the GUI's live board, else a refill of the source file, memoised with the
+fragility field), else the zone outlines. Nested sub-runs (reconciliation laps,
+finalize repairs) inherit the outer run's list through the internal
+`pour_barriers` kwarg. `KICAD_POUR_GUARD=0` turns the guard off. The account is
+in `JSON_SUMMARY.pour_guard`:
+
+```json
+"pour_guard": {"source": "kicad_refill", "why": "",
+               "pours": [{"net": "ZONE_NET", "layer": "F.Cu",
+                          "blocked_islands": 1, "blocked_mm2": 334.3,
+                          "crossable_islands": 0, "minor_islands": 0}]}
+```
+
+A crossable island can still be cut by a net that has no terminal in it. So
+the outermost run grades every out-of-scope zone net with a crossable island
+again, on the board it ships (the written file; the GUI's write model) against
+the copper it started with. Both states are graded through fresh fill models
+(`pour_guard.audit_pour_cuts`). A net left with more disconnected pads than it
+had is named on the console (`Pour cut (#1260): ...`), in `--json-out` and the
+GUI's `results_data` as `pour_cuts: [{net, open_pads_before,
+open_pads_after}]`, and in `JSON_SUMMARY_MIN.pour_cuts` (the names). The audit
+only reports: it does not fail the run or revert it.
+
+##### Pad contacts (#1680)
+
+A via or track lying on another net's pad is a short the rest of a route step
+would never touch: the copper is the input's, and its net reads connected. So
+the outermost `batch_route`, before its already-connected filter, takes such
+copper of a net in this step's `--nets` off the board with the stub that led to
+it (back to the first pad, surviving via or junction), and the net routes clear
+of the pad (`pad_contact.rip_pad_contacts`). KiCad-locked and sense-held copper
+and protected nets stay, under the #521 rules: naming a protected net exactly
+in `--nets` lifts it. A pad with no net and a net tie's partner pad are not
+contacts. The copper is not given back if the reroute fails: an open net is
+named by the run's own tally, and is not a short. The rips are
+`pad_contact_rips` in `--json-out` and the `JSON_SUMMARY`.
+
+The run then audits the board it ships (`pad_contact.audit_shipped`, the written
+file or the GUI's write model, on the "nothing to route" path too). Copper still
+on another net's pad is named on the console (`SHORTED on the board this run
+ships`), and copper inside the clearance of one (`NOT CLEAR ...`, at the floor
+the writeback stores, so a pair a net class raises above it is `check_drc`'s to
+name), in `--json-out` and the GUI's `results_data` as `pad_contacts` and
+`pad_grazes` (`[{pad, pad_net, net, kind, at, overlap_mm, short, ...}]`), and in
+`JSON_SUMMARY_MIN` (the pads). A row whose net a route step will not rip carries
+`net_protected`, the NET's reason (`locked`, a `sense:` group, a `.kicad_pro`
+protection; per net, as the rip decides it, #1766), the console line ends
+`[net X: reason]`, and the audit prints the remedy: no flag lifts `locked` or
+`sense:` copper. This part only reports. `check_complete.py` names
+the shorts among its reasons.
+
+##### History congestion (#590), the only field that measures TIME
+
+Every other field prices the board's state *now*. This one prices how often a
+cell has been **fought over**, so repeatedly-contested ground gets steadily
+more expensive and the contest dissolves without anyone arbitrating whom to
+rip (the 0802 rip study refuted every frame-local rip gate and concluded "soft
+rra pricing beats refusal"; this is that conclusion made cumulative).
+
+Conflict events, charged in mm-equivalent to the cells involved. What ships
+is #590's `v1flat_01` arm: all three events below, at a flat increment, with
+no escalation. It was the best arm on the two corpora that compared arms
+(sets 1-10 and 11-20; sets 21-27 ran it against off only); the contest event
+alone and the doubling escalation both measured worse.
+
+- a **contest** (full increment) — the intersection of a failed
+  search's blocked frontier with a routed net's keep-out: ground one net
+  holds and another just stalled against, the engine's analog of
+  PathFinder's *overused nodes*. Charged inside
+  `analyze_frontier_blocking` (which already computes the per-blocker
+  intersection for rip ranking), **before** any rip — so a ripped blocker's
+  reroute already sees its contested ground priced and relocates instead of
+  re-taking it. A repeat contest adds the same flat increment again.
+  `KICAD_HISTORY_ESCALATE` > 0 makes it escalate instead (at 1.0 a
+  re-charged cell *doubles*: 0.1 → 0.2 → 0.4 …); that was the v2 default,
+  and on the corpus it walled off fine-pitch BGA escape fields, where
+  approaches are mandatory. One failure analyzed twice in a row is charged
+  once.
+- a **rip's whole footprint** — `KICAD_HISTORY_RIP_WEIGHT` × the
+  increment over the ripped copper (half width + `KICAD_HISTORY_RADIUS`,
+  vias on every layer). Default **1.0**. v2 had demoted it to 0, and the
+  corpus A/B reversed that: without it (contests alone, or contests plus
+  frontier) the field measured worse than baseline.
+- a **failed search's raw blocked frontier** —
+  `KICAD_HISTORY_BLOCKED_WEIGHT` × the increment. Default **0.25**.
+
+| Knob | Default | Meaning |
+|------|---------|---------|
+| `KICAD_HISTORY_COST` | `0.1` (on) | mm-equivalent per conflict event; `0` turns the field off |
+| `KICAD_HISTORY_CAP` | `0.5` | Ceiling on a cell's accumulated history (`0` = uncapped). Guards the *productive*-churn regime — a fine-pitch BGA escape field, where 15 rips converge, must not wall itself off. |
+| `KICAD_HISTORY_ESCALATE` | `0` (flat) | Repeat-contest multiplier: when > 0, re-charging a cell adds `max(inc, escalate × accumulated)` — 1.0 doubles per repeat; `0` = flat accumulation |
+| `KICAD_HISTORY_RIP_WEIGHT` | `1.0` | Whole-footprint rip stamp weight |
+| `KICAD_HISTORY_RADIUS` | `0.25` mm | Added to the copper half-width when a rip stamps |
+| `KICAD_HISTORY_BLOCKED_WEIGHT` | `0.25` | Raw-frontier weight |
+| `KICAD_HISTORY_MAX_CELLS` | `500000` | Growth guard bounding the per-prepare merge: past this, each event **evicts the lowest-weight cells** to make room (chronological refusal would unprice the endgame conflicts — the ones completion is measured on). Evictions are disclosed in the run summary along with the field's size and upkeep time. |
+
+**Cost.** The event path is cheap (a rip stamps its corridor by vectorized
+linspace sampling at half-radius spacing, and the sorted field takes new cells
+by merge-insert, so an event is O(field), not O(field·log field) — ~14 ms at a
+pathological 2 M-cell field, well under 1 ms at realistic sizes). What you
+actually pay is the per-prepare composition, which now vstacks one more source:
+measured against a 200 k-row baseline of existing sources, +2.5 ms/prepare at a
+50 k-cell field and +8.7 ms at 200 k. The run summary prints the field's event
+count, cell count, peak, and upkeep time so an A/B can see both sides.
+
+Distinct from the ripped-route ghosts above in the two ways that matter: those
+are per-NET and are **deleted** when the victim reroutes (C1); this is
+per-CELL and survives for the whole call. Scope is one routing call (fresh at
+batch start, like congestion v2's bins); cross-step persistence is a v2
+question. No decay — decay is an FPGA-ism for hundred-iteration convergence.
+There is no CLI flag or GUI control: both fronts read the env knobs through the
+shared engine, so the default reaches them identically. The win is
+concentrated on congested boards (a pre-registered sets 21-27 confirmation
+did not clear its own bar), so read a contradicting corpus result as
+informative; the evidence is in `py_router/history_congestion.py`'s
+docstring.
+
+#### Composition: how multiple sources combine (`KICAD_PROXIMITY_SUM`)
+
+Every source above is deduped WITHIN itself (per net per category: a net's six
+connector stubs, or one track's overlapping sample disks, count once — cost
+never depends on sampling density). Across sources, per cell:
+
+- **unset (default): max.** Saturating — 30 overlapping stub fields cost the
+  same as one. (Briefly `zoned` by default; reverted after the sets-11-15
+  holdout showed it erasing gains on ordinary boards at real CPU cost —
+  the composition modes stay opt-in / retry-tier.)
+- **`1`/`sum`: sum.** Density gradient — corridors threading many nets' fields
+  price proportionally (glasgow A/B: 11 -> 4 failures). Steeper fields around
+  clustered pads (lpddr4 A/B: 6x search, one extra pad short). Those are
+  single boards: on the corpus `sum` alone measured negative (#584: +10), and
+  `sum` with `track_proximity_cost` 0.5 at heuristic weight 2.3 was +419 DRC
+  (#586), so never combine it with track proximity.
+- **`zoned`: sum, except max inside BGA escape fields** (zone +
+  `bga_proximity_radius`), where stacked foreign fields price a net's
+  MANDATORY approach rather than an avoidable crowd. On boards with no BGA
+  it is exactly `sum`.
+- **`softcap`: the global blend `max + α·(sum − max)` per cell, everywhere**
+  (#584). `KICAD_PROXIMITY_SOFTCAP_ALPHA` sets α (default `0.3`): the
+  max-mode floor plus a fraction of the crowd pressure, so density still
+  repels but stacked fields on mandatory approaches can't explode. α=0
+  reproduces max, α=1 reproduces sum (both exactly, up to integer-cost
+  rounding). Implemented with the existing primitives — the stub map stamps
+  the `(1−α)`-scaled max-insert batch plus the `α`-scaled grouped sum; the
+  layer map blends both aggregates in one pass.
+
+Double-merge safety is structural in all modes: the layer-map write primitive
+is an idempotent max-insert over uniquely-composed rows (re-merging the same
+composition rewrites identical values), and the stub map is stamped once per
+cleared prepare cycle.
+
+#### Search-side (not stamps)
+
+`proximity_heuristic_factor` adds an estimated proximity cost
+per remaining step to the A* heuristic when a route's endpoints sit inside
+stub/BGA zones — a deliberate slight overestimate that trades exactness for
+search speed on proximity-heavy boards. The CLI and `batch_route` default is
+`0.02` (`routing_defaults.PROXIMITY_HEURISTIC_FACTOR`). The `GridRouteConfig`
+dataclass field itself defaults to `0.0`, so a config built field by field
+without it runs with the term off. `0` was briefly the default (1af3096), on
+a rescan that could not have measured it because `route.py` still passed
+`0.02`; once that drift was fixed connectivity fell, and `0.02` was restored
+(e9523f23). `0.01` and `0.04` also measured worse, on the same five-board
+probe (boards picked because they had regressed); `0.02` is sized, not tuned
+on the corpus.
+
+### Layer preferences and alignment
+
+| Field | Default | Meaning |
+|-------|---------|---------|
+| `layer_costs` | `[]` | Per-layer cost multipliers (1.0 = neutral), parallel to `layers`; a negative entry (`FORBIDDEN_LAYER_COST`, -1) makes that layer an obstacle that takes no track but that through-vias may span. A layer the list does not cover is 1.0 |
+| `direction_preference_cost` | `250` | Penalty for off-direction moves; layers alternate H/V starting horizontal on top (0 = off). #663 moved it to 5 on a corpus screen whose image had no KiCad, so every oracle leg was a no-op; re-screened with KiCad live (sets 1-5, 75 boards/arm, one commit), incomplete nets / real DRC were 5 → 95/58, 25 → 116/57, 50 → 117/62, 250 → 89/43, and 250 was restored (aaa60331). 25 and 50 are worse than either end, so do not split the difference without measuring. Much higher values (e.g. 5000 = 5x a move) enforce strict human-style lanes but make dense boards' short diagonal hops unroutable (sets 6-11 A/B: +104 incomplete nets). The oracle-weld and plane sub-configs never receive this parameter and run at `GridRouteConfig`'s own default, which is the same 250 |
+| `vertical_attraction_radius` | `1.0` | Radius for cross-layer alignment bonus (0 = off) |
+| `vertical_attraction_cost` | `0.0` | Bonus (negative cost) for vertically aligned positions (**0 = off by default**). NET-AGNOSTIC (soft-knobs C4): the per-cell layer bitmask carries no net id, so it pulls toward ANY other net's tracks on other layers; suppressed inside stub-proximity cells and BGA zones; capped so a step can never go free |
+
+### BGA zones
+
+| Field | Default | Meaning |
+|-------|---------|---------|
+| `bga_exclusion_zones` | `[]` | `(min_x, min_y, max_x, max_y[, edge_tolerance])` regions blocking vias; from `auto_detect_bga_exclusion_zones` |
+
+### Impedance and per-net widths
+
+| Field | Default | Meaning |
+|-------|---------|---------|
+| `impedance_target` | `None` | Target Z0 in Ω; when set, per-layer widths come from `layer_widths` |
+| `layer_widths` | `{}` | Layer name → width (filled by `impedance.calculate_layer_widths_for_impedance`) |
+| `pair_layer_gaps` | `{}` | #1747: layer name → P/N gap where it differs from `diff_pair_gap`. Set only on the config of a diff pair narrowed to fit (#1742): a narrowed layer takes the gap that holds the impedance target at the narrowed width (`impedance.differential_gap_for_impedance`), floored at the pair's own clearance floor. `layer_pair_spacing` reads it |
+| `coplanar_gap` | `0.0` | #486 **declaration**: design gap (mm) from a controlled-impedance trace's edge to the same-layer ground pour. `> 0` means outer-layer widths came from the coplanar-waveguide-over-ground model rather than microstrip. Set from `route.py --coplanar-gap` / `route_diff.py --coplanar-gap` |
+| `coplanar_net_ids` | `set()` | #486: net ids the coplanar declaration applies to. **Empty with a non-zero `coplanar_gap` means the whole call is coplanar**, and `layer_widths` already holds the CPW widths. Non-empty means only these nets are, and their widths live in `coplanar_layer_widths` |
+| `coplanar_layer_widths` | `{}` | #486: layer name → CPW-derived width, used only for `coplanar_net_ids`. Lets one call mix coplanar and microstrip nets |
+| `reserve_layer_widths` | `False` | Obstacle-stamp reserve policy (#156): `False` = stamps reserve nominal `track_width`, wide/impedance nets ride per-net fractional `track_margin`; `True` (diff engine) = stamps bake the full per-layer width |
+| `stamp_pads_at_call_width` | `False` | On a `reserve_layer_widths` map, stamp pads and the board edge at the call's `track_width` anyway (#1736). Set only on the hybrid escape's leg fallback map, used when no leg attaches on the layer-width stamps; the assembled route's foreign-copper gate grades the legs at their real width |
+| `power_net_widths` | `{}` | net_id → width override for power nets (never below `track_width`) |
+| `net_track_widths` | `{}` | net_id → the net's OWN netclass width (mm, #435), used EXACTLY (may be *narrower* than `track_width`); auto-read from the `.kicad_pro` only when `--track-width` is omitted AND no `--impedance` is set (impedance-solved widths would be overridden otherwise, #610), floored at the fab minimum by the caller. Lower priority than a manual `power_net_widths` override |
+| `net_layer_widths` | `{}` | Per-net per-layer widths reapplied from stored `.kicad_pro` impedance declarations on a redo (#521); outranks the netclass scalar |
+| `netclass_width_floors` | `{}` | net_id → netclass-declared width (mm) as an **escalation floor** only: loaded even when an explicit `--track-width` suppresses `net_track_widths`, so the rescue/terminal ladders may narrow a stuck net down to min(nominal, fab track floor, its netclass width) — designer-sanctioned geometry — without changing nominal routing. Clamped at the advanced-tier fab floor at load |
+| `net_clearances` | `{}` | net_id → netclass clearance (mm, #326): each net's own copper is stamped as an obstacle at `max(clearance, its value)` so same-run nets keep the class spacing to it; `get_net_clearance(net_id)` resolves it (never below `clearance`) |
+
+### Differential pairs
+
+| Field | Default | Meaning |
+|-------|---------|---------|
+| `diff_pair_gap` | `0.101` | P-to-N edge-to-edge gap (center-to-center = `track_width + gap`) |
+| `diff_pair_centerline_setback` | `None` | Distance in front of stubs to start the centerline (None = 2 × spacing) |
+| `min_turning_radius` | `0.2` | Minimum turning radius for pose-based diff routing |
+| `max_setback_angle` | `45.0` | Max angle when searching setback positions |
+| `max_turn_angle` | `180.0` | Cumulative turn limit before reset (prevents U-turns) |
+| `gnd_via_enabled` | `True` | Place GND return vias next to diff-pair signal vias |
+| `diff_pair_intra_match` | `False` | Meander the shorter of P/N to match lengths within the pair |
+| `intra_pair_tolerances` | `None` | `{P net id: mm}`, set by the diff-pair engine (#1503): the pairs matched P to N this run and the skew each is matched to -- a `.kicad_dru` P/N skew rule's max, the explicit override, else `length_match_tolerance` |
+| `intra_pair_lanes` | `None` | `{net_id: 'auto' or (pad, pad)}` for both members of each pair matched, recorded and graded on its **lane**, the copper path between two pads, instead of total copper (#1869, `intra_pair_lane.resolve` from `route_diff.py --diff-pair-intra-lane` / the GUI's Intra-pair lane field; `intra_pair_lane.settle` keeps only pairs the step intra-matches that no `.kicad_dru` skew rule binds, and `resolve_auto` turns `'auto'` into the two terminals the pair step routed). `intra_pair_lane.member_lengths` / `pair_skew` read it for the matcher; the pads are recorded with the pair's tolerance and `check_drc` grades the recorded tolerance between them. `None`: total copper, KiCad's measure |
+| `skew_graded_net_ids` | `frozenset()` | Set by the diff-pair engine: P and N of every pair in `intra_pair_tolerances`. With the length-match members `run_length_matching` records, the nets the post-route cleanup gives a via-centre bridge (#1583, `pcb_modification.length_graded_net_ids`) |
+| `ac_couple_match` | `False` | End-to-end length-match AC-coupled pairs split by series caps: concatenated P vs N path (#196) |
+| `diff_chamfer_extra` | `1.5` | Meander chamfer multiplier for pairs (avoids P/N crossings) |
+| `diff_pair_hybrid_escape` | `True` | When a coupled pair's terminal connector can't clear foreign copper (#165 graze), keep the coupled middle and defer each terminal leg to a single-ended point-to-point join instead of failing the whole pair |
+| `diff_pair_setback_no_ladder` | `False` | When `True`, the setback ladder yields ONLY the configured setback (no 0.75/0.5/floor/1.5/2× expansion) — used by the pinch retry so each attempt routes at the exact setback asked |
+| `diff_pair_setback_floor` | `None` | The least setback from a terminal; `None` = `track_width/2 + clearance`, clear of the pad edge it launched from. A caller whose terminals are already coupled copper in open space (a whole-route plan's end connectors, awx) sets `0` to take over at the terminals themselves |
+| `diff_pair_uncouple_factor` | `6.0` | Multiples of pair spacing (`track_width + diff_pair_gap`); a multi-point terminal whose P/N pads are farther apart than this is treated as uncoupled and routed single-ended (#121) |
+
+### Length / time matching
+
+| Field | Default | Meaning |
+|-------|---------|---------|
+| `length_match_groups` | `[]` | Groups of net-name patterns to match |
+| `length_match_tolerance` | `0.1` | Allowed spread within a group (mm) |
+| `meander_amplitude` | `1.0` | Meander height |
+| `meander_spacing` | `2.0` | Centre-to-centre pitch of adjacent meander arms, in multiples of the net's routed track width (#501) |
+| `time_matching` | `False` | Match propagation delay instead of length |
+| `time_match_tolerance` | `1.0` | Allowed spread (picoseconds) |
+
+### Power tap neck-down
+
+| Field | Default | Meaning |
+|-------|---------|---------|
+| `power_tap_neckdown` | `True` | Retry failed wide power taps with a narrow neck from the pad |
+| `neckdown_length` | `2.5` | Length of the pad-entry zone at each pad end: the power width capped at the pad's short side where it fits, narrow only where it does not (#1318). Under `--escalation off` capped at `PAD_ENTRY_NECK_MM` less `neckdown_taper_length` (#1452) |
+| `neckdown_taper_length` | `0.5` | Taper from narrow to full width (0 = abrupt) |
+
+### Clearance details and DRC margins
+
+| Field | Default | Meaning |
+|-------|---------|---------|
+| `routing_clearance_margin` | `1.0` | Diff pairs only: multiplier on the track-to-via distance that sets the P/N via offset and the centerline's via keep-out (1.0 = exact DRC minimum). No single-ended obstacle reads it |
+| `hole_to_hole_clearance` | `0.20` | Drill-to-drill clearance, edge to edge (the CLIs pass the board's own `min_hole_to_hole`, else `routing_defaults.HOLE_TO_HOLE_CLEARANCE`, 0.20). Net-blind, like KiCad's `hole_to_hole` rule: a new via keeps it from vias of its OWN net too -- the same-net via rings are `max(via_size + clearance, (d1 + d2)/2 + hole_to_hole)` (#1070) |
+| `hole_clearance` | `0.0` | Copper-to-HOLE floor (KiCad's `min_hole_clearance`) — keeps TRACKS off an NPTH wall (never below `routing_defaults.NPTH_TO_TRACK_CLEARANCE`), and whenever a floor resolves above 0 also keeps VIA copper `max(clearance, floor)` off it (#1038). A net-less pad whose copper EQUALS its drill (a connector's unnamed locating peg, `kicad_parser.flush_drill_peg`) has no ring, so tracks and vias are held `max(clearance, floor)` off its hole, KiCad's rule, without the NPTH fab floor; a floor no higher than the clearance leaves the map unchanged (#1753). NOT the same rule as `hole_to_hole_clearance` (drill-to-drill). `0` = read the board's own constraint (`rules.min_hole_clearance` or `fab_floor_origin`; on a PCBData built from pcbnew the rule is the live board's in-memory value, `obstacle_map.declared_hole_clearance`); the track keep-out then falls back to `NPTH_TO_TRACK_CLEARANCE`, the via keep-out to none. The project is re-read whenever it changes, so a long-lived process (the GUI) never keeps a superseded value. route.py's DRC writeback writes `min_hole_clearance` into each route step's output project, so every chain step after the first resolves a floor |
+| `board_edge_clearance` | `0.0` | Clearance from board edge (0 = use `clearance`). With a `.kicad_dru` `edge_clearance` rule binding copper (#1678) it is the strictest floor of any net, for every one-number reader |
+| `edge_floors` | `None` | #1678: `design_rules.EdgeFloors`, each net's edge floor under the board's `.kicad_dru`, installed engine-side by `install_design_rules`. `None` = no rule moves a floor. No CLI flag and no GUI control |
+| `board_edge_declared` | `None` | #1678: what `board_edge_clearance` was before a rule moved it, which the DRC writeback records |
+| `edge_extra_clearance` | `0.0` | #1678: what a map's edge band adds for geometry offset from the routed centreline (a diff pair's members, `net_keepouts.centerline_config`; per layer when the members' half-pitch differs by layer, #1729) |
+| `pour_barriers` | `[]` | #1260: the fill islands of out-of-scope zone nets this run could only cut, `[{net, layer, polygons, clearance}]`, installed by `pour_guard.install_pour_barriers` and stamped by `build_base_obstacle_map` as track and via keep-outs (see "Pour guard (#1260)" above). Engine-computed and inherited by nested sub-runs; no CLI flag and no GUI control (`KICAD_POUR_GUARD=0` reverts). Empty = inert |
+| `same_net_pad_clearance` | `-1.0` | #581: edge-to-edge clearance between **every placed via** and **same-net SMD pads**. `> 0` forbids via-in-pad globally (routing/tap/rescue via placement blocks same-net SMD pads at this clearance; pad-centre swap vias are declined; the #189 in-pad rescue is disabled; the sub-grid via nudge honors it; BGA under-pad escapes run dog-bone, QFN refuses via-in-pad). #962: `> 0` also keeps vias out of the net's solder-paste OPENINGS at the same clearance -- graphic and paste-only openings, and pad openings larger than their pad -- in the routing, plane-via, nudge and seal-hint paths (the fanouts keep their own via-in-pad rules). `-1` **and** `0` preserve pre-#581 behavior exactly (0 keeps only its legacy meaning where `route_planes` passes it explicitly into its stitching via maps). Set from `--same-net-pad-clearance` (planes/route/route_diff/fanout/repair) or auto-read from the persisted `.kicad_pro` record (`kicad_routing_tools.same_net_pad_clearance`); an active flag value is persisted so later chain steps inherit it |
+| `net_clearances` | `{}` | `{net_id: class_clearance_mm}` — per-net **net-class** clearance for KiCad's cross-class rule (see below) |
+| `net_clearance_floor` | `None` | Routing-side floor (max class clearance among the nets being routed this call); set by `set_net_clearances()` |
+| `layer_clearances` | `{}` | `{layer_name: mm}` — per-layer clearance from the board's `.kicad_dru` custom rules (#498). **Replacement** semantics, mirroring KiCad's precedence: on a ruled layer the value replaces the net/class-resolved pair clearance for every pair there (it may tighten *or* relax); unruled layers keep the normal resolution. Auto-read engine-side from the sibling `.kicad_dru` by **every routing step** — `batch_route`/`batch_route_diff_pairs`, plane create/repair, BGA/QFN fanout, oracle sub-routes (`kicad_dru.install_layer_clearances`, fab-floor pinned; path discovery via `PCBData.source_path` where the engine signature has no `input_file`) — there is deliberately **no CLI flag and no GUI control**; the rules file is the single source of truth and `check_drc`/staged kicad-cli grade from the same file. Resolve via `layer_clearance(layer, fallback)`; stack-spanning pairs (via barrels) use `stack_clearance(fallback)` = max over the rules and the fallback. Empty map = byte-identical to no rules |
+| `board_copper_layers` | `[]` | The BOARD's copper layer list the `layer_clearances` map was expanded over, recorded by `kicad_dru.install_layer_clearances`. `pad_pair_clearance` resolves a `*.Cu` pad's shared layers over it, as `check_drc` does (a pad on an unrouted, unruled inner layer keeps its class value); `layers` stands in when it is empty |
+| `track_clearances` | `{}` | `{net_id: mm}` — the track-to-track channel (#735): the effective per-obstacle map computed from the board's `.kicad_dru` TRACK-scoped rules (`A.NetClass=='X' && B.NetClass!='X' && A.Type=='track' && B.Type=='track'`) over THIS call's routed set. Applied by `track_obstacle_clearance(net_id, resolved)` — never to copper graphic (`graphic=True`, #1931: KiCad types it `Graphic`, not a track) — **raise-only** over the fully-resolved pair value, seg-vs-seg obstacle expansion only (pads/vias exempt), per-layer like every segment stamp. Auto-read engine-side (`kicad_dru.install_track_clearances`, same no-flag convention as `layer_clearances`); an explicit dict (tests/GUI) wins and stops the auto-read. Empty map short-circuits to byte-identical behavior. The PLACEMENT side reads the same rules pair-EXACTLY rather than through this map (`kicad_dru.track_pair_clearance`, the resolver `check_drc` and `placement/fanout_clearance`'s connector gate both call since #735); `kicad_dru.board_track_rules(pcb_data)` is the quiet reader for an engine that has no `GridRouteConfig`. A "keep pairs apart" rule (`!AB.isCoupledDiffPair()`, #1295) and a rule's `(layer ...)` clause are read too; this map prices both on every net and layer they could bind (see below) |
+| `track_partner_clearances` | `{}` | `{frozenset({P, N}): mm}` -- with a "keep pairs apart" track rule (#1295), the pair-exact track-rule value of every diff pair KiCad couples by name (`kicad_dru.coupled_net_pairs`), which `pair_clearance(P, N, kind='track')` reads instead of `track_clearances` (that map raises the partner too). Engine-computed by `kicad_dru.install_track_clearances`; empty on its explicit-dict path (a nested sub-run) and on a board without such a rule, where it is inert |
+| `scoped_clearance` | `None` | The class/type-scoped channel (#1491): a `kicad_dru.ScopedClearanceInstall` over the board's `.kicad_dru` clearance rules whose condition reads only `NetClass`, `Type`, `Pad_Type`, `Via_Type`, `NetName` (#1528, compared as KiCad compares it: case-insensitive, a literal with `*`/`?` a wildcard) and `hasNetclass`/`hasExactNetclass` (joined by `&&`, `\|\|`, `!`; not the #735 track shape; with or without a copper `(layer ...)` clause -- #1897: a rule with one binds on the layers it names only, where it is one more entry of the pair's layer map (`ScopedClearanceRules.resolve_pair`, `kicad_dru.RuledLayers`), last match by file order against the layer's own #498 rule and a scoped rule with no clause; a track or pad on that layer is stamped through `layer_clearance(layer, value, net_id)` / `ScopedClearanceInstall.stamp_layered`, a via at the max over the stack; measured on kicad-cli 10.0.8: it binds track/track and via/track on its layer and via/via; a "keep pairs apart" condition, `... && !A.isCoupledDiffPair()`, is read without that term and binds every pair that reads so except a pair's own P and N -- pair-exact in a verdict (`ScopedClearanceRules.partners`), while a shared obstacle stamp exempts no partner, since it serves the routed nets that are not), such as `A.NetClass == 'CSI' && B.NetClass == 'CSI'`, `A.NetClass == 'HS' && B.Type == 'Pad'` or `A.NetName == '/GND' && B.NetClass == 'HS'`. Matched pair-exact through `design_rules` (A/B commutative, the last matching rule wins, the rule REPLACES the class value, fab-floor pinned). A foreign obstacle is stamped at the max over THIS call's routed nets of (the rule's value where one binds, else the class value) -- `obstacle_clearance` for tracks/vias, `pad_obstacle_clearance(pad)` for pads, and `obstacle_clearance(net_id, graphic=True)` / `layer_clearance(..., graphic=True)` for copper graphic (a net tie's bridge, a tab, a board `gr_*`), which KiCad types `Graphic`: a rule on `B.Type == 'Track'` never binds it and one on `B.Type == 'Graphic'` does, measured on kicad-cli 10.0.6, and `check_drc` grades it so (#1931) -- so a tightening rule raises a stamp and a relaxing rule lowers one only when every routed net is in its scope (route that class in its own call); a net the run leaves open whose own requirement is lower than the shared stamps gets one whole-net retry at its own requirement (`net_rescue.own_requirement_retry`, #1618, which installs a `ScopedClearanceInstall` over that net alone); a relaxing rule another routed net held up is reported in `JSON_SUMMARY.design_rules.scoped_clearance.held_up` and on the console. `pair_clearance` reads it pair-exact, and so do the passes that move copper after routing (octolinear smoothing, graze re-bend, micro-shift, via nudge) and the terminal checks: the `single_ended_routing._seg_foreign_*_dist` / `_pt_foreign_pad_dist` helpers fold the rule by item type when given the `config` (#1561). Installed by `kicad_dru.install_track_clearances` on BOTH its paths (route, route_diff, plane create/repair, oracle sub-routes -- the oracle installs it whenever the rules source carries such a rule -- and the QFN and BGA fanouts through `kicad_dru.install_pair_rule_channels`, #1565, whose `PairRuleVerdicts` prices the pairs a fanout tests itself: `pair_clearance` for the two items' types, then a track rule pair-exact). A nested sub-run (route.py's reconciliation laps, the in-run plane finalize and its reconnect sub-runs) is handed its parent's resolved rules as the internal `scoped_clearance_rules` kwarg (`install_track_clearances(..., scoped_rules=)`), re-bound by net NAME when its board numbers the nets differently (`ScopedClearanceRules.rebind`), because it routes the output file whose `.kicad_dru` is a carry, not the rules' source (#1602: the explicit-dict path used to leave the channel off, and a reconciliation lap shipped copper the main pass had refused). `None` on a board with no such rule, where it is inert. `check_drc` grades the same rules pair-exact. Against the layer channel the LATER rule in the file wins, per pair and layer (KiCad's last match), on both sides through one resolver: `ScopedClearanceRules.resolve_pair` (the scoped value and the layer rules after it) and `kicad_dru.apply_layer_rules`; a stamp site names its obstacle (`layer_clearance(layer, fallback, net_id)` / `pad=`, `stack_clearance(fallback, net_id)`) so the stamp is ordered the same way |
+| `coupled_pair_clearances` | `{}` | `{frozenset({P, N}): {'track': {layer: mm}, 'layer': {layer: mm}, 'stack': mm or None}}` — each diff pair's P<->N clearance where a rule binding the pair is what KiCad grades it at -- a `.kicad_dru` coupled-pair rule (`AB.isCoupledDiffPair()` ANDed into a clearance rule, #1293), the class's implicit "(diff pair)" rule (`diff_pair_gap` below the class clearance, #1542) or a class/type-scoped rule (#1526) -- by `pair_clearance` kind; a layer is listed only where that rule governs it. Engine-computed by `batch_route_diff_pairs` (`route_diff.coupled_pair_floors`), read first by `pair_clearance`; no CLI flag and no GUI control, the rules file is the source. Empty map is inert |
+| `area_clearance` | `None` | The board's clearance and track-width rules scoped by a rule area (#1843, `area_clearance.AreaClearance`), installed with `rules`. `build_base_obstacle_map`, `precompute_net_obstacles`, the stamp functions (`area_clearance.composed`) and the plane builders (`composed_builder`: the via map, the one-layer routing map, the plane connector map, and `precompute_via_placement_obstacles` that mirrors them) compose every keep-out over it: class values outside the areas, the rule's value inside, a ring and the laid copper touching a tightened area held at its value. The post-route passes and the terminal check read it through the distance helpers (`single_ended_routing._area_excess`) and `AreaClearance.pair_value`; the run's tracks are split at a tightened area's edge (`area_clearance.split_results` / `split_run_copper`, generic `split_segments_at_zones`), and necked to a room's track width where they need it (`area_clearance.narrow_tracks`, on the same split helpers). `tests/test_1843_area_paths.py` fails on a stamp path or a pass that does not read it, and on a track-width scan or shipped-width census that does not read a room's width (`area_clearance.room_width_test` / `is_room_neck`; the necks are disclosed by `neck_census` as `area_necks`). `None` (no such rule) leaves every stamp as it was. No CLI flag, no GUI control. |
+| `rules` | `None` | The board's design rules resolved in **KiCad's own order** (`design_rules.DesignRules`), which the three maps above are being migrated onto (#530). Installed engine-side by `kicad_dru.install_layer_clearances` for both fronts, from the sibling `.kicad_pro` + `.kicad_dru` (`DesignRules.from_project`) or the live board (`from_pcbnew`) — same no-flag convention as `layer_clearances`. Carries `board_min` (the board's `min_*` constraints), `classes`, per-net `memberships`, the parsed custom `rules`, and the active `fab_floor`. `floor(kind, net_id, layer, type=)` is the smallest value DRC accepts for a kind on that net/layer (fab floor applied, `None` when nothing declares one) and backs `config.size_floors(...)`; `draw_size(...)` is the size to DRAW (explicit CLI value, else resolved class/rule `opt`, clamped into `[min, max]`; `diff_pair=<pair name>` resolves a coupled-pair member, whose class track width is the class `diff_pair_width`, as KiCad's `inDiffPair` implicit rule has it). **`None` means "no rules declared" and every consumer must treat it as such** — a board with neither sibling still builds a table rather than inventing a Default class. The #498/#530 clearance caps reach `rules.min_clearance` ONLY (#900): the net classes keep the clearance the board was routed to. `rules.net_keepouts` holds the net-filtered keep-outs its `disallow` rules on named rule areas define (`net_keepouts.derive_area_keepouts`, run by `install_design_rules`; each honoured rule's `honoured` says what, and `unsupported()` stops listing it), which the engines attach to the board and stamp per bound net, and the TRACK BANS of its `disallow track` rules scoped without an area (#1527, `net_keepouts.derive_layer_bans`: `layer_ban` entries with no polygon), which the route entries honour by routing each bound net with those layers forbidden (`net_keepouts.config_for_nets`) and the stub-switch validators refuse (`forbidden_destination`). With no rule behind it, it also holds a via-only region over each copper pad of an edge-connector plug or card-edge fingers whose fingers stand at the outline, binding every net (#1116, `net_keepouts.derive_contact_fingers`: no via is drilled in a contact finger; `check_drc` grades the same regions). A scope-evaluable `disallow` rule any step does not honour (a `via` token; a track ban in a step that does not derive it) carries `router_unhonoured` and `unsupported()` lists it, while the resolver still evaluates it for check_drc |
+| `hole_rules` | `None` | The board's `.kicad_dru` `hole_clearance` rules as the route step reads them (`hole_rule_routing.RoutedHoleRules`, #1853), installed with `rules` by `design_rules.install_design_rules` on both fronts. `None` (no such rule) leaves every hole keep-out as it was. `via_value(via, layer, kind='track')` / `pad_value(pad, layer, kind='track')` give the value a hole is held at against another net's track (`kind='via'`: a new via's copper) on a layer; `config.via_hole_extra(clearance, other_via=None, pad=None)` is how far a new via's keep-out from another net's copper -- a track, or that pad or via read as the item it is -- grows past the ring-to-copper distance. `obstacle_map.stamp_hole_rule_pad_holes` holds copper off pad holes, for the base map and for the pads of the nets a step routes (the per-net cache and `add_net_pads_as_obstacles`). A generator that places off the obstacle map asks `check_drc.hole_rule_refusal(pcb_data, config.rules, segments, vias)` |
+
+#### Cross-class clearance (KiCad `max(classA, classB)`)
+
+KiCad's required spacing between two nets of **different** net classes is
+`max(classA, classB)`. The router honors this: every foreign obstacle — pre-placed
+copper **and** copper routed earlier in the same call (in-run) — is priced at
+`max(routing-side floor, that obstacle net's own class clearance)`. `config.clearance`
+remains the Default/routing-side clearance; `net_clearances` carries the non-Default
+classes. An **empty** map reproduces plain `config.clearance` behaviour exactly
+(byte-identical — the feature is inert until a map is supplied).
+
+```python
+from routing_config import GridRouteConfig
+config = GridRouteConfig(track_width=0.15, clearance=0.15)
+power_hi_net_id, sig_a, sig_b, some_default_net = 1, 2, 3, 4
+config.set_net_clearances({power_hi_net_id: 0.25}, routed_net_ids=[sig_a, sig_b])
+assert config.obstacle_clearance(power_hi_net_id) == 0.25   # max(floor 0.15, class 0.25)
+assert config.obstacle_clearance(some_default_net) == 0.15  # not in the map -> config.clearance
+```
+
+- `set_net_clearances(net_clearances, routed_net_ids)` installs the map and computes
+  `net_clearance_floor` (over the routed nets only, so a foreign class cannot inflate
+  the floor and over-block every routed net). `batch_route` / `batch_route_diff_pairs`
+  call it once per run.
+- `obstacle_clearance(net_id)` is the single accessor the base-map builder **and** every
+  incremental obstacle stamper read, so ADD and REMOVE derive an identical per-obstacle
+  clearance (ref-count symmetry).
+- The map is **auto-read** from the sibling `.kicad_pro` netclasses by `route.py` /
+  `route_diff.py` / the fanout and plane CLIs (and inside `batch_route` for any other
+  caller). Only non-Default classes appear, so an all-Default board yields `{}`.
+  A net's classes come from `netclass_assignments`, the `netclass_patterns` globs
+  and, on a KiCad 6 project (`net_settings` schema 0-2), its `classes[].nets`
+  lists (#1304), all through `design_rules.project_class_membership`. To override
+  the map, pass `--net-clearances FILE` to `route.py`, `route_diff.py`, or
+  `route_planes.py`. The JSON file maps net names to clearances in mm.
+  The GUI derives the same map from the live board, and the Advanced tab's **Net Clearances File** is
+  `--net-clearances` there: the Route, Differential and Planes tabs then use the
+  file's map instead, read through the same `list_nets.load_net_clearances`.
+- **`--clearance-ceiling` is a ceiling on the map (#439; its own flag since #530).** When
+  `--clearance-ceiling` is GIVEN, each auto-read class is capped at it
+  (`net_clearances[nid] = min(class, ceiling)`) before it is installed — a class
+  *tighter* than the ceiling survives; a *looser* one is capped, because stock net
+  classes are largely aspirational (real boards, and even the human-routed references,
+  route below them). The ceiling is first pinned up to the physical fab floor, as the
+  run's clearance is (`fab_tiers.enforce_fab_floors`; the GUI's `_class_ceiling`, #1691;
+  the placement step's `--clearance`, which is a ceiling too, #1699),
+  so it never lowers a class below that floor. The output `.kicad_pro` writeback then clamps every non-Default
+  class down to that same `min(class, ceiling)` (#1492: the ceiling, never the Default
+  class's routed value, which one descent on one Default net used to drag every class
+  down to), so KiCad grades exactly what was routed. An automatic clearance descent on
+  a class's OWN net lowers that class to it, records it under
+  `kicad_routing_tools.class_clearance_relaxed_classes` (`{class: {from, to, nets}}`,
+  the per-class twin of the Default class's `class_clearance_relaxed`), prints
+  `NET CLASS <name> CLEARANCE LOWERED BY A DESCENT`, and `check_complete
+  --authored-from` names it. When it is OMITTED
+  there is no ceiling: each net routes at its own class and the writeback preserves the
+  non-Default classes; `--clearance` then sets only the Default class for the run
+  (#530), and the writeback lowers the Default class to it when it is below (never
+  raises it). An
+  explicit `--net-clearances` map is used as given (not capped). In the GUI, the
+  **Clearance ceiling** checkbox (with the **Min Clearance** override) is the
+  "`--clearance-ceiling` given" signal.
+
+#### Pair clearance for admit/refuse verdicts (#1136)
+
+`obstacle_clearance` is the value a foreign obstacle is **stamped** at, floored at the
+widest class routed in the call so ADD and REMOVE stay symmetric. A **verdict** about two
+specific nets (may this stub sit here, may this via go there, does this P pinch its N)
+is graded by `check_drc` at the pair's own value instead, and these methods return it:
+
+- `pair_clearance(net_a, net_b, layer=None, *, kind='layer', base=None)` —
+  `max(base or clearance, class A, class B)`, then by `kind`: `'layer'` applies the
+  `.kicad_dru` rule for `layer` (replacement, as `check_drc`'s `_pair_cl`); `'track'`
+  additionally raises it by the #735 track rule (track vs track); `'stack'` is the max
+  over the layer rules (via vs via). Net-0 copper takes the widest track rule. A diff
+  pair's P against its own N, on a layer a coupled-pair rule governs
+  (`coupled_pair_clearances`, #1293), is that rule's value instead.
+- `pad_pair_clearance(pad, other_net, layer=None, *, other_pad=None, base=None, other_type=None)` — the
+  same against a pad: the layer rule on `layer` (a track), else the max over the copper
+  layers the two share (a via, or `other_pad`), then the pad / footprint override, which
+  replaces the value (`check_drc`'s `_pad_pair_cl`). `other_type` (`'track'` or `'via'`)
+  names the copper `other_net` lays, so a class/type-scoped rule for the other type does
+  not price it; omitted, the value is the max over both. route_diff's connector-graze
+  guard prices every foreign pad this way, with `other_type='track'` (#1574).
+  `pad_pair_clearance_before_override(...)` stops short of the override, for a site that
+  keeps its own override handling.
+- `max_pair_clearance(base=None)` — an upper bound over every pair: the radius a
+  prefilter must reach. `pair_clearance_inert()` is True when no class map, layer rule,
+  track rule or coupled-pair rule is installed, so a hot loop can keep its flat term.
+- `net_clearances_by_name(nets)` — the class map keyed by net NAME, for a consumer that
+  re-parses a board whose net ids may differ (the KiCad oracle; on the GUI path its
+  board is a pcbnew save that numbers nets afresh, #1133/#1137).
+
+With nothing declared every method hands back the floor it was given, so a site that
+swaps its flat `config.clearance` for one of them is byte-identical on such a board.
+`tests/test_1136_pair_clearance_parity.py` holds them to `check_drc` itself.
+
+A diff pair's own P/N spacing is such a verdict too. `batch_route_diff_pairs` raises
+the coupling gap to the clearance (#441), the pair's class (#530) and the widest
+`.kicad_dru` rule that binds the pair on a layer it may route on (#1145,
+`kicad_dru.pair_gap_rule_floor`: a layer rule, or a track rule read pair-exactly).
+It raises the gap before the `--impedance` solve and again per pair, and never
+lowers it. The P/N self-checks, the #318 neck and the intra-pair meander price the
+partner at `pair_clearance(P, N, layer)`.
+
+The one exception is a pair a **coupled-pair rule** grades (#1293): a `.kicad_dru`
+clearance rule whose condition ANDs in `AB.isCoupledDiffPair()`, such as
+`AB.isCoupledDiffPair() && A.hasNetclass('USB')` (the predicate reads the pair, so `A.` and
+`B.isCoupledDiffPair()` are the same term, #1874), which is how KiCad lets a pair couple
+tighter than the clearance everything else keeps. Where that rule is the one KiCad
+grades the pair's P against its N at on every layer the pair may route on
+(`DesignRules.coupled_pair_clearance`: the last matching rule, conditions tried in both
+orders as KiCad does), the pair's gap is the gap asked for floored at that rule alone,
+not at #441 / #530 / #1145 (`route_diff.coupled_pair_floors`). The engine installs the
+governed layers as `coupled_pair_clearances` (`{frozenset({P, N}): {'track': {layer:
+mm}, 'layer': {layer: mm}, 'stack': mm}}`), which `pair_clearance` reads first;
+`check_drc` grades the pair at the same value per item type; and the DRC writeback
+caps `rules.min_clearance` at the rule (`kicad_dru.min_rule_clearance`), because KiCad
+grades a pair's gap at max(that minimum, the class `diff_pair_gap`).
+
+Two more rules bind P against its own N and take the same path:
+
+- **The net class's own pair gap (#1542).** When a class has `0 < diff_pair_gap <
+  clearance`, KiCad adds an implicit rule, reported as `netclass '<class>' (diff
+  pair)`: the P and N of a pair in that class (the names `MatchDpSuffix` couples) are
+  graded against each other at the class gap, on every item kind, after the class
+  clearance and before every `.kicad_dru` rule, floored at the board minimum clearance.
+  A class that sets no gap of its own takes Default's. `DesignRules` models it
+  (`pair_gap_clearance`), so `coupled_pair_clearance`, `check_drc` (and through it
+  `board_score` / `check_complete`) and `route_diff` read it with no rules file at all.
+- **A class/type-scoped rule that binds the pair (#1526)**, e.g. `A.NetClass == 'CSI'
+  && B.NetClass == 'CSI'`: it replaces the class value for P against N too, so where it
+  is what KiCad grades the pair's tracks at on every routable layer, it floors the gap
+  alone. KiCad's coupling check still grades the gap itself at the board minimum
+  clearance (the `diff_pair_gap` minimum), which an explicit clearance rule does not
+  lower, so such a pair's gap is floored at that minimum too.
+
+Under any of these rules the hybrid escape's single-ended pieces keep the rule as the
+coupled middle does: a terminal leg (`_route_hybrid_leg`) stamps the partner's copper
+at the rule rather than at the partner's class clearance, so a leg can reach its own
+middle end laid at the rule's gap; where legs or a #444 seam re-ask run alongside the
+partner at a grid pitch above the routed gap, `pull_to_pair_gap` lays them at the gap
+(a 0.1 mm gap is not a grid pitch on a 0.1 mm grid, and such copper read uncoupled);
+and a layer combination whose coupled middle crossed its own partner's pad is retried
+with that end's launch a step further in (`LAUNCH_RETRIES_PARTNER_PAD`), because the
+narrower pair's launch swath can clear between its own two pads. With no such rule all
+three are inert.
+
+The negated form is KiCad's **"keep pairs apart"** rule (#1295), e.g. `A.NetClass ==
+'100Ohm-diff' && !AB.isCoupledDiffPair() && A.Type == 'Track' && B.Type == 'Track'`: a
+class member's track keeps the rule's clearance from every other track except its own
+partner. It is a track rule (`kicad_dru.TrackRule`, `except_coupled=True`), and so may
+carry a `(layer ...)` clause (`layer_clause`). The partner is decided on the NAMES by
+KiCad's `MatchDpSuffix` (`kicad_dru.nets_coupled`): a pair this tool detects under
+another convention (`_DP`/`_DM`) is no pair to KiCad, and the rule binds it. The
+per-net `track_clearances` map cannot exempt one net for one other, so it prices the
+partner too and ignores the layer clause (it over-blocks, never under-blocks); the
+pair-exact readers -- `check_drc`, `placement/fanout_clearance`'s connector gate, #1145's
+`pair_gap_rule_floor`, and `pair_clearance(P, N, kind='track')` through
+`track_partner_clearances` -- apply both. A nested sub-run handed its parent's map has no
+partner map and prices P<->N at the per-net value.
+
+The same negation on a rule the scoped channel reads (#1897), e.g.
+`A.hasNetclass('BUS') && B.hasNetclass('BUS') && !A.isCoupledDiffPair()`, with or
+without a `(layer ...)` clause, binds every item kind: it is read without the coupled
+term and binds every pair of items that reads so except a pair's own P and N (named by
+`MatchDpSuffix`). Every verdict about two nets applies it pair-exact
+(`ScopedClearanceRules.partners`: `check_drc`, the placement model, the fan-out
+verdicts); a shared obstacle stamp exempts no partner, since it serves the routed nets
+that are not partners, so a pair routed single-ended is held off its own partner at the
+rule (conservative, never under-blocks). KiCad's documented example of the shape,
+`A.inDiffPair('*') && !AB.isCoupledDiffPair()`, is in neither channel -- `inDiffPair`
+is outside the scoped subset -- so no step routes to it and `check_drc` lists it
+`NOT GRADED`.
+
+`A.inDiffPair('pattern')` is
+evaluated by the resolver as KiCad's `inDiffPairFunc`, so a layer-scoped `track_width`
+rule conditioned on it sets the pair's per-layer width; no consumer reads a
+`.kicad_dru` `diff_pair_gap` rule yet, whatever its condition.
+
+```python
+from routing_config import GridRouteConfig
+config = GridRouteConfig(clearance=0.2)
+config.set_net_clearances({1: 0.4}, routed_net_ids=[1, 2, 3])
+assert config.obstacle_clearance(3) == 0.4     # the stamp: floored at the routed 0.4
+assert config.pair_clearance(2, 3) == 0.2      # the verdict: two Default nets
+assert config.pair_clearance(1, 3) == 0.4      # max(class A, class B)
+config.layer_clearances = {'F.Cu': 0.3}
+assert config.pair_clearance(1, 3, 'F.Cu') == 0.3              # the rule replaces it
+assert config.pair_clearance(1, 3, kind='stack') == 0.4        # via-via: max over the stack
+```
+
+### Strategies and recovery
+
+| Field | Default | Meaning |
+|-------|---------|---------|
+| `max_rip_up_count` | `3` | Max blocking routes ripped up at once (progressive 1..N) |
+| `ripup_abandon_metric` | `'stranded'` | Keep-retry vs abandon rule for multipoint tap rip-ups (see [rip-up-reroute.md](rip-up-reroute.md#abandon-metrics)) |
+| `ripup_blocker_select` | `'count'` | Blocker-ordering algorithm for the rip-up ladder: `'count'`, `'near-target'`, `'bidir'`, `'mincut'`, `'cost'` (`'cost'` ranks by weighted count / (sqrt(pads) x sqrt(span)), so the cheapest net is ripped first; see [rip-up-reroute.md](rip-up-reroute.md#blocker-selection-algorithms)) |
+| `stub_layer_swap` | `True` | Allow moving stubs to other layers to resolve conflicts (never moves an SMD pad's stub off the one layer that pad lives on — that would orphan the pad) |
+| `target_swap_crossing_penalty` | `1000.0` | Penalty for crossing assignments during target swap |
+| `crossing_layer_check` | `True` | Only count crossings between routes sharing a layer |
+| `quick` | `0` | `--quick LEVEL` on `route.py` / `route_diff.py`. `0` routes to ship. `1`, a placement review's first round: `route.py` skips its recovery tail (net rescue, terminal escalation, plane finalize, reconciliation laps). `2`, the seed judge: also skips every pass that only polishes copper for shipping; the engines read it from here (`cleanup_pipeline`'s graze, cycle, neck and smoothing passes, the seam re-asks, the plane-fragility field), so both fronts see one value. The board is a diagnosis, not one to ship |
+
+### Bus routing
+
+| Field | Default | Meaning |
+|-------|---------|---------|
+| `bus_enabled` | `False` | Detect and route bus groups together |
+| `bus_detection_radius` | `5.0` | Max endpoint spread to form a bus |
+| `bus_min_nets` | `2` | Minimum nets per bus |
+| `bus_attraction_radius` | `5.0` | Attraction radius from the neighbor's track |
+| `bus_attraction_bonus` | `5000` | Cost bonus for hugging the neighbor (cost units) |
+
+### Guide corridor and keepouts
+
+| Field | Default | Meaning |
+|-------|---------|---------|
+| `guide_corridor_enabled` | `False` | Follow a user-drawn polyline as waypoints |
+| `guide_corridor_layer` | `'User.1'` | Layer the guide is drawn on |
+| `guide_corridor_spacing` | `0.0` | Waypoint subdivision spacing (0 = endpoints only) |
+| `corridor_waypoints` | `[]` | Prebuilt grid `(gx, gy)` waypoints the router threads in order; set programmatically as an alternative to a drawn guide |
+| `keepout_enabled` | `False` | Honor a user-drawn keepout polygon |
+| `keepout_layer` | `'User.2'` | Layer the keepout is drawn on |
+
+### Debug and output
+
+| Field | Default | Meaning |
+|-------|---------|---------|
+| `debug_lines` | `False` | Emit debug geometry on User layers |
+| `verbose` | `False` | Detailed diagnostics |
+| `debug_memory` | `False` | Print memory statistics |
+| `collect_stats` | `False` | Collect A* statistics |
+| `add_teardrops` | `False` | Add teardrop settings to all pads and vias in the output |
+| `proximity_heuristic_factor` | `0.0` | Tightens the A* heuristic for proximity costs. `0.0` is the dataclass default only; the CLI and `batch_route` pass `0.02`, the measured value (see "Search-side" above) |
+
+### Methods
+
+```python
+config.get_track_width(layer) -> float
+```
+Layer-aware width: `layer_widths[layer]` if impedance-controlled, else
+`track_width`.
+
+```python
+config.get_net_track_width(net_id, layer) -> float
+```
+Net- and layer-aware width. Priority: `power_net_widths[net_id]` (floored up to
+`track_width`) → `net_layer_widths[net_id][layer]` (a stored impedance
+declaration reapplied, #521) → `net_track_widths[net_id]` (the net's own class
+width, used exactly, #435) → `coplanar_layer_widths[layer]` when `net_id` is in
+`coplanar_net_ids` (#486) → `layer_widths[layer]` → `track_width`. This is what
+obstacle expansion uses.
+
+**The coplanar rung is a declaration, not a measurement.** At route time the
+pour does not exist yet, so `coplanar_gap` states what the plane step is going
+to do. Pour with a matching `route_planes --zone-clearance`, then verify the
+geometry actually came out that way with
+`check_impedance.py --coplanar-gap <same value>`. Nothing in the router enforces
+the gap — a coplanar-declared net whose pour never arrives is simply routed at a
+width that assumes a ground it does not have.
+
+```python
+config.get_max_track_width() -> float
+```
+Maximum width across layers (for worst-case via clearance).
+
+```python
+config.route_reserve_width(layer) -> float
+```
+Routing-side width the obstacle stamps reserve for the *future* routed track
+(#156). With `reserve_layer_widths=False` (single-ended engine, the default)
+this is the nominal `track_width` (floored to a narrower impedance layer
+width), and any net routing wider — power override or impedance layer width —
+covers its extra half-width through its own fractional `track_margin`. With
+`reserve_layer_widths=True` (the diff-pair engine) it is the full
+`get_track_width(layer)`, baked mm-exact into the maps. Track margins are
+always computed against this value, so stamps and margins cannot drift.
+
+The baking covers track and via stamps. Pads, the board edge and keep-outs
+stamp the call's `track_width`, so a pair's single-ended member fallback, which
+needs them priced for its layer width, routes with
+`reserve_layer_widths=False` on a map of its own (#1679); a member that
+necks there ships under its layer width and gets one `design_rules` row
+(`diff_pair_custody.disclose_member_fallback_widths`). A member routed coupled
+is graded the same way on the copper it ships, against `get_track_width(layer)`
+on the pair's own config, the connectors drawn at that config's `track_width`
+counted as delivered (`disclose_coupled_pair_widths`, #1725); both call
+`disclose_pair_widths`. A hole keep-out reads
+the reserve per layer, and on a pair's centreline map also reaches the member's
+far edge, because a neck does not look at holes (#1687).
+
+```python
+config.track_margins_for_net(net_id) -> List[float]   # grid cells, per layer
+config.track_margins_for_width(width) -> List[float]  # for a uniform width
+config.base_track_margins() -> List[float]            # each layer's own base width
+```
+Per-layer **fractional** A* track margins (#156): the exact extra half-width
+over `route_reserve_width(layer)`, in grid cells — no ceil, no `+1` (the Rust
+swept-capsule `segment_blocked` covers diagonals precisely). Passed to
+`route_multi` / `route_with_frontier`, which accept a float or a per-layer
+`list[float]`.
+
+```python
+config.net_via(net_id) -> Tuple[float, float]
+```
+The `(diameter, drill)` this net's vias are drawn at: its `net_via_sizes`
+entry, else the call's `via_size` / `via_drill`.
+
+```python
+config.rule_floors(net_id, layer=None) -> Dict[str, float]
+config.track_floor(net_id, layer, fab_value) -> float
+```
+The size floors a descent (rescue, terminal escalation) may not cross on this
+net. `rule_floors` always carries the net's own non-Default class clearance
+(KiCad grades the net at it whatever the run narrowed to), and, except under
+`--escalation fab` (which may go below them), the `.kicad_dru` / Board Setup
+minimums that bind the net (`track_width`, `via_diameter`, `via_drill`, in `fab_tiers` floor
+keys). `track_floor` is the fab floor raised to the net's `track_width` floor.
+
+```python
+config.get_net_clearance(net_id) -> float
+```
+The clearance this net's own copper is stamped at (#326): its class clearance
+when above `clearance`, else `clearance`.
+
+```python
+config.get_layer_costs() -> List[int]            # ×1000 for the Rust router; -1 stays -1
+config.layer_costs_for(layers) -> List[int]      # the same costs aligned to another layer list BY NAME
+config.get_layer_direction_preferences() -> List[int]  # 0=H, 1=V, 255=none
+```
+`layer_costs_for` is for a router whose obstacle map indexes a different layer
+list than `layers` (#1185): each layer gets its own cost by name, a layer
+`layers` does not list gets 1.0x.
+
+```python
+config.routable_layers() -> List[str]
+```
+`layers` minus every FORBIDDEN (negative-cost) layer, in order: the layers a
+track may be placed on. A `--layers` subset run appends the board's other
+copper layers at cost -1 (obstacles that vias may span), so relocation, stub
+switching and layer swaps draw their candidate layers from here, never from
+`layers`; a swap whose destination is the other end's current layer is refused
+by the stub validators when that layer is forbidden. A layer `layer_costs`
+does not cover is routable, as `get_layer_costs` treats it.
+
+#### Cost scaling
+
+Cost knobs are calibrated at `REFERENCE_GRID_STEP` (0.1 mm) and rescaled so
+that the *cost per mm* is grid-independent:
+
+```python
+config.cell_cost(cost_mm) -> int        # per-cell costs (proximity penalties)
+config.scaled_cell_units(units) -> int  # raw per-cell knobs (bus bonus)
+config.via_cost_units() -> int          # per-via penalty in cost units
+config.via_proximity_cost_int() -> int  # via_proximity_cost for Rust: 0 stays 0, a fraction rounds up to 1
+config.get_proximity_heuristic_cost() -> int
+```
+
+You rarely call these yourself, but if you hand costs to the Rust router
+directly, use them rather than multiplying by 1000 manually.
+
+### Example
+
+```python
+from routing_config import GridRouteConfig
+
+config = GridRouteConfig(track_width=0.15, layers=['F.Cu', 'In1.Cu', 'B.Cu'])
+config.power_net_widths = {7: 0.8}                 # net 7 routes at 0.8mm
+config.layer_widths = {'F.Cu': 0.18, 'In1.Cu': 0.13, 'B.Cu': 0.18}
+
+print(config.get_net_track_width(7, 'F.Cu'))       # 0.8  (power override wins)
+print(config.get_net_track_width(3, 'In1.Cu'))     # 0.13 (impedance width)
+print(config.via_cost_units())                     # 75000 at 0.1mm grid (via_cost 75)
+```
+
+## `GridCoord`
+
+Converts between mm and integer grid coordinates. All routing decisions
+happen in integer grid space.
+
+```python
+from routing_config import GridCoord
+
+coord = GridCoord(grid_step=0.1)
+coord.to_grid(12.34, 56.78)      # (123, 568)  — rounds to nearest
+coord.to_float(123, 568)         # (12.3, 56.8)
+coord.to_grid_dist(0.25)         # 2  — floor: distances round down
+coord.to_grid_dist_safe(0.25)    # 3  — ceil: distances round up
+```
+
+Use `to_grid_dist_safe` for **blocking margins** (clearances): rounding a
+clearance down can produce hairline DRC violations after grid quantization.
+
+## `DiffPairNet`
+
+```python
+@dataclass
+class DiffPairNet:
+    base_name: str
+    p_net_id: Optional[int] = None
+    n_net_id: Optional[int] = None
+    p_net_name: Optional[str] = None
+    n_net_name: Optional[str] = None
+    polarity_swap_allowed: bool = False  # may P/N pad nets be swapped (#279)?
+
+    is_complete  # property: both net IDs present
+```
+
+`polarity_swap_allowed` is stamped by `batch_route_diff_pairs` from its
+`polarity_swap_nets` glob patterns (CLI `--polarity-swap-nets`); the default
+denies swaps for every pair.
+
+Produced by
+[`net_queries.find_differential_pairs`](api-net-analysis.md#find_differential_pairs)
+and consumed by the diff-pair routing loop.
+
+## `routing_utils.py`
+
+```python
+POSITION_DECIMALS   # = 3 (re-exported from kicad_parser)
+
+pos_key(x, y) -> Tuple[float, float]
+```
+Rounds a coordinate pair to `POSITION_DECIMALS` for use as a dict/set key.
+Use it on **both** sides of every position lookup.
+
+```python
+build_layer_map(layers) -> Dict[str, int]
+# ['F.Cu', 'In1.Cu', 'B.Cu'] -> {'F.Cu': 0, 'In1.Cu': 1, 'B.Cu': 2}
+```
+The layer-name → index mapping shared by the obstacle map and router.
+
+```python
+segment_length(seg: Segment) -> float
+```
+Euclidean length of one segment.
+
+```python
+iter_pad_blocked_cells(pad_gx, pad_gy, half_width, half_height,
+                       margin, grid_step,
+                       corner_radius=0.0, corner_buffer=None,
+                       off_x=0.0, off_y=0.0, rotation_deg=0.0)
+    # yields (gx, gy) grid cells
+pad_blocked_cells_array(...) -> np.ndarray   # vectorized twin, (N, 2) int32
+```
+Enumerate the grid cells a pad blocks (rounded-rect aware; `rotation_deg` is
+the pad's `rect_rotation` for a pad on a non-orthogonal angle), used by
+obstacle building and the DRC checker. The two variants produce bit-identical
+cell sets.
+
+```python
+segment_blocked_cells_array(x1, y1, x2, y2, margin, grid_step) -> np.ndarray  # (N, 2)
+segment_blocked_spans(x1, y1, x2, y2, margin, grid_step) -> np.ndarray        # (M, 3)
+```
+The cells whose centre lies within `margin` of the true float segment (a
+capsule). The span form `(gx, gy_lo, gy_hi)` covers exactly the same cells in
+less memory and is what stamps into the obstacle map.
+
+```python
+point_in_pad_rect(x, y, pad, margin=0.0) -> bool
+point_to_pad_rect_dist(x, y, pad, margin=0.0) -> float
+pad_rect_halfspan(pad, margin=0.0) -> Tuple[float, float]
+```
+Rotation-aware geometry against a pad's true rectangle: inside test, distance,
+and the half-extents of its axis-aligned bounding box. All reduce to the plain
+axis-aligned answer when `pad.rect_rotation` is 0.
+
+```python
+dist_sq_to_rounded_rect(px, py, half_width, half_height,
+                        corner_radius=0.0) -> float
+```
+Squared distance from a point to a rounded rectangle centered at the origin
+(0 inside).
+
+```python
+circle_offsets(block_range, effective_sq) -> np.ndarray
+```
+Cached offset grids for expanding obstacles (circular footprint).
+
+### Example
+
+```python
+from routing_utils import pos_key, build_layer_map, segment_length
+from kicad_parser import parse_kicad_pcb
+
+pcb = parse_kicad_pcb('kicad_files/routed_output.kicad_pcb')
+layer_map = build_layer_map(pcb.board_info.copper_layers)
+print(layer_map)
+
+# Total routed copper length per layer
+totals = {}
+for seg in pcb.segments:
+    totals[seg.layer] = totals.get(seg.layer, 0.0) + segment_length(seg)
+for layer, mm in sorted(totals.items()):
+    print(f"{layer:8s} {mm:8.1f} mm")
+
+# Position keys survive float noise
+assert pos_key(1.0000004, 2.0) == pos_key(1.0, 2.0)
+```

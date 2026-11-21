@@ -1,0 +1,830 @@
+#!/usr/bin/env python3
+"""Is this pad reachable, or is the router being blamed for the geometry?
+
+    python3 check_reachability.py board.kicad_pcb --net GND --at 142.5,88.1
+    python3 check_reachability.py board.kicad_pcb --pad U3.23
+    python3 check_reachability.py board.kicad_pcb --pad U3.23 --track 0.15 --json
+
+Measures the widest track that can reach the rest of the net from that pad, by
+Euclidean distance transform plus an exact Kruskal widest path (see
+`placement/reachability.py`). Two verdicts, and they mean different things:
+
+    PASSABLE -- a route EXISTS at this track width. If the router failed, that
+                is a finding about the ROUTER (grid, ordering, ripup budget),
+                not about the board.
+    CAGED    -- no route exists at ANY grid. This one IS geometry, and the fix
+                is placement or a spec change.
+
+The verdict grades the PLACEMENT: pads, parts, rule areas, footprint copper and
+locked copper. A board's ROUTED copper -- every track and via a router could
+rip -- is set aside for it (#1347), because CAGED sends a run back to placement
+and copper the router laid is the router's to move: on gp14 StickHub U1.37 the
+routed board read CAGED for any track width, the same placement without its
+copper PASSABLE by +1030.5 um. The board as routed is measured too and printed
+beside the verdict (`routed_copper` in the JSON); when the routing alone cages
+the pad the report says so -- a routing finding, rip up or reroute -- and the
+exit code is still the placement's.
+
+Why it exists: across four recorded runs, 9 of 14 "no placement can fix this"
+claims were later refuted, and every claim that a pad was unroutable in
+principle was wrong. The rule this tool enforces is simple -- **no impossibility
+claim without a numeric field.**
+
+Clearances are read from the BOARD (netclasses via the sibling `.kicad_pro`,
+then `--clearance` as the base), and each foreign object is held to the value
+its PAIR with the routed net's track gets -- both classes, the sibling
+`.kicad_dru`'s class/type-scoped and layer rules, a pad override -- through
+check_drc's own resolver (#1625), so the verdict is measured at what the board
+would actually route at rather than at a guessed round number -- and then
+pinned UP to the fab floor, because this tool PREDICTS routability and a lane
+finer than any fab can etch is capacity nobody can build (see `_fab_wrap`).
+
+Exit codes: 0 PASSABLE, 1 CAGED, 2 usage/geometry error.
+
+**1 is reserved for the geometry verdict and nothing else.** An argument that
+names nothing on this board -- a misspelled ref, a pad number that is not there,
+an unreadable board file -- exits 2 with what it could not resolve. It used to
+exit 1, because `raise SystemExit(msg)` does, and a caller acting on exit 1
+re-enters placement and throws away every routed board.
+"""
+
+#: #937 registry: which door(s) show this tool, and whether it changes
+#: the board. Read by krt_registry.py -- by AST, never imported.
+KRT_TOOL = {'scope': ['placement', 'combined'], 'kind': 'instrument'}
+
+import _path  # noqa: F401  (py_tools -> py_router/py_placer on sys.path)
+import argparse
+import json
+import os
+import sys
+
+
+class Unresolvable(Exception):
+    """The arguments do not name anything on this board.
+
+    Its own exception type because the ALTERNATIVE was `raise SystemExit(msg)`,
+    and SystemExit with a message exits **1** -- which in this tool is the CAGED
+    verdict, the most expensive answer it can give. Measured:
+
+        --pad NOSUCH.9  -> exit 1   a typo
+        --pad RM1.1.1   -> exit 1   a real pad, named "1.1"
+        --pad U1.1      -> exit 2   the honest "nothing to reach here"
+
+    The loop's L3 stage treats "a single genuine CAGED on the copper-free board"
+    as sufficient to re-enter placement, and re-entering placement discards every
+    routed board. So a misspelling could buy the most expensive misclassification
+    in the loop, and nearly did. `target_cells == 0` was already guarded against
+    a false PASSABLE (:224); this is the same guard on the other side, and the
+    false CAGED is the costlier of the two.
+    """
+
+
+def _resolve_pad(pcb, spec):
+    """'U3.23' -> (x, y, net_id, layer). The layer is the pad's own.
+
+    Splits at EVERY dot and keeps what the BOARD actually has, rather than
+    splitting on the last one positionally. KiCad pad numbers are strings and
+    are allowed to contain dots -- RM1 on the measured board has a pad literally
+    named "1.1", so `RM1.1.1` rsplit to ref `RM1.1` (no such footprint) and the
+    tool reported the geometry verdict CAGED for a pad that exists and is fine.
+    """
+    if '.' not in spec:
+        raise Unresolvable(f"--pad wants REF.PADNUM, got {spec!r}")
+    # Every place the dot could be, scored against the board.
+    cands, tried_refs = [], []
+    for i, ch in enumerate(spec):
+        if ch != '.':
+            continue
+        ref, num = spec[:i], spec[i + 1:]
+        tried_refs.append(ref)
+        fp = pcb.footprints.get(ref)
+        if fp is None or not num:
+            continue
+        for p in fp.pads:
+            if str(p.pad_number) == num:
+                cands.append((ref, num, p))
+                break                            # first pad of that number wins
+    if not cands:
+        known = [r for r in tried_refs if r in pcb.footprints]
+        if known:
+            fp = pcb.footprints[known[-1]]
+            have = ', '.join(str(p.pad_number) for p in fp.pads[:12])
+            more = '' if len(fp.pads) <= 12 else f' ... (+{len(fp.pads) - 12})'
+            raise Unresolvable(
+                f"footprint {known[-1]!r} exists but has no pad "
+                f"{spec[len(known[-1]) + 1:]!r} (has: {have}{more})")
+        raise Unresolvable(
+            f"no footprint on this board matches any prefix of {spec!r} "
+            f"(tried: {', '.join(repr(r) for r in tried_refs)})")
+    if len(cands) > 1:
+        # Genuinely ambiguous -- e.g. footprint "A" with pad "1.1" AND footprint
+        # "A.1" with pad "1". Guessing would be a silent wrong answer about
+        # which pad was graded, which is the whole failure mode being fixed.
+        where = '; '.join(f"{r} pad {n!r}" for r, n, _ in cands)
+        raise Unresolvable(f"{spec!r} is ambiguous on this board -- it could be "
+                           f"{where}. Nothing here can decide which you meant.")
+    _ref, _num, p = cands[0]
+    layers = [l for l in (p.layers or []) if l.endswith('.Cu')]
+    layer = None
+    if p.drill and p.drill > 0:
+        layer = None                              # any; caller picks the first
+    elif layers and layers[0] != '*.Cu':
+        layer = layers[0]
+    return p.global_x, p.global_y, p.net_id, layer
+
+
+def _relief_for(pcb, r, track_mm, clearance):
+    """"So what do I DO?" -- how far the blocking part must move, or nothing.
+
+    Deliberately narrow. It answers only when the two nearest things at the
+    throat are pads belonging to two DIFFERENT footprints, because that is the
+    only case where "move this part" is the shape of the answer. A throat formed
+    by a segment, a via, or two pads of the same part is a different question
+    (rip that copper, re-fan that part) and returning a plausible-looking
+    distance for it would be a wrong instruction, which is worse than none.
+
+    The distance is between the two FOOTPRINT pad bounding boxes, and the need
+    is in GAP space: `track + 2*clearance`, not the track width. Reporting a
+    track-space number here would ask for a move roughly 2*clearance too small.
+    """
+    near = getattr(r, 'near', ()) or ()
+    if len(near) < 2:
+        return []
+    a, b = near[0], near[1]
+    if a.get('kind') != 'pad' or b.get('kind') != 'pad':
+        return []
+    if not a.get('ref') or not b.get('ref') or a['ref'] == b['ref']:
+        return []
+
+    def _bbox(ref):
+        from kicad_parser import non_aperture_pads
+        fp = pcb.footprints.get(ref)
+        pads = non_aperture_pads(fp) if fp else ()   # #1143
+        if not pads:
+            return None
+        xs0 = [p.global_x - p.size_x / 2.0 for p in pads]
+        ys0 = [p.global_y - p.size_y / 2.0 for p in pads]
+        xs1 = [p.global_x + p.size_x / 2.0 for p in pads]
+        ys1 = [p.global_y + p.size_y / 2.0 for p in pads]
+        return (min(xs0), min(ys0), max(xs1), max(ys1))
+
+    ra, rb = _bbox(a['ref']), _bbox(b['ref'])
+    if not ra or not rb:
+        return []
+    from placement.routability import relief_move
+    # the clearance in force at EACH of the two blockers (`gap_need_mm`, which
+    # a .kicad_dru rule or a class can set per pair, #1625), else twice the base
+    need = (r.gap_need_mm if getattr(r, 'gap_need_mm', None) is not None
+            else track_mm + 2.0 * clearance)
+    # BOTH movers, not one. The pair is symmetric as geometry but not as a
+    # decision: these are whole-footprint bounding boxes, so a 100-pin QFN and
+    # the 0402 beside it give different distances for the same throat, and
+    # naming only the first-listed one hands the operator "move the QFN" when
+    # nudging the resistor is the cheap answer. Sorted so the smallest move
+    # leads, and each entry says WHICH part it is asking to move.
+    out = [dict(m, ref=b['ref'], against=a['ref'], need_mm=round(need, 5))
+           for m in relief_move(ra, rb, need)]
+    out += [dict(m, ref=a['ref'], against=b['ref'], need_mm=round(need, 5))
+            for m in relief_move(rb, ra, need)]
+    out.sort(key=lambda m: m['min_mm'])
+    return out
+
+
+#: floors key -> `fab_tiers` floor key. Via diameter is in here for the same
+#: reason as track width: a barrel narrower than the fab drills is capacity
+#: that cannot be built.
+_FAB_KEYS = {'clearance': 'clearance', 'track_width': 'track_width',
+             'via_diameter': 'via_diameter'}
+
+
+def _fab_wrap(board, floors, tier=None, overrides=None):
+    """Pin each resolved floor UP to what a fab can actually make.
+
+    `list_nets.board_floor` is board-authoritative, NOT raise-only, and its own
+    docstring says why that cuts both ways: a tool that GRADES existing copper
+    must measure at the board's own value or it manufactures phantom
+    violations, while a tool that PREDICTS routability must wrap at the fab
+    floor or it promises capacity nobody can etch. `check_channels` learned
+    this the expensive way -- on tigard --refs U3, a declared 0.05/0.05 took
+    its deficit faces from 3 to 1 and U3's supply from 29 to 120, hiding two
+    real deficits.
+
+    This tool predicts. Its whole output is a claim about whether a route
+    EXISTS, and its CAGED verdict is the most expensive answer in the loop, so
+    a sub-fab clearance here buys a confident PASSABLE for a lane no fab can
+    make -- the phantom-supply direction, which hides a defect rather than
+    wasting effort on one.
+
+    Pinned regardless of SOURCE, exactly as `enforce_fab_floors` treats an
+    explicit flag: a `--clearance 0.05` typed on the command line is as
+    unetchable as a declared one. The declared value is not discarded -- it is
+    kept under `declared` in the floors block, so the defect record shows both
+    what the board asked for and what the measurement actually used.
+
+    `tier` / `overrides` come from the shared `--fab-tier` / `--fab-overrides`
+    flags, and they are NOT decoration: a floor a tool enforces has to be one
+    the operator can tell it about. A board deliberately built at an advanced
+    tier, or with the documented `--fab-overrides` escape hatch, would
+    otherwise be measured against a floor its fab beats -- and the answer that
+    buys is CAGED, the most expensive verdict in the loop.
+
+    Returns `(values, fab)` -- the wrapped floors and the fab floor dict, which
+    the caller needs to wrap the PER-NET clearance map at the same minimum.
+    """
+    # #857: the PHYSICAL fab floor (override file, else the advanced rung),
+    # not the selected tier's -- the tier bounds automatic descents, and a
+    # reachability prediction is not a descent.
+    from fab_tiers import physical_fab_floor, count_copper_layers_in_file
+    try:
+        fab = physical_fab_floor(count_copper_layers_in_file(board), overrides)
+    except Exception:                                          # noqa: BLE001
+        fab = {}
+    for name, key in _FAB_KEYS.items():
+        rec = floors.get(name)
+        f = fab.get(key)
+        if not rec or f is None or rec['value'] >= f - 1e-9:
+            continue
+        print(f"  {name.replace('_', ' ')} {rec['value']:g}mm "
+              f"[{rec['source']}] is below the {f:g}mm fab floor; measuring "
+              f"at {f:g}mm (no fab can make it narrower).", file=sys.stderr)
+        floors[name] = {'value': f, 'source': 'fab floor',
+                        'declared': {'value': rec['value'],
+                                     'source': rec['source']}}
+    return {n: floors[n]['value'] for n in _FAB_KEYS if n in floors}, fab
+
+
+def _resolve_floors(pcb, args):
+    """`({name: {'value', 'source'}}, design_rules)` for clearance, track and
+    via -- `escape.lane_rules`, the one resolver `--pad`, `--part` and the
+    lane ledger share (#1837). Until then `--pad` fell back to 0.2 / 0.15 /
+    0.6 of its own on a board that declares nothing, while `--part` used the
+    ledger's 0.25 / 0.3 / 0.5 and did not say so."""
+    from placement import escape
+    r = escape.lane_rules(pcb, args.board, track_width=args.track,
+                          clearance=args.clearance, via_diameter=args.via)
+    d = r.to_dict()
+    # the knobs line's order, which predates the shared resolver
+    return ({k: dict(d[k]) for k in ('clearance', 'track_width',
+                                     'via_diameter')}, r.design_rules)
+
+
+def _part_main(args, pcb, tier=None, overrides=None):
+    """`--part REF` (#1817): the part's simultaneous escape, one line, or the
+    JSON document. Exit 0 no deficit, 1 a positive deficit (a proof), 2 a ref
+    this board does not have. Priced at `--pad`'s rules: the same resolver,
+    the same fab wrap (#1837)."""
+    from placement import escape, escape_flow, reachability
+    if args.part not in pcb.footprints:
+        print(f"cannot resolve: no part {args.part!r} on this board",
+              file=sys.stderr)
+        print("(exit 2 -- this is an argument that names nothing on this board, "
+              "NOT a deficit, which is exit 1)", file=sys.stderr)
+        return 2
+    floors, _dr = _resolve_floors(pcb, args)
+    vals, _fab = _fab_wrap(args.board, floors, tier, overrides)
+    try:
+        f = escape_flow.part_flow(
+            pcb, args.part, args.board,
+            margin_mm=(args.margin if args.margin is not None
+                       else escape_flow.DEFAULT_MARGIN_MM),
+            track_width=vals['track_width'], clearance=vals['clearance'],
+            via_diameter=vals['via_diameter'],
+            rule_sources={k: floors[k]['source'] for k in floors},
+            layers=args.layers.split(',') if args.layers else None)
+    except reachability.ScipyRequired as exc:
+        print(str(exc), file=sys.stderr)
+        return 2
+    d = f.to_dict()
+    if args.json_out:
+        with open(args.json_out, 'w', encoding='utf-8') as fh:
+            json.dump(d, fh, indent=2)
+    if args.json:
+        print(json.dumps(d, indent=2))
+        return 1 if f.deficit else 0
+    ru = f.rules
+    print(f"{f.ref}: demand {f.demand} net(s), flow {f.flow}, deficit "
+          f"{f.deficit} -- at " + escape.format_rules(
+              {'track_width': {'value': ru['track_mm'],
+                               'source': f.rule_sources.get('track_width')},
+               'clearance': {'value': ru['clearance_mm'],
+                             'source': f.rule_sources.get('clearance')},
+               'via_diameter': {'value': ru['via_mm'],
+                                'source': f.rule_sources.get('via_diameter')}})
+          + f", window {ru['margin_mm']:g} mm round its pads, "
+          f"{len(f.layers)} layer(s)")
+    if f.deficit:
+        print(f"  PROVEN SHORT at these rules: at most {f.flow} of its "
+              f"{f.demand} nets can leave at once (the lattice over-states "
+              f"capacity)"
+              + (f"; the cut runs past {', '.join(f.cut_refs[:8])}"
+                 if f.cut_refs else '')
+              + (" -- its own pads: at this track and via no path leaves "
+                 "them, so narrower geometry (a finer class, smaller vias) "
+                 "is the other answer" if f.cut_refs == (f.ref,)
+                 else " -- no lattice cell is saturated: their copper closes "
+                 "the stranded nets in where they start (in front of a pad, "
+                 "or on another layer where its via would land)"
+                 if f.cut_refs and not f.cut_cells else ''))
+    else:
+        print("  not proven short: the lattice over-states capacity, so this "
+              "is no promise the router finds every exit")
+    if f.unstartable:
+        print(f"  counted as escaping, no legal start at this track width: "
+              f"{', '.join(f.unstartable)}")
+    if f.ignored:
+        print(f"  plane nets, no demand: {', '.join(f.ignored)}")
+    return 1 if f.deficit else 0
+
+
+def main(argv=None):
+    p = argparse.ArgumentParser(
+        description=__doc__,
+        formatter_class=argparse.RawDescriptionHelpFormatter)
+    p.add_argument('board')
+    p.add_argument('--pad', help="REF.PADNUM, e.g. U3.23 -- sets --at and "
+                                 "--net from the pad itself")
+    p.add_argument('--part', metavar='REF',
+                   help="how many of REF's signal nets can leave it AT ONCE "
+                        "(#1817): a maximum flow over a lattice that "
+                        "over-states capacity, so a positive deficit is a "
+                        "proof and 0 is 'not proven short'. Prices lanes at "
+                        "the rules --pad and the lane ledger resolve (wrapped "
+                        "at the fab floor, as --pad is), each named with its "
+                        "source; --track/--clearance/"
+                        "--via override them, --margin is the window round "
+                        "the part's pads (default 3). Exit 1 only for a "
+                        "positive deficit")
+    p.add_argument('--at', help="x,y of the stranded pad (mm)")
+    p.add_argument('--net', help="net name; inferred from --pad when given")
+    p.add_argument('--layers', default=None,
+                   help="comma list, the seed pad's layer FIRST "
+                        "(default: the board's copper layers)")
+    p.add_argument('--track', type=float, default=None,
+                   help="track width to test (default: the board's Default "
+                        "netclass track width, else its min_track_width, else "
+                        "routing_defaults' 0.3, as the lane ledger)")
+    p.add_argument('--via', type=float, default=None,
+                   help="via diameter for layer changes (default: the board's "
+                        "Default netclass via, else its min_via_diameter, else "
+                        "routing_defaults' 0.5)")
+    p.add_argument('--clearance', type=float, default=None,
+                   help="base clearance (default: the board's Default "
+                        "netclass clearance, else routing_defaults' 0.25). "
+                        "Per-net classes are read from "
+                        "the sibling .kicad_pro on top of this")
+    p.add_argument('--step', type=float, default=0.01,
+                   help="raster step in mm (default 0.01). A throat is only "
+                        "resolved to +/- one step, so halve it if the margin "
+                        "comes out inside a step of zero")
+    p.add_argument('--margin', type=float, default=None,
+                   help="half-size of the view around the seed, mm "
+                        "(default 4.0; with --part, the window round the "
+                        "part's pads, default 3.0). Reachability is LOCAL; a "
+                        "whole board at 10um costs memory for nothing")
+    p.add_argument('--view', default=None, help="x0,y0,x1,y1 to override")
+    p.add_argument('--json', action='store_true',
+                   help="print the result as JSON on stdout, and nothing else "
+                        "-- notices go to stderr. --json-out writes the same "
+                        "document to a file and keeps the text report")
+    p.add_argument('--defect-json', metavar='PATH', default=None,
+                   help="when the verdict is CAGED, write a `defect-record` "
+                        "JSON document to PATH: the throat coordinates, the "
+                        "nearest foreign refs/pads, the shortfall in both "
+                        "track-width and gap space, the floors graded at (with "
+                        "their sources) and, when the two nearest blockers are "
+                        "pads of two different parts, a per-direction relief "
+                        "distance. Nothing is written for a PASSABLE or "
+                        "NO-TARGET measurement. Schema: "
+                        "placement.reachability.Reachability.defect_record")
+    p.add_argument('--json-out', metavar='PATH', default=None,
+                   help="also write the result dict to PATH (the same document "
+                        "--json prints); the text report is still printed")
+    # The same two flags every routing and DRC CLI carries, from the same
+    # helper, so the fab floor this tool measures against is the one the rest
+    # of the chain routed to.
+    from fab_tiers import (add_fab_tier_args, fab_tier_from_args,
+                           set_default_fab_tier)
+    add_fab_tier_args(p)
+    args = p.parse_args(argv)
+    try:
+        _tier, _tier_over = fab_tier_from_args(args)
+    except SystemExit as exc:                     # a missing override FILE
+        print(f"cannot resolve: {exc}", file=sys.stderr)
+        return 2
+    # Set the PROCESS default too, as route.py:5713 and check_drc.py do.
+    # Nothing else in this tool's call graph reads a fab floor today, so this
+    # changes no number here -- it is so a future nested consumer cannot
+    # silently measure against the stock tier while this run was told another.
+    set_default_fab_tier(_tier, _tier_over)
+
+    from kicad_parser import parse_kicad_pcb  # _path put py_router on sys.path
+    from placement import reachability
+
+    # An unreadable board is exit 2 for the same reason a bad --pad is: an
+    # uncaught exception here exits 1, which reads as CAGED to every caller.
+    if not os.path.isfile(args.board):
+        print(f"cannot resolve: no such board file: {args.board}",
+              file=sys.stderr)
+        return 2
+    try:
+        pcb = parse_kicad_pcb(args.board)
+    except Exception as exc:                                    # noqa: BLE001
+        print(f"cannot resolve: {args.board} did not parse: "
+              f"{type(exc).__name__}: {exc}", file=sys.stderr)
+        return 2
+
+    if args.part:
+        return _part_main(args, pcb, _tier, _tier_over)
+    if args.margin is None:
+        args.margin = 4.0
+
+    # EVERY argument-resolution failure below leaves here as exit 2. None of
+    # them is a statement about the board's geometry, and 1 is reserved for the
+    # one statement that is (CAGED). See Unresolvable.
+    layer_first = None
+    try:
+        if args.pad:
+            x, y, nid, layer_first = _resolve_pad(pcb, args.pad)
+            seed = (x, y)
+            net_id = nid
+            if not net_id:
+                raise Unresolvable(f"{args.pad} has no net -- nothing to reach")
+        else:
+            if not (args.at and args.net):
+                raise Unresolvable(
+                    "give --pad REF.NUM, or both --at x,y and --net")
+            try:
+                seed = tuple(float(v) for v in args.at.split(','))
+            except ValueError:
+                raise Unresolvable(f"--at wants x,y in mm, got {args.at!r}")
+            if len(seed) != 2:
+                raise Unresolvable(f"--at wants x,y in mm, got {args.at!r}")
+            net_id = None
+    except Unresolvable as exc:
+        print(f"cannot resolve: {exc}", file=sys.stderr)
+        print("(exit 2 -- this is an argument that names nothing on this board, "
+              "NOT the CAGED geometry verdict, which is exit 1)", file=sys.stderr)
+        return 2
+
+    # Knobs from the BOARD, not from round numbers.
+    import list_nets
+    # #1837: through `escape.lane_rules`, the resolver `--part` and the lane
+    # ledger use too, so one board is priced at one set of rules by every
+    # escape instrument. It is `list_nets.board_floor` per rule -- explicit,
+    # Default netclass, board constraint, then the fixed default -- and keeps
+    # the SOURCE beside each value ('cli' | 'board netclass' | 'board
+    # constraint' | 'fixed default'; 'fab floor' below), which is what lets
+    # the defect record say where each floor came from.
+    floors, dr = _resolve_floors(pcb, args)
+    # ...and then wrapped at the fab floor, because this tool PREDICTS.
+    _floors, _fab = _fab_wrap(args.board, floors, _tier, _tier_over)
+    clearance = _floors['clearance']
+    track = _floors['track_width']
+    via = _floors['via_diameter']
+    # #1402: copper keeps the board's copper-to-edge floor from the outline,
+    # every cutout and a mouse-bite row's slots; the field walls them.
+    edge_clearance = list_nets.board_floor_knobs(
+        args.board, design_rules=dr)[1]
+    try:
+        net_clearances = list_nets.net_clearance_map_by_id(
+            args.board, {i: n.name for i, n in pcb.nets.items()}, dr)
+    except Exception:                             # noqa: BLE001
+        net_clearances = {}
+    # The per-net map gets the same wrap as the base. Pinning only the base
+    # would leave the hole open on exactly the boards this map exists for: a
+    # net class declaring 0.05 would still build its part of the field at a
+    # spacing no fab can etch, and the field is a min() over the classes, so
+    # one unwrapped class sets the answer.
+    _fc = _fab.get('clearance')
+    if _fc is not None and net_clearances:
+        _pinned = sum(1 for c in net_clearances.values() if c < _fc - 1e-9)
+        if _pinned:
+            print(f"  {_pinned} net-class clearance(s) below the {_fc:g}mm "
+                  f"fab floor; measuring those nets at {_fc:g}mm.",
+                  file=sys.stderr)
+            net_clearances = {i: max(c, _fc) for i, c in net_clearances.items()}
+    # #1625: each foreign object is priced at the clearance its PAIR with the
+    # routed net's track gets -- check_drc's resolver (placement.legality.
+    # PadClearanceModel): both net classes, the class/type-scoped and layer
+    # .kicad_dru rules, a pad override -- pinned up to the same fab floor. The
+    # per-net map above is the fallback when that model cannot be built.
+    clearance_model = None
+    try:
+        from placement.legality import PadClearanceModel
+        clearance_model = PadClearanceModel.for_board(pcb, clearance, args.board)
+        for _n in clearance_model.notes:
+            print(f"  pair clearance: {_n}", file=sys.stderr)
+    except Exception as exc:                      # noqa: BLE001
+        print(f"  pair clearances unread ({type(exc).__name__}: {exc}); "
+              f"pricing each foreign net at its class clearance",
+              file=sys.stderr)
+
+    layers = (args.layers.split(',') if args.layers
+              else list(pcb.board_info.copper_layers or ('F.Cu', 'B.Cu')))
+    if layer_first and layer_first in layers:     # the seed's own layer first
+        layers = [layer_first] + [l for l in layers if l != layer_first]
+    # --view gets the same treatment as --at, and for the same reason: a
+    # traceback here exits 1, which is the CAGED verdict. Garbage floats raised
+    # ValueError out of this line; the wrong COUNT of them survived to raise
+    # IndexError deep inside reachability.slack_field. Both read as "no route
+    # exists at any grid" to a caller branching on the exit code.
+    view = None
+    if args.view:
+        try:
+            view = [float(v) for v in args.view.split(',')]
+        except ValueError:
+            print(f"cannot resolve: --view wants x0,y0,x1,y1 in mm, got "
+                  f"{args.view!r}", file=sys.stderr)
+            return 2
+        if len(view) != 4:
+            print(f"cannot resolve: --view wants FOUR values x0,y0,x1,y1, got "
+                  f"{len(view)} in {args.view!r}", file=sys.stderr)
+            return 2
+        if view[2] <= view[0] or view[3] <= view[1]:
+            print(f"cannot resolve: --view must have x1>x0 and y1>y0, got "
+                  f"{args.view!r}", file=sys.stderr)
+            return 2
+
+    def _measure(pcb, label=''):
+        """(Reachability, auto_widened) for one view of the board. `label`
+        leads its stderr notices, so two measurements' notices are told
+        apart."""
+        auto_widened = None
+        r = reachability.pad_reachability(
+            pcb, seed, net_name=args.net, net_id=net_id, layers=layers,
+            view=view, track_mm=track, via_mm=via, base_clearance=clearance,
+            net_clearances=net_clearances, step=args.step,
+            margin_mm=args.margin, edge_clearance=edge_clearance,
+            clearance_model=clearance_model, clearance_floor=_fc)
+        # run-23: NO-TARGET at the default view means the net's other island
+        # sits beyond --margin, NOT that the question is unanswerable -- and
+        # the manual retry ladder measured badly (--margin 12 took 128s,
+        # --margin 18 306s, --margin 25 timed out at 10 minutes with NO
+        # data, because cells scale as (span/step)^2 at the fixed step).
+        # Locate the nearest other island by VECTOR union-find (no raster),
+        # widen the view to hold seed + its closest point, and coarsen the
+        # step so the grid stays ~1200^2 whatever the span. Coarse-locate;
+        # the step used rides in the result so readings stay comparable --
+        # re-measure a found throat on a small box at native step.
+        if (r.target_cells == 0 and view is None
+                and net_id is not None):
+            import math as _math
+            # `list_nets.net_islands`, NOT `net_forensics._components`: that
+            # was a sibling CLI's private name imported from a directory
+            # `_path` does not put on sys.path, so the ImportError would have
+            # escaped as exit 1 -- the code this file reserves for the CAGED
+            # geometry verdict, and the most expensive answer it can give.
+            sx, sy = seed
+            best = None
+            own_d, own_i = None, None
+            comp_pts = []
+            for comp in list_nets.net_islands(pcb, net_id):
+                pts = [p for _k, _o, ps in comp for p in ps]
+                if not pts:
+                    continue
+                d = min(_math.hypot(px - sx, py - sy) for px, py in pts)
+                comp_pts.append((d, pts))
+                if own_d is None or d < own_d:
+                    own_d, own_i = d, len(comp_pts) - 1
+            for i, (_d, pts) in enumerate(comp_pts):
+                if i == own_i:
+                    continue
+                for px, py in pts:
+                    dd = _math.hypot(px - sx, py - sy)
+                    if best is None or dd < best[0]:
+                        best = (dd, px, py)
+            if best is not None:
+                _d, px, py = best
+                x0 = min(sx, px) - args.margin
+                x1 = max(sx, px) + args.margin
+                y0 = min(sy, py) - args.margin
+                y1 = max(sy, py) + args.margin
+                span = max(x1 - x0, y1 - y0)
+                # Rounded UP to 10 nm so the step the field is built at is
+                # the step the result discloses (one number, not a rounded
+                # copy beside a raw one), and the grid stays <= ~1200^2.
+                step2 = max(args.step,
+                            _math.ceil(span / 1200.0 * 1e5) / 1e5)
+                # stderr: --json makes stdout a machine channel (the loop
+                # driver documents it as one), and a notice on it is a
+                # JSONDecodeError at character 0.
+                print(f"  {label}NO-TARGET at the default +/-{args.margin:g}mm "
+                      f"view; nearest other island of this net is "
+                      f"{best[0]:.2f}mm away -- auto-widening to "
+                      f"[{x0:.1f},{y0:.1f},{x1:.1f},{y1:.1f}] at step "
+                      f"{step2:g}mm", file=sys.stderr)
+                r = reachability.pad_reachability(
+                    pcb, seed, net_name=args.net, net_id=net_id,
+                    layers=layers, view=[x0, y0, x1, y1], track_mm=track,
+                    via_mm=via, base_clearance=clearance,
+                    net_clearances=net_clearances, step=step2,
+                    margin_mm=args.margin, edge_clearance=edge_clearance,
+                    clearance_model=clearance_model, clearance_floor=_fc)
+                # The widened step grows with the ISLAND DISTANCE (span/1200),
+                # and nothing about that distance says the answer is still
+                # resolvable. A bottleneck is only resolved to +/- one step, so
+                # once a step is a large fraction of the track width the
+                # verdict is a coin toss dressed as a measurement. Measured,
+                # tigard U3.30 at one view: native step 0.01 gave bottleneck
+                # 0.4403, the widened 0.02021 gave 0.46904 -- 29 um
+                # OPTIMISTIC, more than one whole step, and optimistic is the
+                # direction that hides a cage.
+                coarse = step2 > track / 4.0 + 1e-12
+                auto_widened = {
+                    'view': [round(v, 2) for v in (x0, y0, x1, y1)],
+                    'step_mm': step2,
+                    'nearest_island_mm': round(best[0], 2),
+                    'coarse': coarse}
+                if coarse:
+                    _msg = (f"COARSE: the widened step {step2:g}mm is more "
+                            f"than a quarter of the {track:g}mm track, and a "
+                            f"bottleneck is resolved to +/- one step -- treat "
+                            f"this verdict as a locate, then re-measure the "
+                            f"throat on a small --view at --step {args.step:g}")
+                    auto_widened['coarse_note'] = _msg
+                    r.note = f"{r.note} | {_msg}" if r.note else _msg
+                    print(f"  {label}{_msg}", file=sys.stderr)
+        return r, auto_widened
+
+    # #1347: the VERDICT grades the PLACEMENT. Routed copper -- every track
+    # and via a router could rip -- is set aside for it, because CAGED sends
+    # a run back to placement, and on gp14 StickHub U1.37 the routed board
+    # read CAGED for any track width where the same placement with its
+    # copper stripped read PASSABLE by +1030.5 um. The board AS ROUTED is
+    # measured too and reported beside the verdict, so congestion is named
+    # as its own cause instead of being read as geometry.
+    placement, n_seg, n_via = reachability.without_routed_copper(pcb)
+    r_cu = aw_cu = None
+    try:
+        try:
+            r, auto_widened = _measure(placement)
+        except ValueError as exc:
+            if n_seg or n_via:
+                raise ValueError(
+                    f"{exc} (the board's routed copper is set aside for the "
+                    f"verdict, so the seed must be on a pad: give --pad, or "
+                    f"--at a pad centre)") from exc
+            raise
+        if n_seg or n_via:
+            r_cu, aw_cu = _measure(pcb, label='[with the routing] ')
+    except reachability.ScipyRequired as exc:
+        print(str(exc), file=sys.stderr)
+        return 2
+    except ValueError as exc:
+        print(str(exc), file=sys.stderr)
+        return 2
+    routed = None
+    if r_cu is not None:
+        _cu = r_cu.to_dict()
+        routed = {
+            'segments_set_aside': n_seg, 'vias_set_aside': n_via,
+            'verdict': _cu['verdict'], 'bottleneck_mm': r_cu.bottleneck_mm,
+            'margin_um': r_cu.margin_um,
+            'throat': None if r_cu.wide_open else r_cu.throat,
+            'near': [dict(n) for n in (r_cu.near or ())],
+            # The routing alone cages a pad the placement does not: a
+            # ROUTING finding (rip up / reroute), never a placement one.
+            'cages_the_pad': bool(r_cu.caged and r.target_cells
+                                  and not r.caged)}
+        if aw_cu:
+            routed['auto_widened'] = aw_cu
+
+    # `declared -> pinned` in the report, not only on the stderr notice: the
+    # record carries both numbers and the text should say the same thing, or a
+    # reader of the printed report cannot tell a wrapped floor from a declared
+    # one that happens to equal the fab minimum.
+    source = ', '.join(
+        f"{k.replace('_', ' ')}: {v['source']}"
+        + (f" ({v['declared']['value']:g} declared [{v['declared']['source']}]"
+           f" -> {v['value']:g})" if v.get('declared') else '')
+        for k, v in floors.items())
+    if args.defect_json:
+        _sha = None
+        try:
+            import hashlib
+            with open(args.board, 'rb') as _fh:
+                _sha = hashlib.sha256(_fh.read()).hexdigest()
+        except OSError:
+            pass
+        _relief = []
+        # A relief distance needs two RECTS, and this tool measures a raster
+        # throat -- so it is offered only when the two nearest things are pads
+        # whose footprints we can bound. Absent rather than guessed: a wrong
+        # "move R7 east by X" is worse than no instruction.
+        try:
+            _relief = _relief_for(pcb, r, track_mm=track, clearance=clearance)
+        except Exception:                                   # noqa: BLE001
+            _relief = []
+        doc = r.defect_record(board=args.board, board_sha=_sha,
+                              relief=_relief, floors=floors,
+                              instrument='check_reachability')
+        if doc is None:
+            print(f"  no defect record written to {args.defect_json}: this "
+                  f"measurement is {r.to_dict()['verdict']}, and a record "
+                  f"describes a DEFECT", file=sys.stderr)
+        else:
+            try:
+                with open(args.defect_json, 'w', encoding='utf-8') as fh:
+                    json.dump(doc, fh, indent=1)
+                print(f"  DEFECT RECORD -> {args.defect_json}",
+                      file=sys.stderr)
+            except OSError as exc:
+                print(f"  could not write {args.defect_json}: {exc}",
+                      file=sys.stderr)
+    _doc = r.to_dict()
+    if auto_widened:
+        # The reading is only comparable at its own step -- say which.
+        _doc['auto_widened'] = auto_widened
+    # #1347: what the verdict graded, always present so a reader never has
+    # to guess: 'placement' with routed copper set aside, and the reading
+    # WITH it when the board carries any (None on a copper-free board).
+    _doc['graded'] = 'placement'
+    _doc['routed_copper'] = routed
+    # #1625: what priced a foreign object at other than the base clearance
+    _doc['clearance_sources'] = r.pricing_sources
+    # #1837: the base rules and where each came from, as the knobs line
+    _doc['floors'] = floors
+    if args.json_out:
+        try:
+            with open(args.json_out, 'w', encoding='utf-8') as fh:
+                json.dump(_doc, fh, indent=2)
+            print(f"  JSON -> {args.json_out}", file=sys.stderr)
+        except OSError as exc:
+            print(f"  could not write {args.json_out}: {exc}", file=sys.stderr)
+    if args.json:
+        print(json.dumps(_doc, indent=2))
+    else:
+        print(f"board      {os.path.basename(args.board)}")
+        print(f"knobs      clearance {clearance}mm, track {track}mm, "
+              f"via {via}mm ({source}), outline edge {edge_clearance:g}mm")
+        # #1625: name what changed the clearance a pair is held to -- a
+        # .kicad_dru rule above all, as route.py names the rules it honours
+        for _src, _vals in sorted((r.pricing_sources or {}).items()):
+            print(f"           pairs priced by {_src}: "
+                  f"{', '.join(f'{v:g}' for v in _vals)}mm")
+        print(r.format_text())
+        # WHERE, beside how much. The number alone sent run 20 to two more
+        # tools and a hand-assembled paragraph. Not on a wide-open result:
+        # there is no throat to locate (`throat` is already None there, and
+        # this guard keeps it that way if that ever changes).
+        _t = None if r.wide_open else r.throat
+        if _t:
+            _who = ', '.join(n.get('pad') or f"{n['kind']}@{n['net']}"
+                             for n in (r.near or ()))
+            print(f"throat     ({_t['x']}, {_t['y']}) on {_t['layer']}"
+                  + (f"  between {_who}" if _who else ''))
+            if r.gap_mm is not None:
+                _ca, _cb = r.binding_clearances
+                print(f"           gap {r.gap_mm:.4f}mm vs "
+                      f"{r.gap_need_mm:.4f}mm needed "
+                      f"(gap space); track {r.bottleneck_mm:.4f} vs "
+                      f"{r.track_mm:.4f} (track space) -- same throat, two "
+                      f"spaces, related by the clearance at each blocker "
+                      f"({_ca:g} + {_cb:g}mm)")
+                if r.gap_blockers < 2:
+                    # Say it, rather than print a two-object number derived
+                    # from one object and let the label carry the lie.
+                    print(f"           NOTE only {r.gap_blockers} blocker(s) "
+                          f"identified at this throat, so the far side is "
+                          f"ASSUMED at the same clearance: the gap above is "
+                          f"twice the room on the known side, not a distance "
+                          f"between two named objects")
+            if r.caged:
+                _side = max(0.5, 4.0 * (r.track_mm - (r.bottleneck_mm or 0.0)))
+                print(f"look at it:\n"
+                      f"  python3 -X utf8 py_tools/render_placement.py "
+                      f"{os.path.basename(args.board)} --focus \\\n"
+                      f"      --view {_t['x'] - _side / 2:.3f},"
+                      f"{_t['y'] - _side / 2:.3f},{_t['x'] + _side / 2:.3f},"
+                      f"{_t['y'] + _side / 2:.3f} --size 1600")
+        if routed is not None:
+            print(f"routed     {n_seg} track segment(s) and {n_via} via(s) of "
+                  f"routing set aside: the verdict above grades the "
+                  f"PLACEMENT (pads, parts, rule areas, locked copper)")
+            _m = (f" (margin {routed['margin_um']:+.1f} um)"
+                  if routed['margin_um'] is not None else '')
+            print(f"           with the routing in place: "
+                  f"{routed['verdict']}{_m}")
+            if routed['throat'] and (r_cu.caged or routed['cages_the_pad']):
+                _t = routed['throat']
+                _who = ', '.join(n.get('pad') or f"{n['kind']}@{n['net']}"
+                                 for n in routed['near'])
+                print(f"           its throat ({_t['x']}, {_t['y']}) on "
+                      f"{_t['layer']}" + (f" between {_who}" if _who else ''))
+            if routed['cages_the_pad']:
+                print("           -> ROUTED COPPER cages this pad, the "
+                      "placement does not: a ROUTING finding (rip up or "
+                      "reroute that copper), not a placement one.")
+        if r.target_cells and not r.caged:
+            print("\nPASSABLE means a route EXISTS at this width. If the "
+                  "router failed here, that is a finding about the router "
+                  "(grid, ordering, ripup budget) -- not about the board.")
+    # "nothing to reach inside the view" is not a verdict, and must not be
+    # reported as one: exit 2 so a script cannot read it as PASSABLE.
+    if r.target_cells == 0:
+        return 2
+    return 1 if r.caged else 0
+
+
+if __name__ == '__main__':
+    sys.exit(main())

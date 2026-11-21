@@ -1,42 +1,57 @@
 # Power/Ground Plane Via Connections
 
-The `route_planes.py` script creates copper pour zones and places vias to connect SMD pads on other layers to the plane.
+The `route_planes.py` script creates copper pour zones (plus via features: thermal via arrays under exposed pads, and optionally area stitching, a board-edge via fence and GND return vias).
+
+> **Since #562 the plane step does NO ROUTING — unconditionally.** This
+> tool places **no tap vias and draws no traces** for pads that need to
+> reach the plane; there is no flag or environment variable that re-enables
+> the old tap mode (the machinery is deleted, not gated). Every such pad is
+> left for the **route step**, which welds it into the pour with the full
+> routing machinery (pour-launch) and taps whatever the fill cannot reach
+> in its **in-run plane finalize**. Consequence for readers: a bare pour
+> "leaving pads unconnected" is expected — run `route.py` with the plane
+> nets inside its `--nets` scope (e.g. `--nets '*'`, the plane nets also in
+> `--power-nets` for their width) and grade after that, not after the pour.
+> A plane net outside a route step's `--nets` gets no weld and no finalize:
+> the step says so in red and records it as `finalize_excluded_nets` in its
+> summary, and the net's pads ship open unless a later route step covers it.
+>
+> Exposed/thermal pads are the one exemption: they still get their **via
+> array** here (#487), because that stamps vias without drawing traces and
+> nothing else in the chain places one. If the array cannot be fitted, the
+> pad is deferred to the route step rather than traced to.
 
 ## Overview
 
 When creating a ground or power plane on an inner or bottom layer, SMD pads on other layers need via connections to reach the plane. This tool automates:
 
-1. **Zone creation** - Creates a copper pour zone covering the board. Replaces existing zones for the same net/layer with new parameters
-2. **Pad classification** - Identifies which pads need vias vs direct zone connection
-3. **Via placement** - Places vias near pads, avoiding obstacles on all copper layers
-4. **Trace routing** - Routes traces from offset vias to pads using A* pathfinding
-5. **Blocker rip-up** - Optionally removes blocking nets to place more vias
-6. **Automatic re-routing** - Optionally re-routes ripped nets after via placement
-7. **Resistance analysis** - Calculates and displays plane resistance and max current capacity
+1. **Zone creation** - Creates a copper pour zone covering the board. Replaces an existing zone for the same net/layer with this run's settings, and lists each setting that changes (see [Replacing a same-net pour](#replacing-a-same-net-pour)); coexists with other nets' pours on that layer (warning + explicit fill priority)
+2. **Pad classification** - Identifies which pads need vias vs direct zone connection (the ones needing vias are handed to the route step; see the note above)
+3. **Thermal via arrays** (#487) - Exposed/thermal pads get a lattice of vias into the plane
+4. **Area via stitching / edge fence / GND return vias** - Optional via features (`--stitch-vias`, `--stitch-edge-fence`, `--add-gnd-vias`)
+5. **Resistance analysis** - Calculates and displays plane resistance and max current capacity
+
 
 ## Basic Usage
 
 ```bash
 # Create GND plane on bottom layer (outputs to input_routed.kicad_pcb)
-python route_planes.py input.kicad_pcb --nets GND --plane-layers B.Cu
+python3 py_router/route_planes.py input.kicad_pcb --nets GND --plane-layers B.Cu
 
 # Create GND plane, overwrite input file
-python route_planes.py input.kicad_pcb --overwrite --nets GND --plane-layers B.Cu
+python3 py_router/route_planes.py input.kicad_pcb --overwrite --nets GND --plane-layers B.Cu
 
 # Create GND plane to specific output file
-python route_planes.py input.kicad_pcb output.kicad_pcb --nets GND --plane-layers B.Cu
+python3 py_router/route_planes.py input.kicad_pcb output.kicad_pcb --nets GND --plane-layers B.Cu
 
 # Create multiple planes at once (each net paired with corresponding plane layer)
-python route_planes.py input.kicad_pcb --nets GND +3.3V --plane-layers In1.Cu In2.Cu
+python3 py_router/route_planes.py input.kicad_pcb --nets GND +3.3V --plane-layers In1.Cu In2.Cu
 
-# Create VCC plane on inner layer with larger vias
-python route_planes.py input.kicad_pcb --nets VCC --plane-layers In2.Cu --via-size 0.5 --via-drill 0.4
-
-# Rip up blocking nets and automatically re-route them
-python route_planes.py input.kicad_pcb --nets GND +3.3V --plane-layers In1.Cu In2.Cu --rip-blocker-nets --reroute-ripped-nets
+# Create VCC plane on inner layer with larger vias (thermal arrays, stitching)
+python3 py_router/route_planes.py input.kicad_pcb --nets VCC --plane-layers In2.Cu --via-size 0.6 --via-drill 0.4
 
 # Preview what would be placed without writing
-python route_planes.py input.kicad_pcb --nets GND --plane-layers B.Cu --dry-run
+python3 py_router/route_planes.py input.kicad_pcb --nets GND --plane-layers B.Cu --dry-run
 ```
 
 ## Command-Line Options
@@ -45,67 +60,94 @@ python route_planes.py input.kicad_pcb --nets GND --plane-layers B.Cu --dry-run
 
 | Option | Description |
 |--------|-------------|
-| `--nets`, `-n` | Net name(s) for the plane(s). Can specify multiple (e.g., "GND" "+3.3V") |
-| `--plane-layers`, `-p` | Plane layer(s) for the zone(s), one per net (e.g., "In1.Cu" "In2.Cu") |
+| `--nets`, `-n` | Net name(s) for the plane(s). Can specify multiple (e.g., "GND" "+3.3V"); `"A\|B"` puts several nets on one layer (see [Multi-Net Layer Zone Generation](#multi-net-layer-zone-generation)) |
+| `--plane-layers`, `-p` | Bare copper layer name(s) for the zone(s), one per `--nets` entry (e.g., "In1.Cu" "In2.Cu"). `GND:B.Cu` is not a layer name and is refused |
 
-When specifying multiple nets, each net is paired with its corresponding plane layer. For example, `--nets GND VCC --plane-layers In1.Cu In2.Cu` creates a GND plane on In1.Cu and a VCC plane on In2.Cu.
+When specifying multiple nets, each net is paired with its corresponding plane layer. For example, `--nets GND VCC --plane-layers In1.Cu In2.Cu` creates a GND plane on In1.Cu and a VCC plane on In2.Cu. A count mismatch is an argument error (exit 2).
+
+### Output
+
+| Option | Default | Description |
+|--------|---------|-------------|
+| `output_file` (positional) or `--output FILE` | `<input>_routed.kicad_pcb` | Output board; the two spellings must agree when both are given |
+| `--overwrite`, `-O` | off | Write over the input file |
+| `--add-teardrops` | off | Add teardrop settings to all pads and vias in the output |
 
 ### Via/Trace Geometry
 
 | Option | Default | Description |
 |--------|---------|-------------|
-| `--via-size` | 0.5 | Via outer diameter in mm |
-| `--via-drill` | 0.3 | Via drill size in mm |
-| `--track-width` | 0.3 | Track width for via-to-pad connections in mm |
-| `--clearance` | 0.25 | Clearance from other copper in mm |
+| `--via-size` | board Default class, else 0.5 | Via outer diameter in mm (thermal arrays, stitching, GND return vias) |
+| `--via-drill` | board Default class, else 0.3 | Via drill size in mm |
+| `--track-width` | board Default class, else 0.3 | Track width in mm (the DRC-floor writeback and GND-via config; the pour itself draws no traces) |
+| `--clearance` | board Default class, else 0.25 | Copper clearance of the **Default** net class for this run; other classes are honoured at their own clearance (pairwise max). `--clearance-ceiling` caps every class instead (see [Configuration](configuration.md#fab-tier-options)) |
+| `--net-clearances` | - | JSON file mapping net name -> clearance in mm (the file `route.py` / `route_diff.py` take). It REPLACES the per-net map auto-read from the board's net classes for plane taps, the pour's fill model and `--add-gnd-vias` return vias, used as given (not capped by `--clearance-ceiling`); a net it does not name routes at the run's clearance. GUI: the Advanced tab's **Net Clearances File** |
 
 ### Zone Options
 
 | Option | Default | Description |
 |--------|---------|-------------|
-| `--zone-clearance` | 0.2 | Zone clearance from other copper in mm |
+| `--zone-clearance` | follows `--clearance` | Zone (pour) clearance from other copper in mm. When omitted it follows the routed clearance, stepping down toward the fab floor when the pour could not otherwise thread a BGA's via lattice (`plane_lattice.py`); the value used is recorded so the DRC floor drops with it |
 | `--min-thickness` | 0.1 | Minimum zone copper thickness in mm |
+| `--board-edge-clearance` | board `min_copper_edge_clearance`, else 0.5 | Zone inset from the board edge in mm |
+| `--thermal-vias` / `--no-thermal-vias` | on | Via array over exposed/thermal pads (#487): an SMD plane-net pad at least 2.0 mm on both axes that is the exposed pad or tab of an active part (U/Q/D/T/VR/IC/PS/LED), not a large passive or connector pad |
+| `--thermal-relief` | off | Connect pads to the pour with thermal-relief spokes instead of solid copper |
+| `--skip-existing-zones` | off | Keep an existing same-net zone on the target layer instead of replacing it (place stitching vias only). When off (the CLI default), an existing same-net zone on the target layer is replaced, and the run lists every setting the replacement changes (pad connection, clearance, width, outline, ...). Use it to keep a designer's pour as drawn. **Other nets' pours on the layer are tolerated either way** — see below |
 
 ### Algorithm Options
 
 | Option | Default | Description |
 |--------|---------|-------------|
 | `--grid-step` | 0.1 | Grid resolution in mm |
-| `--max-search-radius` | 10.0 | Maximum radius to search for valid via position in mm |
-| `--max-via-reuse-radius` | 1.0 | Prefer reusing existing vias within this radius in mm |
-| `--hole-to-hole-clearance` | 0.2 | Minimum clearance between drill holes in mm |
+| `--hole-to-hole-clearance` | board `min_hole_to_hole`, else 0.2 | Minimum clearance between drill holes in mm (fab floor) |
+| `--same-net-pad-clearance` | project record, else -1 | Edge-to-edge clearance (mm) between placed vias and same-net pads. `> 0` keeps this step's stitching vias off same-net pads and the net's solder-paste openings (#962) at that clearance, and records the value in the sibling `.kicad_pro` (`kicad_routing_tools.same_net_pad_clearance`) so later chain steps — `route.py`, `route_diff.py`, `bga_fanout`/`qfn_fanout`, `repair_planes` — keep **all** their vias off them (#581). `0` keeps its legacy stitching-only meaning; `-1` explicitly allows via-in-pad. Unset = use the project's recorded value if one exists |
 | `--layers`, `-l` | F.Cu + plane-layers + B.Cu | All copper layers for routing and via span (auto-computed) |
-| `--layer-costs` | 1.0 per layer (4+) or F.Cu=1.0/B.Cu=3.0 (2-layer) | Per-layer routing cost multipliers (1.0-1000) |
+| `--layer-costs` | 1.0 per layer (4+) or F.Cu=1.0/B.Cu=3.0 (2-layer) | Per-layer routing cost multipliers (1.0-1000, or negative = forbidden: the layer stays an obstacle and via span but gets no copper), one per `--layers` entry; any other count is refused |
 
 ### Multi-net Plane Layer Options
 
-These options control MST-based routing between vias when multiple nets share the same plane layer.
+These options control the spines routed on a layer several nets share (see [Multi-Net Layer Zone Generation](#multi-net-layer-zone-generation)).
 
 | Option | Default | Description |
 |--------|---------|-------------|
-| `--plane-proximity-radius` | 3.0 | Radius around other nets' vias for proximity cost (mm) |
-| `--plane-proximity-cost` | 2.0 | Maximum proximity cost around other nets' vias (mm equivalent) |
-| `--plane-track-via-clearance` | 0.8 | Clearance from MST track center to other nets' via centers (mm) |
-| `--voronoi-seed-interval` | 2.0 | Sample interval for Voronoi seed points along routes (mm) |
-| `--plane-max-iterations` | 200000 | Maximum A* iterations for routing plane connections |
+| `--voronoi-seed-interval` | 2.0 | Longest gap between a spine's Voronoi seeds (mm); nearer another net's point they run closer |
+| `--plane-max-iterations` | 200000 | Maximum A* iterations for routing a spine |
 
-The `--plane-track-via-clearance` parameter ensures MST routes don't pass through narrow gaps between other nets' vias. A larger value ensures more room for polygon fill but may cause routing failures on dense boards.
+The GUI planes tab exposes these two and `--min-thickness` in its "Zone Width &
+Shared Layers (advanced)" box, each starting at the CLI default above.
 
-### Blocker Rip-up Options
+A spine's keep-out from another net's via is not a setting: it is derived from the board (the via's radius plus the zone clearance plus half the zone's minimum width), and a spine pays no proximity cost.
+
+A net earns a zone on a shared layer if it has **any** connection point there — a stitching via, a pad, or a **virtual via** (a pad whose drop to this plane the route step will lay, #562). A net whose pads are all through-hole or already on the layer places zero stitching vias, but its zone is still poured (its spines join those pads); the partition is not gated on placing ≥1 via (issue #114).
+
+A net with **no copper at all** on the layer still earns one. Because pours run before routing (#562), a virgin *inner* layer carries neither vias nor pads — every pad is SMD on an outer layer — so a requested inner split plane used to produce **zero zones** for *both* nets, with only a buried `no vias or pads on layer, skipping zone` warning to show for it (issue #598). Such a net is now seeded from its pads **projected onto the layer** (their x/y, whatever layer the copper sits on, off-board pads excluded): those positions exist regardless of routing state, they are where the route step's pour-launch vias come down, and they partition the layer the way the components themselves are spread over the board. These are partition seeds only — they never enter the via list, so no MST edge or spine is invented for them, and a net that has seeds of its own is untouched. (A pad the route step drops to this plane is a virtual via on the net's spines already, so the projection seeds only a net with none.)
+
+### Re-routing Options (accepted, no effect on the pour)
 
 | Option | Default | Description |
 |--------|---------|-------------|
-| `--rip-blocker-nets` | off | Enable blocker identification and removal |
-| `--max-rip-nets` | 3 | Maximum blocker nets to rip up per pad |
-| `--reroute-ripped-nets` | off | Automatically re-route ripped nets after via placement |
-| `--power-nets` | - | Glob patterns for power nets to route with wider tracks |
-| `--power-nets-widths` | - | Track widths in mm for each power-net pattern |
+| `--no-bga-zone`, `--no-bga-zones` | off | Was: disable BGA auto-exclusion zones when re-routing ripped nets |
+| `--power-nets` | - | Was: glob patterns for power nets to re-route with wider tracks |
+| `--power-nets-widths` | - | Was: track widths in mm for each power-net pattern |
+| `--ripup-blocker-select` | `count` | Blocker selection algorithm for a rip-up ladder ([rip-up-reroute.md](rip-up-reroute.md)) |
 
-When `--rip-blocker-nets` is enabled, if via placement or routing fails for a pad, the tool identifies which net is blocking and temporarily removes it from the PCB data. It then retries via placement. This process repeats up to `--max-rip-nets` times per pad.
+These are still parsed, so recorded commands keep working, but the pour has
+nothing to rip or re-route: they reach the engine and change nothing. The same
+flags do act on `repair_planes.py` and `route.py`.
 
-When `--reroute-ripped-nets` is also enabled, after all plane vias are placed, the tool automatically re-routes the ripped nets using the batch router from `route.py`. This uses all copper layers specified by `--layers` for proper via clearance checking.
+The pour step does **no tapping and no ripping** (#562). Every pad that would need a tap via is deferred to the route step, which welds it into the pour with the full routing machinery (pour-launch) and taps whatever the fill cannot reach in its in-run plane finalize. The one exception is an exposed/thermal pad, whose via **array** (#487) stamps vias without drawing any trace. The blocker rip-up knobs (`--rip-blocker-nets`, `--max-rip-nets`, `--reroute-ripped-nets`) and the via-search radii (`--max-search-radius`, `--max-via-reuse-radius`, `--close-via-radius`) are **removed** from this script accordingly. Of those, only `--rip-blocker-nets` and `--max-search-radius` still exist on `repair_planes.py` (the standalone repair utility; `--reroute-ripped-nets` survives there as a documented no-op) — the other radii exist nowhere anymore. Recorded manifests were migrated in place by `tests/stress/migrate_manifests.py` (54 of 459 chains, 63 occurrences, all `--rip-blocker-nets`); passing a removed flag here now fails in argparse, which is the intended behavior.
 
-**Note:** The plane nets being processed are protected and will never be ripped up, even if they block each other during multi-net processing.
+**Pour-served balls are a commitment (#678).** The BGA fanout's pour-direct serves a plane-net ball by fill contact instead of a drop via when the (existing or `--plane-net-layers`-declared) pour's main fill reaches it. Each such ball is recorded in the sibling `.kicad_pro` under `kicad_routing_tools.pour_served_pads` (`"REF.PAD": {"net", "layer", "how": "pour"|"pour_track"}`), merged across a chain's fanout steps and carried down by the per-step project copy. The route step's in-run plane finalize reads it back and **audits** every promised ball **after** routing against KiCad's exact fill (the raster model when no file can be refilled; the source is always disclosed), then audits again on the shipped board. The audit is always on: the populations are printed as `Pour-served balls (#678, finalize|ship): N promised, N checked (source), N kept, N DETACHED` (plus any stale promises: pad missing, net renamed, no zone any more) and kept in `JSON_SUMMARY.pour_served` (`finalize` / `ship`, each with `weld: on|off`).
+
+**Welding a detached ball back is opt-in** (`KICAD_POUR_PROMISE_WELD=1`), because it changes copper: the detached ball becomes a custody link anchored **at the ball** — the tap site the fanout reserved for exactly this — which the final reconciliation welds with rip authority, and a ball still detached at ship gets a promise-scoped oracle weld pass. Without it each detached ball is named with `NOT welded`. There is no CLI flag or GUI control either way.
+
+**A pour the finalize verified does not ship cut by the reconciliation.** The finalize's oracle leg verifies every zone net against KiCad's exact fill, and the route step's final reconciliation then lays and rips copper with rip authority -- its rescues and rip-reroutes can cut a pour KiCad has just called complete (a rescued or rerouted signal fences a pad's fill island off, or splits a plane where only KiCad's refill sees the neck close). So the step keeps the verified board and, after the reconciliation, re-audits the verified zone nets with the same oracle leg (one refill at round 0 on a healthy board) and welds what was cut. A pour the weld cannot mend is graded by KiCad on both boards -- never by the raster fill model, which can join islands KiCad's refill splits -- and the reconciliation is **refused** (the verified board is put back) unless it connected more nets than it broke; on a draw the board whose pours are whole wins. A reconciliation that moved a part or swapped pads is kept, since a copper restore cannot undo that, and a pour it leaves cut is graded on the exact fill by the end-of-run re-grade. Both fronts: the CLI re-audits and restores the written file, the GUI a staged save of the live board and the change-set. The result is printed as `Pour re-audit: ...` and kept in `JSON_SUMMARY.pour_reaudit` (`verdict`: `whole`, `refused`, `kept` or `unchecked`). No flag and no GUI control.
+
+After writing output, `route_planes.py` runs a **geometric verification** pass: it re-parses the board and reports, per plane net, how many pads are actually joined to the plane (via `check_net_connectivity`). Under #562 most plane pads are not joined by the pour alone, so the count it prints is labelled EXPECTED and does not mark the run incomplete; it still surfaces TH pads on a shared layer that ended up outside their own net's region.
+
+The CLI then runs, on the written board: `--add-gnd-vias` (below), the shared plane-copper cleanup `clean_plane_copper` (gap snap, graze prune, dead-end sweep; its board-level core `compute_plane_copper_cleanup` is what the GUI planes tab applies to the live board), the castellated-landing retract, and the `.kicad_pro` DRC-floor writeback (#160) with the `--same-net-pad-clearance` record. There is deliberately **no KiCad-oracle recheck** in the pour step (#217): before the route step every not-yet-welded pad reads as a missing link. The oracle runs in the route step's finalize.
+
+The `JSON_SUMMARY:` line carries `min_clearance_used`, `plane_nets` (names) and `plane_zones` (`{net, layer}` per poured zone), `pads` (one tally over all zones, `pads_scope` says so), `plane_resistance` (per net: `resistance_ohms`, `max_current_a`, `max_current_ipc2152_a`, `copper_oz`, `temp_rise_c`, `path_length_mm`, `path_basis`, `avg_width_mm`), `sense_branches` when the board declares Kelvin sense branches (#1279), `design_rules` when anything was delivered below its requested size, and `complete` / `status` (`no_output` when the engine refused and wrote nothing, which also exits non-zero).
 
 ### Debug Options
 
@@ -114,6 +156,61 @@ When `--reroute-ripped-nets` is also enabled, after all plane vias are placed, t
 | `--dry-run` | Analyze and report without writing output file |
 | `--verbose`, `-v` | Print detailed debug messages |
 | `--debug-lines` | Draw MST routes on User.1, User.2, etc. per net |
+
+### Fab Floor and DRC-Settings Options
+
+`route_planes.py` and `repair_planes.py` take the fab-floor flags every routing
+step shares (`--fab-tier`, `--fab-overrides`, `--escalation`,
+`--clearance-ceiling`, `--strict-sizes`) and the post-run DRC-settings flags
+(`--no-fix-drc-settings`, `--relax-drc-severities`, `--keep-thermal`,
+`--enable-used-layers`); see [Configuration](configuration.md#fab-tier-options)
+and [Post-Route DRC Settings](configuration.md#post-route-drc-settings).
+
+### Area Via Stitching (#485)
+
+A deliberate, periodic lattice of vias bonding a plane net's pours across the
+copper layers it owns — the standard SI/EMI/thermal practice of stitching a
+plane pair, rather than relying on wherever pad taps happened to land.
+
+| Option | Default | Description |
+|--------|---------|-------------|
+| `--stitch-vias` | off | Enable area via stitching on this run's plane nets |
+| `--stitch-pitch` | 20.0 | Lattice pitch (mm) |
+| `--stitch-max-freq` | — | Maximum frequency of interest (MHz): derives the pitch as λ/20 using the largest dielectric ε_r in the board's stackup (FR-4 4.5 if none), overriding `--stitch-pitch` |
+| `--stitch-edge-fence` | off | Board-edge via fence: a via row tracking the board outline(s) (EMI guard ring); works with or without `--stitch-vias` |
+| `--stitch-fence-pitch` | *lattice pitch* | Via spacing along the fence (mm) |
+| `--stitch-inset` | *auto* | Fence distance from the board edge to the via centers (mm). Auto = the board edge clearance plus the fill-margin ring — as close as a via can sit and keep the pour intact |
+
+The stitched nets are always the `--nets` that own **two or more** of the
+`--plane-layers` — there is deliberately no net-selection flag. Each lattice
+site is accepted only when:
+
+1. The predicted zone fill (`plane_fill_model.ZoneFillModel`)
+   contains the via **plus its clearance pocket plus a `min_thickness` ring**
+   inside the *main* fill component on at least 2 of the net's layers — so a
+   stitch never necks the pour below minimum thickness locally and never taps
+   an isolated fill island.
+2. The via obstacle map clears the site (foreign copper at
+   cross-class clearance, drill hole-to-hole, board edge, per-layer
+   `.kicad_dru` rules).
+3. KiCad's own fill agrees: one pcbnew refill of the board with this run's
+   zones, and a site off the net's main filled cluster is rejected rather than
+   anchoring an isolated island. Without KiCad's python (or a source file) the
+   run says so and keeps the model gate alone.
+
+A site already within `pitch/2` of a same-net via or plated through-hole
+barrel is coverage-satisfied and skipped; a blocked site is nudged outward up
+to `pitch/4` before being given up. The pass reports a coverage metric (max
+lattice-site distance to the nearest same-net bond, before → after) and runs
+in `--dry-run` too. The GUI planes tab exposes the same controls ("Area Via
+Stitching").
+
+The **edge fence** samples the true `Edge.Cuts` polygon(s) — a panelized
+board fences every outline — inset toward the interior, and validates each
+site with the exact same fill and obstacle gates as the lattice. The fence
+runs *before* the lattice, so fence vias count as existing bonds for the
+lattice's coverage rule and the rim is not stitched twice. Interior cutouts
+are not fenced.
 
 ### GND Return Via Placement
 
@@ -125,17 +222,133 @@ path close to each signal via.
 **Note:** Differential pair routing (`route_diff.py`) adds its own GND return vias automatically.
 This feature is for single-ended signal vias placed by `route.py`.
 
+**A return via needs its ground net poured on two layers.** A via that joins fewer than two layers
+connects nothing, and the next `route.py` removes it (#1166). The placer keeps a return via off the
+net's own tracks and pads, so its layers come from pours: on a net poured on one layer, or none, it
+warns and places none, on either front. On a net poured on more, a site must lie inside two of its
+pours, by the test the removal uses (`check_weird.via_support_parts`). A pour from an earlier step
+counts, as does one in this call.
+
 | Option | Default | Description |
 |--------|---------|-------------|
-| `--add-gnd-vias` | off | Enable GND return via placement near signal vias |
-| `--gnd-via-net` | GND | Net name for the GND vias |
+| `--add-gnd-vias` | off | Enable GND return via placement near signal vias (a post-pass on the written board). Needs the ground net poured on two layers; on fewer it warns and places none |
+| `--gnd-via-net` | *auto* | Pin every return via to this net. Empty (the default) matches each signal to **its own ground domain** |
 | `--gnd-via-distance` | 2.0 | Maximum distance from signal via to place GND via (mm) |
 
 The algorithm:
-1. Finds all signal vias (non-GND nets)
-2. Skips signal vias that already have a GND via or through-hole GND pad within the distance threshold
+1. Finds all signal vias: nets that are neither a ground net nor a power net
+   (`list_nets.power_net_evidence`: a rail name, power pins on two or more
+   parts, or a pour the board draws for the net). A supply rail's via needs no
+   return via of its own (#1816)
+2. Skips signal vias that already have a **same-domain** GND via or drilled GND pad within the distance threshold
+
+Steps 1 and 2 are `return_vias.ReturnViaModel`, the same test
+`py_tools/check_return_vias.py` reports coverage with, so the step and the
+check cannot disagree.
 3. For each remaining signal via, searches outward from the minimum viable distance (via-to-via clearance) in 24 angles (every 15°)
-4. Places the GND via at the closest valid position that respects track clearances
+4. Places the GND via at the closest valid position that respects track clearances, on the signal's own ground net
+
+#### Split grounds (#489 §5)
+
+Ground used to collapse to one board-global net, so every signal via -- analog
+included -- was stitched to it. On a split-ground board that is worse than doing
+nothing: it can bridge the very domains the split exists to separate, while
+connectivity and DRC both report green.
+
+Each ground-family net (`GND*`, `AGND`, `DGND`, `PGND`, ...) is now a **domain**,
+seeded with the components that touch it. The single-point tie between domains --
+a ferrite, a 0 Ω link, a net tie -- is detected structurally (a populated 2-pad
+part with one pad on each ground) and excluded from that seeding, so membership
+cannot leak across the split. A signal's return domain is then the domain of its
+endpoint components; anything ambiguous falls back to the board-global answer, so
+behaviour never gets worse than before.
+
+Boards with one ground resolve exactly as before (verified across the corpus set:
+12 single-ground boards unchanged for every net, 3 split-ground boards corrected).
+A run on a multi-domain board prints the domains, the tie, and the per-domain via
+count. `--gnd-via-net AGND` still pins everything to one net board-wide.
+
+Helpers: `net_queries.resolve_ground_domains`, `ground_domain_bridges`,
+`resolve_return_net_id`, `describe_ground_domains`.
+
+#### Sharing a layer with another net's pour
+
+A pour belonging to a **different net** on the target layer used to abort the run
+("Cannot create *net* zone on same layer. Aborting.") — so a plane could not be
+added to any board that already had a pour on that layer, and the abort then
+crashed the post-passes on the output file it never wrote. KiCad itself allows
+zones of different nets to share a layer: it fills them by priority and holds
+normal clearance between nets.
+
+The run now **warns and continues**, naming the other nets, and gives the new
+plane a fill priority **one above the highest incumbent** so KiCad resolves the
+overlap in favour of the plane you just asked for — the existing pours pull back
+around it rather than the outcome depending on zone UUID order. The incumbent
+zones themselves are left untouched. Point `--plane-layers` at a free layer if
+you want the opposite. Priority is chosen upward because KiCad zone priority is
+non-negative: a value below the incumbent is written but read back as 0.
+
+Footprint-owned pours (a shield or thermal pour inside a footprint) neither
+contend nor get replaced (#478).
+
+#### Replacing a same-net pour
+
+An existing pour for the **same** net on the target layer is replaced by default
+(`--skip-existing-zones` keeps it instead). Three cases used to go wrong silently:
+
+- **KiCad 10 boards.** Zones carry `(net "NAME")`, and the replacement filter was
+  only given numeric `(net <id>)` pairs, so it never matched: the old pour shipped
+  next to its replacement while the log said "Replacing existing zone", and every
+  re-run stacked another duplicate. The name pairs are passed now.
+- **Multi-layer pours.** `(layers "F.Cu" "B.Cu")` is **one** zone. A run that
+  pours the net on every layer the zone covers replaces it, with one new zone
+  per layer: `--nets GND GND --plane-layers F.Cu B.Cu` replaces a
+  `(layers "F.Cu" "B.Cu")` GND pour. A run that pours only some of those layers
+  does *not* delete it, because that would destroy the copper on the others. It
+  warns, names the layers it does not pour, keeps the pour, and pours the new
+  plane over it at a higher fill priority (same net, so no short). To replace it,
+  add those layers to the run or delete the pour in KiCad. Until #1299 the
+  decision was made one layer at a time, so even a run over every layer kept
+  the pour and stacked a new zone on each layer. On CM5_MINIMA_3 that left 5
+  extra GND zones, and `check_impedance` read the overlap as 64 reference-plane
+  splits.
+- **KiCad 5 / 6 spellings.** A bare `(layer B.Cu)` and the layer sets
+  `(layers F&B.Cu)` / `(layers *.Cu)` are read as pcbnew loads them, so the
+  writer removes exactly the pours the run decided to replace.
+
+A pour is therefore removed only when every layer it covers is being replaced.
+A teardrop area on the net is not a pour (#1164) and is never removed with it.
+
+**What a replacement changes (#1329).** The new pour takes this run's
+settings, not the old pour's. The run prints every setting that changes, with
+the old value, the new one and where the new one comes from, once the new pour
+is built. It records the same in `JSON_SUMMARY.zone_replacements` (one entry
+per replaced pour: `net`, `layers`, `replaced_uuid`, and `changes` as
+`{setting, old, new, why}`):
+
+```
+Replaced 'GND' pour on B.Cu (--skip-existing-zones keeps it): 5 setting(s) changed
+    pad connection: thermal relief -> solid  [route_planes connects pads solid unless --thermal-relief (Planes tab: Thermal relief pad connections)]
+    clearance: 0.508 mm -> 0.254 mm  [this run's zone clearance: --zone-clearance, else the routed clearance]
+    minimum width: 0.254 mm -> 0.1 mm  [--min-thickness]
+    thermal gap / spoke width: 0.508 mm / 0.508 mm -> 0.2 mm / 0.2 mm  [route_planes' fixed spoke geometry; unused while pads connect solid]
+    outline: 4-vertex outline (105.41, 67.31)..(182.88, 110.49) -> 4-vertex outline (103.50, 67.51)..(183.50, 110.29)  [the board's bounding box inset 0.2 mm (--board-edge-clearance)]
+```
+
+The settings compared are the pad connection, clearance, minimum width,
+thermal gap and spoke width, outline (and its cut-outs), isolated-island
+removal and fill priority. The pad connection matters most on a hand-soldered
+through-hole board: route_planes connects pads solid unless `--thermal-relief`
+is given, so a designer's thermal-relief pour comes back solid. To keep a
+designer's pour as drawn, pass `--skip-existing-zones`. To keep replacing it
+but keep its thermal relief, pass `--thermal-relief`. Before #1329 the run
+said only "Replacing existing zone ... with new parameters".
+
+The GUI planes tab does the same. Its **Skip existing zones** checkbox is
+`--skip-existing-zones`, unticked by default as on the CLI. The tab then deletes
+the replaced pour from the live board and adds the new one. A multi-layer pour
+is deleted only when the run replaced every one of its layers, as the CLI writer
+does. A plan step that omits the flag runs unticked again.
 
 #### Choosing `--gnd-via-distance`
 
@@ -150,46 +363,73 @@ close placement is blocked. Higher-frequency signals need tighter placement.
 | Medium | 10 - 100 MHz (SPI, JTAG) | 5.0 mm | Return current less localized |
 | Low | <10 MHz (I2C, UART, GPIO) | Skip | GND plane provides adequate return path |
 
-**Minimum physical limit:** Do not set `--gnd-via-distance` below 3 x (via_size + clearance),
-typically ~2.5 mm for standard 0.8 mm vias with 0.25 mm clearance. Below this, no valid
-placement positions exist.
+**Minimum physical limit:** a return via can sit no closer to its signal via than the via
+centre-to-centre minimum, `max(via_size + clearance, via_drill + hole_to_hole)` (0.75 mm for
+0.5 mm vias at 0.25 mm clearance; the run prints it as `min_distance`). A `--gnd-via-distance`
+at or below that finds no position at all, and one only a little above it leaves few.
 
 Use the `/find-high-speed-nets` Claude Code skill to analyze component datasheets and determine
-the appropriate distance for your board. The `/plan-pcb-routing` skill includes this as a
-standard step when GND planes are present.
+the appropriate distance for your board. The `/plan-pcb-routing` skill includes this step at high
+speed tier or above, when GND is poured on two or more layers.
 
 #### Example
 
 ```bash
-python route_planes.py input.kicad_pcb --nets GND --plane-layers B.Cu --add-gnd-vias --gnd-via-distance 2.0
+python3 py_router/route_planes.py input.kicad_pcb --nets GND GND --plane-layers F.Cu B.Cu --add-gnd-vias --gnd-via-distance 2.0
 ```
 
 Output:
 ```
 Added 8 GND vias near signal vias
-Placement distances: min=0.800mm, avg=1.131mm, max=1.450mm (min_distance theoretical=0.750mm)
+  Placement distances: min=0.800mm, avg=1.131mm, max=1.450mm
+  (min_distance theoretical=0.750mm)
 ```
 
 ## How It Works
 
 ### Pad Classification
 
-The tool classifies each pad on the target net into three categories:
+The tool classifies each pad on the target net (`identify_target_pads`):
 
 1. **Through-hole pads** - Have drill holes that connect all layers. No via needed.
 2. **SMD pads on plane layer** - Already on the zone layer. No via needed.
-3. **SMD pads on other layers** - Need a via + trace to connect to the plane.
+3. **SMD pads already routed to the plane** - Same-net copper already reaches the layer. No via needed.
+4. **SMD pads on other layers** - Need a via. Since #562 they are deferred to the route step (each kept as a virtual via for a shared layer's split), except exposed/thermal pads, which get their via array here.
+5. **Pads outside the board outline** - Unreachable; reported and skipped (#291).
 
 ### Via Placement Algorithm
 
-For each pad needing a via, the algorithm:
+> Since #562 this machinery no longer places per-pad tap vias here — pads
+> needing a via are deferred to the route step. It remains in this module
+> as library code: the repair engine's pad taps (`plane_pad_tap.py`, run by
+> `repair_planes.py` and route.py's in-run finalize) import
+> `find_via_position`, `route_via_to_pad` and `route_multi_source_to_pad`,
+> and the BGA fanout imports `route_multi_source_to_pad`.
 
-1. **Check for nearby existing via** - If a via on the same net exists within `--max-via-reuse-radius`, reuse it
-2. **Try pad center first** - If the pad center is not blocked, place via there (no trace needed)
+For each via those consumers place, the algorithm:
+
+1. **Check for nearby existing via** - If a via on the same net exists close by, reuse it
+2. **Try pad center first** - If the pad center is not blocked, place a via there with no trace. When same-net pad obstacles are enabled, skip this shortcut and search outside the pad at the requested edge-to-edge clearance.
 3. **Spiral search outward** - Search in expanding rings for a valid position that:
    - Has clearance from existing vias, tracks, and pads on ALL copper layers
    - Can be routed to the pad using A* pathfinding
-4. **Fallback to farther via** - If no new via position works, try reusing any existing via within `--max-search-radius`
+4. **Fallback to farther via** - If no new via position works, try reusing any existing via farther out
+
+#### Same-net pad clearance / via-in-pad
+
+When `--same-net-pad-clearance` is omitted, the CLI inherits the project's recorded
+positive value. With no positive record it resolves to `-1`, allowing via-in-pad.
+An explicit `-1` allows via-in-pad for this run. A positive value keeps all of the
+step's vias outside same-net SMD pads with that edge-to-edge clearance.
+For example, `--same-net-pad-clearance 0.25` requests a 0.25 mm gap. An explicit
+`0` keeps the legacy stitching-only behavior and does not enable the board-wide
+constraint for routing, fanout, or repair taps.
+
+**Board-wide semantics (#581).** A value `> 0` is a *board-wide assembly constraint*, not just a stitching option: it is recorded in the sibling `.kicad_pro` and every later chain step keeps **all** of its vias — routing escape vias, the #189 via-in-pad rescue (disabled), layer-swap pad vias (declined), plane tap/join/reconnect vias, and the sub-grid via nudge — at that clearance from same-net **SMD** pads. BGA fanout runs its under-pad escapes in dog-bone mode and QFN fanout refuses via-in-pad. The same flag is accepted by `route.py`, `route_diff.py`, `repair_planes.py`, `bga_fanout.py` and `qfn_fanout.py`; unset means "use the project's recorded value". `0` and `-1` reproduce the pre-#581 behavior exactly.
+
+In the GUI, the **Allow via-in-pad** checkbox and **Same-net Pad Clearance** spin control live at the top of the **Route tab's Options box** (moved from the Planes tab) and apply to *every* step run from the dialog. The checkbox defaults to ticked (via-in-pad allowed, CLI parity); unticking enables the spin control. When the board's project already records a clearance (a CLI chain step set it), the dialog opens with the checkbox unticked and the recorded value loaded.
+
+**Hole-to-hole is separate from via-in-pad.** `--same-net-pad-clearance` governs only the *copper* clearance to same-net pads. The *drill-to-drill* (hole-to-hole) minimum is a physical fab constraint and is always enforced against every drilled hole regardless of net — so even with via-in-pad enabled (`-1`), stitching vias still keep `--hole-to-hole-clearance` away from same-net **through-hole** pad drills (and from other vias). This is why via-in-pad applies to same-net **SMD** pads (no drill), but a stitching via will never be placed within the hole-to-hole minimum of a same-net through-hole pad (issue #125).
 
 ### Via Obstacle Checking
 
@@ -197,53 +437,35 @@ Since vias are through-hole (spanning all layers), the obstacle map checks for c
 
 ### A* Trace Routing
 
-When a via cannot be placed at the pad center, the tool routes a trace from the via to the pad using A* pathfinding. The routing:
+When a consumer of the placement engine (repair taps, fanout escapes) needs
+a via that cannot sit at the pad center, a trace is routed from the via to
+the pad using A* pathfinding. The pour itself never draws these traces
+(#562); the code lives here as the shared implementation. The routing:
 
 - Avoids other-net pads and tracks
 - Respects clearance requirements
 - Uses the pad's layer for the trace
 
-### Blocker Rip-up
+### Blocker Rip-up (removed from this script)
 
-When `--rip-blocker-nets` is enabled and via placement or routing fails:
-
-1. **Identify blocker** - Analyzes what net is blocking:
-   - For via placement failures: finds the nearest segment/via from another net
-   - For routing failures: analyzes the A* frontier to find which net's obstacles are blocking the most cells
-   - **Protected nets** (the plane nets being processed) are never identified as blockers
-
-2. **Remove blocker** - Temporarily removes the blocking net's segments and vias from the PCB data
-
-3. **Rebuild obstacles** - Rebuilds the obstacle maps without the ripped net (also re-blocks any vias already placed in this run)
-
-4. **Retry placement** - Attempts via placement and routing again
-
-5. **Repeat** - If still blocked, identifies the next blocker and repeats (up to `--max-rip-nets` times)
-
-The tool also uses a skip optimization: when routing fails from a particular via position, nearby positions (within 2x via-size) are skipped to avoid redundant attempts.
-
-### Automatic Re-routing
-
-When `--reroute-ripped-nets` is enabled, after all plane vias are placed:
-
-1. The tool collects all ripped net names
-2. Calls `batch_route` from `route.py` with the ripped nets
-3. Uses all copper layers (`--layers`) for routing and via clearance checking
-4. Reports how many nets were successfully re-routed
-
-This ensures that ripped nets are re-routed while respecting clearance from the newly placed plane vias on all layers.
+The pour no longer places taps, so it never needs to rip a blocker.
+The rip-up algorithm still exists in the repair engine
+(`repair_planes.py`, documented below), which the route
+step's in-run plane finalize calls -- with rip authority ON by default
+(`KICAD_FINALIZE_RIP=0` turns it off).
 
 ### Multi-Net Layer Zone Generation
 
-When multiple nets share the same plane layer (e.g., `--nets "VA19|VA11" --plane-layers In5.Cu`), the tool uses MST-based routing to ensure connected Voronoi zones:
+When multiple nets share the same plane layer (e.g., `--nets "VA19|VA11" --plane-layers In5.Cu`), the layer is split by the **spine split**: one net is the layer's background sheet, every other net a compact region round its parts, and each net's region is connected by **spines** routed on the layer, so every pad keeps its own net's plane under it. The background is poured as the whole layer at the lowest priority and the other nets' zones outrank it by area, so KiCad's fill does the subtraction.
 
-1. **Compute MST** - For each net, computes a Minimum Spanning Tree between all its vias
-2. **Route MST edges** - Routes each MST edge on the plane layer using A* pathfinding, avoiding other nets' vias and previously routed paths
-3. **Retry with reordering** - If some edges fail to route, retries with failed nets processed first (up to 5 iterations), keeping the best result
-4. **Sample routes for Voronoi** - Samples points along successful routes as additional Voronoi seed points
-5. **Compute final zones** - Uses Voronoi diagram with augmented seeds to create non-overlapping zone polygons per net
+1. **Spines.** Every net's connection points on the layer join its MST: vias, the **virtual vias** of the pads the route step will drop to this plane (a BGA's balls included), and pads with copper on the layer. Each MST edge is routed on the layer as the middle of a plane neck, so it keeps from another net's via exactly the via's radius plus the zone clearance plus half the zone's minimum width, and from other nets' pads, holes and slots the same margin. It pays no proximity cost: that cost discourages *tracks* from breaking a plane up, while a spine *is* the plane. A bend costs about the corridor's width of path, so corridors run in long straight 0/45/90 stretches. A link to a pad on the layer may leave from anywhere on the pad's edge. The background's spines route last; edges that fail are retried with their nets first (up to 5 tries, the best kept), judged first by the other nets' failures.
+2. **Partition.** The Voronoi diagram of every net's points plus its spine samples. A spine is seeded every quarter of its distance to the nearest other net's point, so its boundary with a pad beside it runs straight.
+3. **Reach.** The background net (the largest board-wide reach × pad count, scored on the net's full pad set) is the whole layer's sheet. Every other net keeps its Voronoi share only inside its reach: a **chamfered octagon** round each 5 mm cluster of its points, grown 2 mm, and a **3 mm corridor** along each spine, mitred at its bends. Two of a net's corridors less than a corridor's width apart run together where the gap is the net's own share. Every piece is held to the background invariant (#662 3b): the sheet, as the fill will pour it, stays one region that matters -- a detached piece that holds a background pad or a quarter of the sheet is a severing, a source-less sliver is not (fill island removal culls it). An island that would sever it shrinks (half its inflation, then none) and else drops, leaving those pads to the route step, which carries every plane net in its `--nets`; a corridor that would sever it is refused. A background with a plane on another layer too (one this run pours, or one already on the board) is the sheet alone: its pads are served through that plane, so it neither takes part in the partition nor holds the others back.
+4. **Raster finishing** (`plane_split_raster.py`). The regions go onto one label grid, and each net's fill is modelled as KiCad pours it: inside the board's real shape (its outline less its Edge.Cuts cutouts) less the edge clearance, clear of other nets' pads and vias and of holes (a milled NPTH slot by the edge clearance, as KiCad grades it), pulled back only from the smaller zones that outrank it, and opened at the minimum width. A piece of fill holding none of its net's pads or vias is fed by nothing; it goes to the neighbour whose own fill carries it on to one of that neighbour's anchors, else back to the background. Each region is then drawn as an octilinear polygon. The background's own cells inside another net's region are poured as **pockets** of their own, but only where they hold one of its pads, so a panel's rails behind their tabs never become a zone.
 
-The MST routes ensure that each net's zone polygons are connected (if routing succeeds). The `--debug-lines` option outputs the MST routes on User.1, User.2, etc. for visualization.
+A spine keeps from another net's track on the layer, and from another net's spine routed before it, the clearance KiCad grades the two nets at: both net classes, then the `.kicad_dru` layer rule (#1131).
+
+The outcome is printed as one `Spine split:` line per layer. The `--debug-lines` option outputs the spines on User.1, User.2, etc. for visualization.
 
 ### Plane Resistance Analysis
 
@@ -257,14 +479,18 @@ After zone creation, the tool calculates and displays approximate plane resistan
 - Uses the longest path through the MST (tree diameter) as the path length
 - Follows the actual routed traces, not straight-line distance
 - Samples polygon width perpendicular to the path at 1mm intervals
+- A net with no routed path between its vias yet (common, since the pour runs before
+  fanout and routing) is measured on its largest region as a single-net plane, by the
+  bounding diagonal (`path_basis: "diagonal"` in the summary)
 
 **Calculations:**
 - **Resistance:** `R = ρ × L / (W × t)` where ρ = 1.68×10⁻⁸ Ω·m (copper), L = path length, W = average width, t = copper thickness
-- **Max current:** IPC-2152 formula `I = k × ΔT^0.44 × A^0.725` where k = 0.024 for internal layers, 0.048 for external, A = cross-sectional area in mils²
+- **Max current:** the **IPC-2221** chart fit `I = k × ΔT^0.44 × A^0.725`, k = 0.024 internal / 0.048 external, A = cross-sectional area in mils². This was documented as IPC-2152, but the formula and both k values are 2221's (#489 §6). IPC-2152 came later and specifically **overturned** 2221's 2× derating of internal layers — an inner trace in FR4 runs *cooler* than an external one in still air — so `Imax` under-credits inner planes by roughly 2×. `plane_resistance.calculate_max_current_ipc2152()` gives the corrected estimate, and it is printed alongside for internal layers.
 
 **Assumptions:**
-- 1 oz copper (35 µm thickness)
+- Copper weight is read from the board's own **stackup**, per layer (1 oz / 35 µm only when the board has no stackup)
 - 10°C maximum temperature rise
+- **Chart range:** the 2221 curves are drawn for cross-sections up to ~700 mils². A plane pour is far outside that, so a result past the range is reported as *not rated* instead of as a current, with the extrapolated number shown only for reference — this is why the example below no longer states "21.05 A" as fact.
 
 **Example output (single-net layer):**
 ```
@@ -272,68 +498,49 @@ Plane Resistance Analysis (1 oz copper, 10°C rise):
   Path length: 117.0 mm (diagonal)
   Avg width:   52.2 mm
   Resistance:  1.075 mΩ
-  Max current: 21.05 A
+  Max current: not rated -- 2832 mils² cross-section is past the IPC-2221
+               chart range (700 mils²); the fit would say 21.05 A by extrapolation
 ```
 
 **Example output (multi-net layer):**
 ```
 Plane Resistance Analysis (1 oz copper, 10°C rise):
-----------------------------------------------------------------------
+--------------------------------------------------------------------------
 Net                       Path(mm)   AvgW(mm)   R(mΩ)      Imax(A)
-----------------------------------------------------------------------
+--------------------------------------------------------------------------
 /fpga_adc/VA19            33.6       3.6        4.457      3.03
-/fpga_adc/VA11            96.3       5.7        8.121      4.22
-/fpga_adc/VLVDS           28.4       78.1       0.175      28.18
+/fpga_adc/VA11            96.3       5.7        8.121      4.22*
+/fpga_adc/VLVDS           28.4       78.1       0.175      28.18*
 /fpga_adc/VD11            31.7       4.3        3.537      3.44
-----------------------------------------------------------------------
+--------------------------------------------------------------------------
 Path = longest MST route, AvgW = avg polygon width along path
+Imax = IPC-2221 chart fit; inner layers carry 2221's 2x derating, which IPC-2152 overturned
+* extrapolated past the IPC-2221 chart range (700 mils²) -- not a rating
 ```
 
 This helps identify potential current bottlenecks in power distribution networks. Narrow polygon sections (low AvgW) will have higher resistance and lower current capacity.
 
-## Error Messages
-
-The tool provides clear error messages in red:
-
-### VIA PLACEMENT FAILED
-```
-VIA PLACEMENT FAILED - no valid position within 10.0mm of pad at (x, y)
-```
-No position was found where a via could be placed. All candidate positions within the search radius were blocked by existing vias, tracks, or pads.
-
-### ROUTING FAILED
-```
-ROUTING FAILED - no path from via (vx, vy) to pad at (px, py)
-```
-A via position was found (or an existing via was selected), but the A* router could not find a valid path from the via to the pad. This typically happens on dense boards where routing channels are blocked.
+Each zone's numbers are also returned with the zone data (`resistance_analysis`),
+so a caller can gate on them instead of scraping the printout.
 
 ## Tips for Dense Boards
 
-1. **Reduce via size** - Smaller vias have more placement options
+1. **Reduce via size** - Smaller thermal-array and stitching vias have more placement options
    ```bash
-   --via-size 0.4 --via-drill 0.3
+   --via-size 0.4 --via-drill 0.2
    ```
 
-2. **Increase search radius** - Search farther for valid positions
-   ```bash
-   --max-search-radius 15.0
-   ```
+2. **Pour first, route after** - The chain pours the planes before fanout and routing
+   (#562): a pour sees every pad as a virtual via, and the fanout and route steps then
+   lay their drops and welds into fill that already exists.
 
-3. **Reduce reuse radius** - Place more local vias instead of routing long distances
-   ```bash
-   --max-via-reuse-radius 0.5
-   ```
-
-4. **Run after other routing** - Place plane vias last so they work around existing routes
-
-5. **Use blocker rip-up with re-routing** - For maximum via placement, enable both options:
-   ```bash
-   --rip-blocker-nets --reroute-ripped-nets --max-rip-nets 5
-   ```
+3. **Let the route step do the work** - Plane pads the pour cannot reach are not a
+   pour failure: the route step welds them (pour-launch) and its in-run finalize
+   taps the rest. Grade plane connectivity AFTER the route step, never here.
 
 ## Example Output
 
-### Single Net
+### Bare pour (the #562 default)
 
 ```
 Loading PCB from input.kicad_pcb...
@@ -344,111 +551,49 @@ Board bounds: (71.12, 55.88) to (228.60, 147.32)
 Processing net 'GND' on layer B.Cu
 ============================================================
 
+  1 exposed/thermal pad(s) get a via ARRAY (#487)
+  76 pad(s) on 'GND' deferred to the route step, each kept as a virtual via for the split
+
 Pad analysis for net 'GND':
   Through-hole pads (no via needed): 31
   SMD pads on B.Cu (no via needed): 16
-  SMD pads on other layers (via needed): 81
-
-Building obstacle map for via placement...
-  Pad C107.2... via at pad center
-  Pad U102.3... via at (140.40, 92.70), 12 segs
-  Pad U102.15... via at (134.40, 92.70), 12 segs
-  ...
+  SMD pads kept for thermal via arrays (via needed): 1
 
 Results for 'GND':
   Zone created on B.Cu
-  New vias placed: 74
-  Existing vias reused: 6
-  Traces added: 362
+  New vias placed: 9
+  Traces added: 0
 
-============================================================
-OVERALL TOTALS
-============================================================
-  Nets processed: 1
-  Total new vias placed: 74
-  Total existing vias reused: 6
-  Total traces added: 362
+  76 pad(s) are not connected to their plane by the pour alone -- EXPECTED
+  (#562): the plane step places no taps. They are welded during the route
+  step's normal routing (pour-launch); its in-run finalize then verifies
+  against KiCad's exact fill and repairs any residue. Grade the board AFTER
+  the route step, not here (see per-net breakdown above).
 
-Writing output to output.kicad_pcb...
-Output written to output.kicad_pcb
-Note: Open in KiCad and press 'B' to refill zones
+JSON_SUMMARY: {"min_clearance_used": 0.25, "plane_nets": ["GND"],
+  "plane_zones": [{"net": "GND", "layer": "B.Cu"}], "pads": {...},
+  "plane_resistance": [{"net": "GND", "resistance_ohms": 0.0011,
+  "max_current_a": 56.6, ...}], "complete": true, ...}
 ```
 
-### Multiple Nets
+Vias and traces appear at the **route step** (`route.py --nets '*'`, the
+plane nets inside its scope, and in `--power-nets` for their width): pour-launch welds pads into the fill,
+and the in-run plane finalize taps whatever the fill cannot reach. Rip-up
+of blockers, when needed, happens there too -- never in this script.
 
-```
-Loading PCB from input.kicad_pcb...
-Found net 'GND' with ID 91
-Found net '+3.3V' with ID 104
-Board bounds: (71.12, 55.88) to (228.60, 147.32)
-
-============================================================
-Processing net 'GND' on layer In1.Cu
-============================================================
-...
-Results for 'GND':
-  Zone created on In1.Cu (replaced existing)
-  New vias placed: 89
-  Existing vias reused: 6
-  Traces added: 358
-
-============================================================
-Processing net '+3.3V' on layer In2.Cu
-============================================================
-...
-Results for '+3.3V':
-  Zone created on In2.Cu (replaced existing)
-  New vias placed: 83
-  Existing vias reused: 5
-  Traces added: 346
-
-============================================================
-OVERALL TOTALS
-============================================================
-  Nets processed: 2
-  Total new vias placed: 172
-  Total existing vias reused: 11
-  Total traces added: 704
-```
-
-### With Blocker Rip-up and Re-routing
-
-```
-  Pad U102.3... blocked, trying rip-up... ripping /NET_A... via at (140.40, 92.70), ripped 1 nets
-  Pad U102.15... via at pad center
-  Pad U301.24... blocked, trying rip-up... ripping /NET_B... ripping /NET_C... FAILED after 2 rip-ups
-  ...
-
-Results for 'GND':
-  New vias placed: 77
-  Existing vias reused: 6
-  Traces added: 380
-  Failed pads: 1
-
-============================================================
-OVERALL TOTALS
-============================================================
-  Nets processed: 1
-  Total new vias placed: 77
-  Total existing vias reused: 6
-  Total traces added: 380
-  Total failed pads: 1
-
-Writing output to output.kicad_pcb...
-Output written to output.kicad_pcb
-Note: Open in KiCad and press 'B' to refill zones
-
-============================================================
-Re-routing 3 ripped net(s)...
-============================================================
-Loading output.kicad_pcb...
-...
-Routing complete
-  Single-ended:  2/3 routed (1 FAILED)
-...
-
-Re-routing complete: 2 routed, 1 failed in 15.32s
-```
+The `.kicad_pro` writeback follows the copper the step drew (#1319). A pour
+that placed no via writes no via, drill or hole-to-hole floor. One that laid
+no track writes no track floor. One that drew neither (the line `Bare pour (no
+track or via drawn)`) writes no copper-to-hole floor either. It writes only
+the copper clearance, which the pour's KiCad refill needs. The soft-joint
+bridges the finalize lays (`Closed N soft joint(s)`) join copper the board
+already carried, so they are not copper the step drew (#1577). A pour that
+did draw copper writes the copper-to-hole floor it held -- the board's own
+`min_hole_clearance` -- lowered only to what that copper needs, as `route.py`
+does (`step_hole_clearance`), and a floor written under the board's own is a
+`hole_clearance` row in `JSON_SUMMARY.design_rules` (`--strict-sizes` exits
+3). The Planes tab makes the same decisions (`fix_kicad_drc_settings.
+plane_fix_kwargs`, `plane_floor_segments`) from the copper it applied.
 
 ## Post-Processing
 
@@ -465,24 +610,31 @@ The plane generation code is organized into several modules:
 
 | Module | Description |
 |--------|-------------|
-| `route_planes.py` | Main CLI and orchestration - loads PCB, coordinates via placement per-net, and writes output |
+| `route_planes.py` | Main CLI and orchestration - loads PCB, pours each net's zone, places thermal arrays and stitching, splits shared layers, and writes output |
 | `plane_io.py` | I/O utilities - zone extraction, PCB file reading/writing, net ID resolution |
-| `plane_obstacle_builder.py` | Obstacle map construction - builds grid-based maps for via placement and routing |
-| `plane_blocker_detection.py` | Blocker detection and rip-up - identifies which nets are blocking via placement |
-| `plane_zone_geometry.py` | Voronoi zone computation - computes non-overlapping zone polygons for multi-net layers |
+| `plane_obstacle_builder.py` | Obstacle map construction - builds grid-based maps for via placement and routing; pad classification |
+| `plane_fill_model.py` | Zone fill model with KiCad's filler semantics (clearance; the hole clearance from every foreign drill -- the board's `min_hole_clearance`, else pcbnew's factory 0.25 -- with an NPTH's hole kept the hole clearance alone; the minimum-width opening, its deflated fill sampled exactly at half-cell points, so a channel under `min_thickness` never joins; island removal; clipped to the board outline and kept the edge clearance alone from every Edge.Cuts item -- the board's `min_copper_edge_clearance`, replaced by a `.kicad_dru` `edge_clearance` rule that binds the zone on that layer, never the zone's or its class's clearance, as KiCad 10's filler does (#1643)); gates stitching sites and fanout pour-direct, and is the zone credit of the connectivity grader, the oracle and the plane repairs |
+| `plane_lattice.py` | The plane's web through a BGA via lattice: the pour clearance that still threads it |
+| `plane_write_reconcile.py` | Keeps the write list and `pcb_data` in step when a pass removes copper (#508) |
+| `add_gnd_vias.py` | GND return via placement (`--add-gnd-vias`) |
+| `plane_blocker_detection.py` | Blocker detection - which net blocks a via position or a route (serves the repair engine and the router's diagnostics) |
+| `plane_zone_geometry.py` | Voronoi cells for a shared layer's split, polygon clipping, route sampling for the cells' seeds |
+| `plane_split_raster.py` | The shared layer's raster finishing: regions on one label grid, fills modelled as KiCad pours them, octilinear outlines |
 | `plane_resistance.py` | Resistance analysis - calculates plane resistance and max current capacity |
 
 ### Key Functions
 
 **route_planes.py:**
-- `create_plane()` - Main orchestration function
+- `create_plane()` - Main orchestration function (shared by the CLI and the GUI planes tab)
+- `is_thermal_pad()` / `compute_thermal_via_array()` - Exposed-pad detection and its via lattice (#487)
 - `find_via_position()` - Searches for valid via positions with routing verification
 - `route_via_to_pad()` - A* routing from via to pad
-- `route_plane_connection()` - Routes MST edges between vias on multi-net layers
+- `route_plane_connection()` - Routes a spine (an MST edge) on a shared layer
 
 **plane_io.py:**
 - `extract_zones()` - Reads existing zones from PCB file
-- `check_existing_zones()` - Validates zone conflicts
+- `check_existing_zones()` - Reports what already occupies the target layer: the same-net pour to replace, plus other nets' pours to coexist with (it no longer aborts the run over a foreign pour). `call_layers` is every layer the call pours the net on; a same-net pour is replaced only when every layer it covers is in that set (#1299)
+- `shared_layer_zone_priority()` - Fill priority for a plane sharing a layer with another net's pour: one above the highest incumbent, so the overlap resolves deterministically
 - `write_plane_output()` - Writes vias, traces, and zones to output file
 
 **plane_obstacle_builder.py:**
@@ -493,11 +645,9 @@ The plane generation code is organized into several modules:
 **plane_blocker_detection.py:**
 - `find_via_position_blocker()` - Identifies net blocking a via position
 - `find_route_blocker_from_frontier()` - Identifies net blocking A* routing
-- `try_place_via_with_ripup()` - Iterative rip-up and retry logic
 
 **plane_zone_geometry.py:**
-- `compute_zone_boundaries()` - Computes Voronoi-based zone polygons
-- `find_polygon_groups()` - Groups adjacent polygons for connectivity analysis
+- `voronoi_cells()` - The Voronoi cell of every seed, by its net, clipped to the board bounds
 - `sample_route_for_voronoi()` - Samples route paths for Voronoi seeding
 
 **plane_resistance.py:**
@@ -506,11 +656,27 @@ The plane generation code is organized into several modules:
 - `find_mst_diameter_path()` - Finds longest path through MST (tree diameter)
 - `calculate_average_width_along_path()` - Samples polygon width perpendicular to path
 - `calculate_resistance()` - Computes R = ρL/Wt
-- `calculate_max_current_ipc()` - Computes max current using IPC-2152 formula
+- `calculate_max_current_ipc2221()` - Max current from the IPC-2221 chart fit (was `calculate_max_current_ipc`, which is kept as an alias)
+- `calculate_max_current_ipc2152()` - Same fit with IPC-2152's internal/external correction (no 2× inner-layer derating)
+- `ipc2221_area_in_range()` - Whether the conductor is inside the 2221 chart's data range (False ⇒ the number is an extrapolation, not a rating)
+- `stackup_copper_oz()` - Copper weight in oz for a layer, read from the board's stackup
 
 ## Repairing Disconnected Plane Regions
 
-After power planes are created, regions may become effectively split due to vias and traces from other nets cutting through the plane. The `route_disconnected_planes.py` script detects these disconnected regions and routes tracks between them to ensure electrical continuity.
+After power planes are created, regions may become effectively split due to vias and traces from other nets cutting through the plane. The `repair_planes.py` script detects these disconnected regions and routes tracks between them to ensure electrical continuity.
+
+**Note (#562): in the default chain this runs for you.** `route.py`'s in-run
+plane finalize calls this same engine for the zone nets inside its `--nets`
+scope, then the plane-copper cleanup and the
+KiCad-oracle completion check, at the route step's own parameters — so the
+standalone invocation below is for boards routed outside that chain.
+`KICAD_PLANE_FINALIZE=0` disables the in-run pass. The finalize runs even
+when the route step finds nothing else to route (#1112), so a chain never
+needs this script: end it on `route.py` instead. Run standalone, it cannot
+know the sizes a chain routed at -- its track and via default to the board's
+Default net class (a route step never writes those back, #842) -- so pass
+`--track-width` / `--via-size` / `--via-drill` explicitly if you use it on a
+board this toolchain routed.
 
 Key features:
 - **Per-net processing** - Zones with the same net on multiple layers (e.g., GND on B.Cu and In1.Cu) are processed together, avoiding redundant routes since vias connect all layers
@@ -521,47 +687,152 @@ Key features:
 
 ```bash
 # Auto-detect all zones in PCB and repair disconnected regions (outputs to input_routed.kicad_pcb)
-python route_disconnected_planes.py input.kicad_pcb
+python3 py_router/repair_planes.py input.kicad_pcb
 
 # Auto-detect all zones, overwrite input
-python route_disconnected_planes.py input.kicad_pcb --overwrite
+python3 py_router/repair_planes.py input.kicad_pcb --overwrite
 
 # Auto-detect all zones to specific output file
-python route_disconnected_planes.py input.kicad_pcb output.kicad_pcb
+python3 py_router/repair_planes.py input.kicad_pcb output.kicad_pcb
 
 # Specific nets and layers
-python route_disconnected_planes.py input.kicad_pcb --nets GND --plane-layers B.Cu
+python3 py_router/repair_planes.py input.kicad_pcb --nets GND --plane-layers B.Cu
 
 # Customize track width and clearance
-python route_disconnected_planes.py input.kicad_pcb --max-track-width 1.0 --clearance 0.2
+python3 py_router/repair_planes.py input.kicad_pcb --max-track-width 1.0 --clearance 0.2
 
 # Increase iterations for difficult routes
-python route_disconnected_planes.py input.kicad_pcb --max-iterations 500000
+python3 py_router/repair_planes.py input.kicad_pcb --max-iterations 500000
 ```
 
 ### Command-Line Options
 
 | Option | Default | Description |
 |--------|---------|-------------|
+| `output_file` / `--output FILE` | `<input>_routed.kicad_pcb` | Output board (`--overwrite`, `-O` writes over the input) |
 | `--nets`, `-n` | auto | Net name(s) to process. If omitted, all nets with zones are processed |
 | `--plane-layers`, `-p` | auto | Layer(s) to process. If omitted, all layers with zones are processed |
 | `--layers`, `-l` | all Cu | Layer(s) available for routing |
+| `--layer-costs` | uniform | Per-layer cost multipliers, one per `--layers` entry (route.py semantics; negative = forbidden). route.py's finalize forwards the chain's costs; this is the standalone spelling |
 | `--max-track-width` | 2.0 | Maximum track width for connections (mm) |
 | `--min-track-width` | 0.2 | Minimum track width for connections (mm) |
-| `--track-width` | 0.3 | Default track width for routing config (mm) |
-| `--clearance` | 0.25 | Trace-to-trace clearance (mm) |
+| `--track-width` | board Default class, else 0.3 | Default track width for routing config (mm) |
+| `--clearance` | board Default class, else 0.25 | Trace-to-trace clearance of the Default net class this run (mm); other classes are honoured. `--clearance-ceiling` caps every class |
 | `--zone-clearance` | 0.2 | Zone fill clearance around obstacles (mm) |
 | `--track-via-clearance` | 0.8 | Clearance from tracks to other nets' vias (mm) |
-| `--hole-to-hole-clearance` | 0.2 | Minimum clearance between drill holes (mm) |
-| `--board-edge-clearance` | 0.5 | Clearance from board edge (mm) |
-| `--via-size` | 0.5 | Via outer diameter (mm) |
-| `--via-drill` | 0.3 | Via drill diameter (mm) |
+| `--hole-to-hole-clearance` | board `min_hole_to_hole`, else 0.2 | Minimum clearance between drill holes (mm, fab floor) |
+| `--board-edge-clearance` | board `min_copper_edge_clearance`, else 0.5 | Clearance from board edge (mm) |
+| `--same-net-pad-clearance` | project record, else -1 | `> 0` keeps repair vias (taps, joins, reconnects) off same-net pads and the net's paste openings (#581, #962); `-1` allows via-in-pad |
+| `--via-size` | board Default class, else 0.5 | Via outer diameter (mm) |
+| `--via-drill` | board Default class, else 0.3 | Via drill diameter (mm) |
 | `--grid-step` | 0.1 | Routing grid step (mm) |
 | `--analysis-grid-step` | 0.5 | Grid step for connectivity analysis (coarser = faster) |
 | `--max-iterations` | 200000 | Maximum A* iterations per route attempt |
+| `--no-kicad-recheck` | off | Skip the KiCad-oracle reconnect pass on the output (it runs by default when `kicad-cli` is installed) |
+| `--ripup-blocker-select` | `count` | Blocker selection algorithm for the rip-up ladder ([rip-up-reroute.md](rip-up-reroute.md)) |
+| `--repair-pads` / `--no-repair-pads` | on | Also repair pad-level plane connection failures (see below) |
+| `--max-search-radius` | 10.0 | Max radius to search for a via position during pad repair (mm) |
+| `--rip-blocker-nets` | off | Connect a pad that can't reach its plane by tracing to a nearby same-net pad, ripping the signal net(s) blocking that trace (see below) |
+| `--max-rip-nets` | 3 | Maximum blocker nets to rip per pad |
+| `--reroute-ripped-nets` | off | **Deprecated no-op** (issue #141 reverted): ripped blocker nets are now reconnected in-run (restore-first, an end-of-run reconnect pass, and custody restore on failure), so no separate `route.py` pass is needed. Accepted for compatibility |
+| `--power-nets` | — | Power net names needing wider tracks when re-routing ripped nets |
+| `--power-nets-widths` | — | Track width (mm) per `--power-nets` entry, for re-routing ripped nets |
+| `--no-bga-zone` | off | Disable BGA auto-exclusion zones when re-routing ripped nets (match the signal run) |
+| `--add-teardrops` | off | Add teardrop settings to all pads and vias in the output |
 | `--dry-run` | off | Analyze without writing output |
 | `--verbose`, `-v` | off | Print detailed debug messages |
 | `--debug-lines` | off | Add debug lines on User.4 layer showing route paths |
+| `--no-fix-drc-settings` | off | Skip rewriting the output project's DRC design rules to match the plane routing floors. By default they are made consistent (clearance, hole/edge, track/via floors + the Default net class clearance) so KiCad's manual DRC shows only genuine violations (issue #160; see [DRC Settings Fixer](utilities.md#drc-settings-fixer-fix_kicad_drc_settingspy)) |
+| `--relax-drc-severities` | off | ALSO lower the non-routing DRC severities in the project (off by default, #856) |
+| `--keep-thermal` | off | Deprecated no-op |
+| `--enable-used-layers` | off | Add any layer the board uses but its `(layers)` table lacks back into the board |
+
+After the repair the standalone script runs the same plane-copper cleanup as the
+pour (`clean_plane_copper`), the castellated-landing retract and, unless
+`--no-kicad-recheck`, a KiCad-oracle reconnect on the exact missing links
+`kicad-cli` reports (#217). Fab-floor flags: see [above](#fab-floor-and-drc-settings-options).
+
+### Pad-Level Repair (`--repair-pads`, default on)
+
+Plane-net pads can be left with no connection to the plane (the pour places
+no taps at all since #562, and congested SMD neighborhoods resist the route
+step's welds). Before the region repair, the engine finds pads
+of each plane net with no geometric connection to the plane — no same-net
+via or segment touching the pad's copper (including vias landed inside the
+pad), and the pad not sitting directly on a zone layer — and retries each
+with a stitching via + short trace. The retry escalates its parameters:
+the run parameters first, then scoped fine
+parameters when the pad is fine-pitch (a same-component neighbor pad within
+0.65mm, or pad min dimension below 0.35mm). The fine retry uses a finer grid
+(0.05mm) and steps the clearance DOWN from the run value toward the
+manufacturing floor for the board's layer count (the JLC fab floor, ~0.127mm
+2-layer / 0.10mm 4+), narrowing the tap track to the fab track floor, and stops
+at the loosest clearance that routes — there is no hard-coded "fine clearance"
+(issue #226). The clearance it actually used is recorded into the output
+`.kicad_pro` DRC floor and `JSON_SUMMARY` (`min_clearance_used`) so `check_drc`
+grades the board at it. Obstacle maps for each retry are built on a small window
+around the pad, so fine grids stay cheap on large boards. Per-pad outcomes are printed, and pads that still fail are listed in
+the summary. Use `--no-repair-pads` to only reconnect zone islands.
+
+The standalone script then grades the plane nets on the board it wrote (after
+the KiCad-oracle reconnect, with the same fill-aware grade as route.py's final
+re-grade), and its `JSON_SUMMARY` says what is left: `status:
+"incomplete-pads"`, route.py's `failed_multipoint` / `multipoint_pads_total` /
+`multipoint_pads_connected`, and `unconnected_pads` (`"REF.PAD (NET)"`). A
+shortfall still exits 0, as on `route.py`; exit 4 means rip casualties ship
+open.
+
+**Pads per tap via (#1896).** A pad may reach its plane through a
+neighbour's via, joined by a surface track, rather than through a via of its
+own. On the board a step ships, every SMD pad of a plane net is followed
+through the copper on its own layer (tracks, pads, vias; no zone fill) to the
+vias it reaches that have copper on a layer the net is poured on, whoever laid
+them: a fan-out dogbone, a via in the pad, a repair tap, a strap to another
+pad, the join gate's track, the oracle's reconnect. `JSON_SUMMARY.tap_vias`
+counts them: `pads` (pads that reach a tap via), `vias`, `shared_vias` (vias
+reached by more than one pad), `max_pads_per_via`, `pads_on_shared_vias` and
+`shared` (`{net, at, pads}` per shared via, most pads first), and a
+`Tap vias:` line says the same. `repair_planes.py` measures the plane nets it
+processed on the board it wrote, after the oracle's reconnect; the route step
+measures the zone nets its plane finalize served on the board it ships, in
+`--json-out` and the GUI's `results_data` (`tap_via_census.py`). Report-only:
+nothing limits sharing.
+
+**`route_planes.py` taps nothing** (#562, see the note at the top),
+so it is the ROUTE step's in-run plane finalize that runs this repair —
+including the fine-parameter retry (#104) — at the route step's own
+parameters. The text above describes that engine; it applies wherever it
+runs. The standalone script is for boards routed outside the chain.
+
+### Rip-Blocker Pad Repair (`--rip-blocker-nets`)
+
+Some plane-net pads can't take a via at all — a tiny outer-layer pad (e.g. a
+0.4mm USB-connector GND pin) amid congestion, where the plane is on an inner
+layer. (Under the #562 chain the route step routes the plane nets too, so
+this is rarer: the pad usually welds into the pour directly.) The human connects these with
+a short trace to an adjacent same-net pad (a connector GND pin to its shield
+pad). With `--rip-blocker-nets`, the repair does the same: when no via fits and
+no same-net via is within the close-reuse radius, it routes a trace to the
+nearest same-net pad/via reachable on the pad's layer. If a signal net crosses
+that corridor, it is **ripped** (up to `--max-rip-nets`; never a net that pours
+anywhere on the board, a protected or locked net, or -- in a route step's
+finalize -- a net the step's `--nets` negates, #1620/#1621), the pad connected, and
+the ripped net reconnected in the same run: restore-first, then an end-of-run
+reconnect pass, with custody restore of its original copper if that fails
+(#517). Pass `--power-nets`/`--power-nets-widths` so the reconnect routes
+power nets at their proper width, and `--no-bga-zone` if the signal run used
+it. Example:
+
+```bash
+python3 py_router/repair_planes.py step_planes.kicad_pcb out.kicad_pcb \
+    --clearance 0.15 --via-size 0.5 --via-drill 0.3 --track-width 0.127 --grid-step 0.05 \
+    --rip-blocker-nets
+```
+
+In the plugin, plane repair is no longer a tab of its own: it runs inside
+every route step's in-run plane finalize (#562), where the same rip-blocker
+arbitration applies. In the default chain you never invoke this
+step — `repair_planes.py` is for boards routed outside the chain.
 
 ### How It Works
 
@@ -574,6 +845,24 @@ Uses flood fill on a coarse grid (`--analysis-grid-step`) to identify disconnect
 3. Find all anchor points (vias + through-hole pads) for the target net
 4. Flood fill from each anchor to identify connected regions
 5. Group anchors by their connected region
+
+Pad-less **orphan islands** found by the fill model are classified by what
+KiCad's filler would do on refill (#609/#611): an island the filler ERASES
+(truly bare, `island_removal_mode` 0) is never strapped — that would ship
+copper that is never poured — but it is reported as a `Zone SPLIT` with its
+area, because a split reference plane is a return-path defect even when the
+copper disappears. An island the filler KEEPS (it carries a same-net
+track/via) is a real KiCad `Missing connection` and is **joined at any size**
+(≥1 mm²; the 25 mm² area bar only guards clutter joins for erased copper).
+On a multi-layer plane, every poured layer is scanned (#611): a kept island
+cut off on a non-primary layer is reported by the first pass, then joined by
+a **follow-up pass with that layer as the primary analysis layer**. An
+island whose same-net via reaches anchored fill on another poured layer is
+recognized as connected through the stack and left alone. This holds on both
+discovery paths (#612): the raster fallback (used when the fill models can't
+build) runs its own per-layer sweep, and the primary analysis layer is
+auto-swapped to a layer whose fill model built rather than silently dropping
+the whole net to the raster path.
 
 #### 2. MST-Based Region Selection
 
@@ -713,13 +1002,17 @@ Increasing `--max-iterations` can help with complex routes. Reducing `--analysis
 
 | Module | Description |
 |--------|-------------|
-| `route_disconnected_planes.py` | CLI and orchestration - loads PCB, detects zones, coordinates region repair |
+| `repair_planes.py` | CLI and orchestration - loads PCB, detects zones, coordinates region and pad repair (also the engine route.py's in-run finalize calls) |
 | `plane_region_connector.py` | Region detection and routing - flood fill analysis, multi-point A* routing, open-space fallback |
+| `plane_pad_tap.py` | Single-pad plane taps with the fine-pitch parameter escalation (the pad-level repair) |
+| `plane_component_oracle.py` | Refuses a tap whose "same-net copper" is itself a floating island of the plane |
+| `plane_corridor_ghosts.py` | Soft reservation of a ripped net's vacated corridor during `--rip-blocker-nets` (#517) |
+| `pour_promise.py` | The #678 audit of pour-served balls, run by route.py's finalize |
 
 ### Key Functions
 
-**route_disconnected_planes.py:**
-- `route_planes()` - Main orchestration: loads PCB, iterates over nets, writes output
+**repair_planes.py:**
+- `repair_planes()` (alias `route_planes` kept) - Main orchestration: loads PCB, iterates over nets, writes output
 - `auto_detect_zones()` - Scans PCB for existing zones and returns net/layer pairs
 
 **plane_region_connector.py:**

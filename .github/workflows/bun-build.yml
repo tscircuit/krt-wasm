@@ -30,5 +30,9 @@ jobs:
       - name: Install dependencies
         run: bun install
 
-      - name: Run build
-        run: bun run build
+      - name: Verify published package layout and embedded router
+        run: |
+          package_dir=$(mktemp -d)
+          archive=$(npm pack --silent --pack-destination "$package_dir")
+          tar -xzf "$package_dir/$archive" -C "$package_dir"
+          node scripts/check-packed-router.mjs "$package_dir/package"
