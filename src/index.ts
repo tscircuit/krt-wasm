@@ -9,7 +9,7 @@ import type {
   GenericLocalAutorouter,
   SimpleRouteJson,
   SimplifiedPcbTrace,
-} from "tscircuit"
+} from "@tscircuit/core"
 
 type Handler<T> = (event: T) => void
 
